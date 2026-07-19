@@ -36,11 +36,11 @@ export class SessionPool {
    * Acquire a fresh session. If email is provided, use that specific account.
    * Otherwise, pick the best available account (round-robin, non-throttled).
    */
-  async acquire(email?: string): Promise<PoolEntry> {
-    if (process.env.TEST_MOCK_PLAYWRIGHT) {
-      const mockId = process.env.TEST_SESSION_ID || 'mock-session';
-      return { chatId: mockId, parentId: null, inUse: true, accountEmail: 'mock@test' };
-    }
+ async acquire(email?: string): Promise<PoolEntry> {
+   if (process.env.TEST_MOCK_PLAYWRIGHT) {
+     const mockId = process.env.TEST_SESSION_ID || 'mock-session';
+      return { chatId: mockId, parentId: null, inUse: true, accountEmail: email || 'mock@test' };
+   }
 
     const maxAttempts = email ? 1 : Math.max(1, getAllAccountEmails().length);
     let lastErr: unknown;

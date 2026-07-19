@@ -47,9 +47,9 @@ describe('extractLocalMcpToolCalls', () => {
             status: 'finished',
             extra: {
               local_mcp: {
-                '★': [
+                star:  [
                   {
-                    tool_name: '★-Bash',
+                    tool_name: 'Bash',
                     params: { command: 'ls -la /tmp' },
                   },
                 ],
@@ -76,10 +76,10 @@ describe('extractLocalMcpToolCalls', () => {
           delta: {
             extra: {
               local_mcp: {
-                '★': [
-                  { tool_name: '★-Bash', params: { command: 'echo hello' } },
-                  { tool_name: '★-Read', params: { file_path: '/tmp/test.txt' } },
-                  { tool_name: '★-Edit', params: { file_path: '/tmp/test.txt', old_string: 'foo', new_string: 'bar' } },
+                star:  [
+                  { tool_name: 'Bash', params: { command: 'echo hello' } },
+                  { tool_name: 'Read', params: { file_path: '/tmp/test.txt' } },
+                  { tool_name: 'Edit', params: { file_path: '/tmp/test.txt', old_string: 'foo', new_string: 'bar' } },
                 ],
               },
             },
@@ -103,15 +103,15 @@ describe('extractLocalMcpToolCalls', () => {
     expect(extractLocalMcpToolCalls({ choices: [{}] })).toEqual([]);
   });
 
-  test('strips ★- prefix from tool names', async () => {
+  test('strips �? prefix from tool names', async () => {
     const { extractLocalMcpToolCalls } = await import('../routes/chatStreamingHelpers.ts');
 
     // Test with and without prefix
     const withPrefix = {
-      choices: [{ delta: { extra: { local_mcp: { '★': [{ tool_name: '★-Bash', params: { command: 'ls' } }] } } } }],
+      choices: [{ delta: { extra: { local_mcp: { star:  [{ tool_name: 'Bash', params: { command: 'ls' } }] } } } }],
     };
     const withoutPrefix = {
-      choices: [{ delta: { extra: { local_mcp: { '★': [{ tool_name: 'Bash', params: { command: 'ls' } }] } } } }],
+      choices: [{ delta: { extra: { local_mcp: { star:  [{ tool_name: 'Bash', params: { command: 'ls' } }] } } } }],
     };
 
     expect(extractLocalMcpToolCalls(withPrefix)[0].name).toBe('Bash');
@@ -138,10 +138,10 @@ describe('xmlToolCallToParsed', () => {
     expect(result.arguments).toEqual({ file_path: '/tmp/test.txt', timeout: 5000 });
   });
 
-  test('strips ★- prefix from tool name', async () => {
+  test('strips �? prefix from tool name', async () => {
     const { xmlToolCallToParsed } = await import('../tools/xmlToolParser.ts');
 
-    const result = xmlToolCallToParsed({ name: '★-Bash', parameters: { command: 'ls' } }, 0);
+    const result = xmlToolCallToParsed({ name: 'Bash', parameters: { command: 'ls' } }, 0);
     expect(result.name).toBe('Bash');
   });
 
@@ -327,7 +327,7 @@ describe('convertOpenAIResponseToAnthropic', () => {
       content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input: args });
     }
 
-    // not-json can't be parsed, args stays {} → filtered out
+    // not-json can't be parsed, args stays {} �?filtered out
     expect(content.length).toBe(0);
   });
 
@@ -429,7 +429,7 @@ describe('convertOpenAIResponseToAnthropic', () => {
   });
 });
 
-// ── Anthropic tools → OpenAI conversion test ─────────────────────────
+// ── Anthropic tools �?OpenAI conversion test ─────────────────────────
 
 describe('anthropicToolsToOpenAI', () => {
   test('converts Anthropic tool format to OpenAI format', async () => {
@@ -488,7 +488,7 @@ describe('Anthropic streaming tool call pipeline', () => {
       if (!allToolCalls.some((e: any) => e.id === ltc.id)) allToolCalls.push(ltc);
     }
 
-    // No dedup by name — only by ID
+    // No dedup by name �?only by ID
     expect(allToolCalls.length).toBe(3);
 
     // Filter empty tool calls
@@ -501,7 +501,7 @@ describe('Anthropic streaming tool call pipeline', () => {
       }
     });
 
-    // Both Bash calls have 'command', Read has 'file_path' → all valid
+    // Both Bash calls have 'command', Read has 'file_path' �?all valid
     expect(validToolCalls.length).toBe(3);
   });
 
@@ -591,7 +591,7 @@ describe('Tool parameter name mapping', () => {
     // Qwen returns snake_case file_path
     const input1 = { file_path: '/tmp/x' };
     const result1 = validateToolCallParams('Read', input1);
-    // filePath is missing but file_path exists → should be valid
+    // filePath is missing but file_path exists �?should be valid
     expect(result1.valid).toBe(true);
 
     // Qwen returns camelCase command
@@ -722,8 +722,8 @@ describe('snake_case to camelCase mapping', () => {
 });
 
 // ── Full local_mcp pipeline test ──────────────────────────────────────
-// End-to-end: mock Qwen SSE → extractLocalMcpToolCalls → validateToolCall
-// → normalizeToolName → emit as Anthropic tool_use content blocks
+// End-to-end: mock Qwen SSE �?extractLocalMcpToolCalls �?validateToolCall
+// �?normalizeToolName �?emit as Anthropic tool_use content blocks
 
 describe('local_mcp pipeline to Claude Code', () => {
   // Replicate REQUIRED_PARAMS + helpers from handleAnthropicStream
@@ -803,7 +803,7 @@ describe('local_mcp pipeline to Claude Code', () => {
             status: 'finished',
             extra: {
               local_mcp: {
-                '★': [{ tool_name: '★-Bash', params: { command: 'ls -la /tmp' } }],
+                star:  [{ tool_name: 'Bash', params: { command: 'ls -la /tmp' } }],
               },
             },
           },
@@ -851,7 +851,7 @@ describe('local_mcp pipeline to Claude Code', () => {
           delta: {
             extra: {
               local_mcp: {
-                '★': [{ tool_name: '★-Read', params: { file_path: '/tmp/test.txt' } }],
+                star:  [{ tool_name: 'Read', params: { file_path: '/tmp/test.txt' } }],
               },
             },
           },
@@ -864,7 +864,7 @@ describe('local_mcp pipeline to Claude Code', () => {
     expect(calls[0].name).toBe('Read');
     expect(calls[0].arguments).toEqual({ file_path: '/tmp/test.txt' });
 
-    // Validate — snake_case → camelCase mapping should make this valid
+    // Validate �?snake_case �?camelCase mapping should make this valid
     const validToolCalls: any[] = [];
     const validArgs: any[] = [];
     for (const tc of calls) {
@@ -890,9 +890,9 @@ describe('local_mcp pipeline to Claude Code', () => {
           delta: {
             extra: {
               local_mcp: {
-                '★': [
+                star:  [
                   {
-                    tool_name: '★-Write',
+                    tool_name: '�?Write',
                     params: { file_path: '/tmp/output.txt', content: 'hello world' },
                   },
                 ],
@@ -929,7 +929,7 @@ describe('local_mcp pipeline to Claude Code', () => {
           delta: {
             extra: {
               local_mcp: {
-                '★': [{ tool_name: 'bash', params: { command: 'echo hi' } }],
+                star:  [{ tool_name: 'bash', params: { command: 'echo hi' } }],
               },
             },
           },
@@ -938,7 +938,7 @@ describe('local_mcp pipeline to Claude Code', () => {
     };
 
     const calls = extractLocalMcpToolCalls(sseChunk);
-    // extractLocalMcpToolCalls strips ★- prefix but doesn't normalize case
+    // extractLocalMcpToolCalls strips �? prefix but doesn't normalize case
     expect(calls[0].name).toBe('bash');
 
     const validToolCalls: any[] = [];
@@ -967,7 +967,7 @@ describe('local_mcp pipeline to Claude Code', () => {
           delta: {
             extra: {
               local_mcp: {
-                '★': [{ tool_name: '★-Bash', params: { description: 'list files' } }],
+                star:  [{ tool_name: 'Bash', params: { description: 'list files' } }],
               },
             },
           },
@@ -993,16 +993,16 @@ describe('local_mcp pipeline to Claude Code', () => {
     // Simulate multiple SSE chunks arriving during stream
     const chunks = [
       {
-        choices: [{ delta: { extra: { local_mcp: { '★': [{ tool_name: '★-Bash', params: { command: 'ls' } }] } } } }],
+        choices: [{ delta: { extra: { local_mcp: { star:  [{ tool_name: 'Bash', params: { command: 'ls' } }] } } } }],
       },
       {
-        choices: [{ delta: { extra: { local_mcp: { '★': [{ tool_name: '★-Read', params: { file_path: '/tmp/x' } }] } } } }],
+        choices: [{ delta: { extra: { local_mcp: { star:  [{ tool_name: 'Read', params: { file_path: '/tmp/x' } }] } } } }],
       },
       {
         choices: [
           {
             delta: {
-              extra: { local_mcp: { '★': [{ tool_name: '★-Edit', params: { file_path: '/tmp/x', old_string: 'a', new_string: 'b' } }] } },
+              extra: { local_mcp: { star:  [{ tool_name: 'Edit', params: { file_path: '/tmp/x', old_string: 'a', new_string: 'b' } }] } },
             },
           },
         ],
@@ -1055,7 +1055,7 @@ describe('local_mcp pipeline to Claude Code', () => {
     });
   });
 
-  test('XML fallback + local_mcp both active — merge produces correct tool_use blocks', async () => {
+  test('XML fallback + local_mcp both active �?merge produces correct tool_use blocks', async () => {
     const { extractLocalMcpToolCalls } = await import('../routes/chatStreamingHelpers.ts');
     const { parseXmlToolCalls, xmlToolCallToParsed } = await import('../tools/xmlToolParser.ts');
 
@@ -1074,7 +1074,7 @@ describe('local_mcp pipeline to Claude Code', () => {
 
     // Step 2: Also got a local_mcp for the same tool
     const sseChunk = {
-      choices: [{ delta: { extra: { local_mcp: { '★': [{ tool_name: '★-Bash', params: { command: 'ls -la' } }] } } } }],
+      choices: [{ delta: { extra: { local_mcp: { star:  [{ tool_name: 'Bash', params: { command: 'ls -la' } }] } } } }],
     };
     const localMcpCalls = extractLocalMcpToolCalls(sseChunk);
 
@@ -1083,7 +1083,7 @@ describe('local_mcp pipeline to Claude Code', () => {
     for (const ltc of localMcpCalls) {
       if (!allToolCalls.some((e: any) => e.id === ltc.id)) allToolCalls.push(ltc);
     }
-    // Both pass — XML and local_mcp have different IDs
+    // Both pass �?XML and local_mcp have different IDs
     expect(allToolCalls.length).toBe(2);
 
     // Step 4: Validate
@@ -1098,13 +1098,13 @@ describe('local_mcp pipeline to Claude Code', () => {
     }
     expect(validToolCalls.length).toBe(2); // both valid
 
-    // Step 5: Emit — both go to Claude Code
+    // Step 5: Emit �?both go to Claude Code
     const blocks = validToolCalls.map((tc, i) => emitToolUseBlock(tc, validArgs[i]));
     expect(blocks.every((b) => b.content_block.name === 'Bash')).toBe(true);
     expect(blocks.every((b) => b.content_block.input.command === 'ls -la')).toBe(true);
   });
 
-  test('XML hallucination in text — text content still emitted as text_delta during stream', async () => {
+  test('XML hallucination in text �?text content still emitted as text_delta during stream', async () => {
     const { cleanTextOfXmlArtifacts, parseXmlToolCalls } = await import('../tools/xmlToolParser.ts');
 
     // Model produces text with XML tool call markup
@@ -1130,3 +1130,9 @@ describe('local_mcp pipeline to Claude Code', () => {
     expect(toolCalls[0].parameters).toEqual({ command: 'ls -la /tmp' });
   });
 });
+
+
+
+
+
+

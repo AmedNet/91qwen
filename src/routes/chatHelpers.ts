@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import modelSpecs from '../models.json' with { type: 'json' };
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { modelRouter } from '../services/modelRouter.ts';
 import { buildFeatureConfig, createQwenStream } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -15,6 +16,11 @@ function escXml(s: string): string {
 
 // Re-export everything from core utilities
 export * from './chatHelpersCore.ts';
+
+const modelSpecs = JSON.parse(readFileSync(fileURLToPath(new URL('../models.json', import.meta.url)), 'utf8')) as Record<
+  string,
+  ModelSpec
+>;
 
 /** Pre-compiled regex patterns for user content sanitization */
 const SYSTEM_REMINDER_RE = /<system-reminder\b[^>]*>([\s\S]*?)<\/system-reminder>/gi;
@@ -150,6 +156,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       }
 
       const toolResultText = compressToolResult(contentStr || '');
+      const isErrorResult = toolResultText.startsWith('[ERROR]');
       // Inline tool result so the model sees it directly in the prompt without reading context.txt
       const inlineName = escXml(toolName || 'unknown');
       const inlineResult = escXml(toolResultText);
@@ -158,9 +165,9 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         type: 'function',
         tool: toolName || 'unknown',
         result: {
-          success: true,
-          stdout: toolResultText,
-          stderr: '',
+          success: !isErrorResult,
+          stdout: isErrorResult ? '' : toolResultText,
+          stderr: isErrorResult ? toolResultText.replace(/^\[ERROR\]\s*/, '') : '',
           command: toolName || '',
         },
       });
@@ -175,14 +182,12 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const localMcp: Record<string, any> = {};
     localMcp['★'] = {};
-    const toolNames: string[] = [];
     for (const t of body.tools) {
       const fn = t.function || {};
       localMcp['★'][fn.name] = {
         description: fn.description || '',
         input_schema: fn.parameters || { type: 'object', properties: {} },
       };
-      toolNames.push(`${fn.name}${fn.description ? ` (${fn.description})` : ''}`);
     }
     featureConfig.local_mcp = localMcp;
     // ponytail: tool schema in system prompt as textual fallback for models
@@ -320,7 +325,7 @@ export async function createQwenStreamWithRetry(
     return { stream: result.stream, abortController: result.abortController, qwenLogFile: result.qwenLogFile };
   } catch (err: any) {
     modelRouter.recordError(routedModel);
-    // ponytail: caller (chat.ts) handles session release — don't double-release
+    // ponytail: caller (chat.ts) handles session release �?don't double-release
     throw err;
   }
 }

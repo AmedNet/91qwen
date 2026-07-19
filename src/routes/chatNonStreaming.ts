@@ -49,6 +49,21 @@ interface StreamProcessorState {
   nextParentId: string | null;
 }
 
+function buildUpstreamErrorResponse(err: any, fallbackStatus = 500): { body: any; status: number } {
+  const status = err?.upstreamStatus || err?.status || fallbackStatus;
+  const cleanMessage = cleanTextOfXmlArtifacts(err?.message || String(err)).cleanedText || err?.message || 'Internal error';
+  const error: Record<string, any> = {
+    message: cleanMessage,
+    type: err?.type || 'server_error',
+  };
+  if (err?.message !== undefined) error.upstream_message = err.message;
+  if (err?.code !== undefined) error.code = err.code;
+  if (err?.upstreamCode !== undefined) error.upstream_code = err.upstreamCode;
+  if (err?.upstreamStatus !== undefined) error.upstream_status = err.upstreamStatus;
+  if (err?.retryAfterMs !== undefined) error.retry_after_ms = err.retryAfterMs;
+  return { body: { error }, status };
+}
+
 function buildPromptString(messages: Message[]): string {
   return messages
     .map((m) => {
@@ -351,8 +366,18 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
   const upstreamError = parseQwenErrorPayload(state.buffer);
   if (upstreamError) {
     logStore.finalizeRequest(logId);
-    const cleanMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
-    return c.json({ error: { message: cleanMessage } }, upstreamError.status);
+    return c.json(
+      {
+        error: {
+          message: cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message,
+          type: 'upstream_error',
+          code: upstreamError.code,
+          upstream_code: upstreamError.upstreamCode,
+          upstream_status: upstreamError.status,
+        },
+      },
+      upstreamError.status,
+    );
   }
 
   flushAndDetectLoops(state, logId);
@@ -402,4 +427,23 @@ export async function handleNonStreamingRequest(ctx: NonStreamingContext): Promi
       sessionPool.release(session.chatId, state.nextParentId, sessionHeaders, resolvedEmail, false);
     }
   }
+}
+
+export function buildChatUpstreamErrorResponse(err: any): { body: any; status: number } {
+  if (err?.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err?.message || '')) {
+    return {
+      body: {
+        error: {
+          message: 'All accounts have reached their daily usage limit. Please try again later.',
+          type: 'rate_limit_error',
+          code: 'rate_limit_exceeded',
+          upstream_message: err?.message,
+          upstream_code: err?.upstreamCode,
+          upstream_status: err?.upstreamStatus || 429,
+        },
+      },
+      status: 429,
+    };
+  }
+  return buildUpstreamErrorResponse(err, err?.upstreamStatus || 500);
 }

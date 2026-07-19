@@ -219,7 +219,7 @@ setInterval(
 
 export function parseQwenErrorPayload(
   raw: string,
-): { message: string; status: import('hono/utils/http-status').ContentfulStatusCode } | null {
+): { message: string; status: import('hono/utils/http-status').ContentfulStatusCode; code?: string; upstreamCode?: string } | null {
   let text = raw.trim();
   if (!text) return null;
   // Strip SSE data: prefix if present — used when checking full buffer content
@@ -233,11 +233,11 @@ export function parseQwenErrorPayload(
       const details = payload.data?.details || payload.message || 'Qwen returned an error';
       const wait = payload.data?.num !== undefined ? ` Wait about ${payload.data.num} hour(s) before trying again.` : '';
       const status = code === 'RateLimited' ? 429 : code === 'Not_Found' ? 404 : 502;
-      return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status };
+      return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status, code, upstreamCode: code };
     }
     if (payload && payload.error) {
       const msg = typeof payload.error === 'string' ? payload.error : payload.error.message || JSON.stringify(payload.error);
-      return { message: `Qwen upstream error: ${msg}`, status: 502 };
+      return { message: `Qwen upstream error: ${msg}`, status: 502, code: 'upstream_error', upstreamCode: payload.error?.code || payload.code };
     }
   } catch {
     return null;

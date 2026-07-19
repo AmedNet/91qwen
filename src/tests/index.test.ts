@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import test from 'node:test';
 
 process.env.TEST_MOCK_PLAYWRIGHT = 'true';
-// Set a test API key (never empty — prevents auth bypass in tests)
+// Set a test API key (never empty 鈥?prevents auth bypass in tests)
 process.env.API_KEY = 'test-key-for-testing';
 
 import { app } from '../index.tsx';
@@ -207,6 +207,51 @@ test('Chat Completions returns explicit error for non-SSE upstream JSON errors',
     const body = await res.json();
     assert.match(body.error.message, /Qwen upstream error: RateLimited/);
     assert.match(body.error.message, /upper limit/);
+    assert.strictEqual(body.error.upstream_code, 'RateLimited');
+    assert.strictEqual(body.error.upstream_status, 429);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Anthropic messages returns upstream error details from non-streaming OpenAI path', async () => {
+  const originalFetch = globalThis.fetch;
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/v2/chat/completions')) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          data: {
+            code: 'Not_Found',
+            details: 'Requested chat was not found.',
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/messages', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' }, authHeaders),
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 64,
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 404);
+
+    const body = await res.json();
+    assert.match(body.error.message, /Requested chat was not found/);
+    assert.strictEqual(body.error.upstream_code, 'Not_Found');
+    assert.strictEqual(body.error.upstream_status, 404);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -410,7 +455,7 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
     assert.ok(Array.isArray(msg.files), 'Message should have files array');
     assert.ok(msg.files.length > 0, 'Should have at least one file (image)');
 
-    // Chat type should remain t2t (default) — Qwen web UI uses t2t even with images
+    // Chat type should remain t2t (default) 鈥?Qwen web UI uses t2t even with images
     assert.strictEqual(msg.chat_type, 't2t', 'Chat type should remain t2t for images');
     assert.strictEqual(msg.sub_chat_type, 't2t', 'Sub chat type should remain t2t');
     assert.strictEqual(msg.extra?.meta?.subChatType, 't2t', 'Extra subChatType should remain t2t');
@@ -509,6 +554,33 @@ test('Anthropic streaming strips XML artifacts from text deltas', async () => {
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.7-max', owned_by: 'qwen' }] }), { status: 200 });
     }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            access_key_id: 'test-key',
+            access_key_secret: 'test-secret',
+            security_token: 'test-token',
+            bucketname: 'test-bucket',
+            region: 'oss-cn-hangzhou',
+            endpoint: 'oss-cn-hangzhou.aliyuncs.com',
+            file_id: 'test-file-id',
+            file_path: 'test-user/test-file-id_context.txt',
+            file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-file-id_context.txt',
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse/status')) {
+      return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse')) {
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }
     if (url.includes('/api/v2/chat/completions')) {
       const stream = new ReadableStream({
         start(c) {
@@ -523,7 +595,7 @@ test('Anthropic streaming strips XML artifacts from text deltas', async () => {
           );
           c.enqueue(
             new TextEncoder().encode(
-              'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★-Bash","params":{"command":"cat /etc/hostname"}}]}}}}]}\n\n',
+              'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★Bash","params":{"command":"cat /etc/hostname"}}]}}}}]}\n\n',
             ),
           );
           c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
@@ -636,13 +708,40 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.7-max', owned_by: 'qwen' }] }), { status: 200 });
     }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            access_key_id: 'test-key',
+            access_key_secret: 'test-secret',
+            security_token: 'test-token',
+            bucketname: 'test-bucket',
+            region: 'oss-cn-hangzhou',
+            endpoint: 'oss-cn-hangzhou.aliyuncs.com',
+            file_id: 'test-file-id',
+            file_path: 'test-user/test-file-id_context.txt',
+            file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-file-id_context.txt',
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse/status')) {
+      return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse')) {
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }
     if (url.includes('/api/v2/chat/completions')) {
       const stream = new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"I\'ll run that for you."}}]}\n\n'));
           c.enqueue(
             new TextEncoder().encode(
-              'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★-Bash","params":{"command":"ls -la /tmp"}}]}}}}]}\n\n',
+              'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★Bash","params":{"command":"ls -la /tmp"}}]}}}}]}\n\n',
             ),
           );
           c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
@@ -683,7 +782,7 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     assert.strictEqual(
       res.status,
       200,
-      `Expected 200 got ${res.status} — body: ${await res
+      `Expected 200 got ${res.status} 鈥?body: ${await res
         .clone()
         .text()
         .catch(() => '?')}`,
@@ -717,9 +816,9 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     assert.ok(msgStart, 'Should have message_start');
     assert.strictEqual(msgStart.message.role, 'assistant');
 
-    // Find tool_use content block — per spec, input is {} in start event
+    // Find tool_use content block 鈥?per spec, input is {} in start event
     const toolStart = events.find((e) => e.type === 'content_block_start' && e.content_block?.type === 'tool_use');
-    assert.ok(toolStart, `Should have tool_use content_block_start — types: ${[...new Set(events.map((e) => e.type))].join(', ')}`);
+    assert.ok(toolStart, `Should have tool_use content_block_start 鈥?types: ${[...new Set(events.map((e) => e.type))].join(', ')}`);
     assert.strictEqual(toolStart.content_block.name, 'Bash', `Tool name should be Bash. Got: ${toolStart.content_block.name}`);
     assert.deepStrictEqual(toolStart.content_block.input, {}, 'tool_use start must have empty input per spec');
 

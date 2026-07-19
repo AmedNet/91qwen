@@ -21,6 +21,7 @@ import {
 } from './chatHelpers.ts';
 import { handleNonStreamingRequest } from './chatNonStreaming.ts';
 import { handleStreamingRequest } from './chatStreaming.ts';
+import { buildChatUpstreamErrorResponse } from './chatNonStreaming.ts';
 
 export {
   commonPrefixLen,
@@ -484,29 +485,10 @@ export async function chatCompletions(c: Context) {
 
     // Rate limit errors after all accounts exhausted — clean user-facing message
     if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
-      return c.json(
-        {
-          error: {
-            message: 'All accounts have reached their daily usage limit. Please try again later.',
-            type: 'rate_limit_error',
-            code: 'rate_limit_exceeded',
-          },
-        },
-        429,
-      );
+      const mapped = buildChatUpstreamErrorResponse(err);
+      return c.json(mapped.body, mapped.status);
     }
-
-    const status = err.upstreamStatus || 500;
-    const cleanMessage = cleanTextOfXmlArtifacts(err.message || String(err)).cleanedText || err.message || 'Internal error';
-    return c.json(
-      {
-        error: {
-          message: cleanMessage,
-          type: err.type || 'server_error',
-          code: err.code || undefined,
-        },
-      },
-      status,
-    );
+    const mapped = buildChatUpstreamErrorResponse(err);
+    return c.json(mapped.body, mapped.status);
   }
 }

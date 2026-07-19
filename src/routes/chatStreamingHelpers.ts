@@ -42,7 +42,7 @@ const MAX_BUFFER_CHARS = 200;
  * ```json
  * {"choices": [{"delta": {"role": "assistant", "content": "", "phase": "local_tool",
  *   "status": "finished",
- *   "extra": {"local_mcp": {"â˜…": [{"tool_name": "â˜…-bash", "params": {"command": "ls -la /tmp"}}]}}}}]}
+ *   "extra": {"local_mcp": {"â˜?: [{"tool_name": "â˜?bash", "params": {"command": "ls -la /tmp"}}]}}}}]}
  * ```
  *
  * @param sseData - Parsed SSE data chunk
@@ -50,16 +50,16 @@ const MAX_BUFFER_CHARS = 200;
  */
 export function extractLocalMcpToolCalls(sseData: any): ParsedToolCall[] {
   const localMcp = sseData?.choices?.[0]?.delta?.extra?.local_mcp;
-  if (!localMcp) return [];
+  if (!localMcp || typeof localMcp !== 'object') return [];
 
-  const serverTools = localMcp['â˜…'];
+  const serverTools = Object.values(localMcp).find(Array.isArray) as any[] | undefined;
   if (!Array.isArray(serverTools)) return [];
 
   const toolCalls: ParsedToolCall[] = [];
   for (const tool of serverTools) {
     if (tool?.tool_name && tool?.params !== undefined) {
-      const rawName = tool.tool_name;
-      const name = rawName.startsWith('â˜…-') ? rawName.slice(2) : rawName;
+      const rawName = String(tool.tool_name);
+      const name = rawName.replace(/^[^A-Za-z0-9]+-?/, '');
       toolCalls.push({
         id: `call_${crypto.randomUUID()}`,
         name,
@@ -120,7 +120,7 @@ export type ProcessStreamResult = 'continue' | 'break_stream';
 
 /**
  * Shared content filter pipeline standardizing the order:
- * cleanTextOfXmlArtifacts â†’ filterContent â†’ cleanThinkTags.
+ * cleanTextOfXmlArtifacts â†?filterContent â†?cleanThinkTags.
  * Used in both per-chunk (processStreamData) and flush (handlePostStreamCompletion) paths.
  */
 export function filterContentPipeline(
@@ -157,8 +157,8 @@ export function filterContentPipeline(
 /**
  * Process a single parsed SSE data chunk from the stream.
  * Mutates `state` in place and returns a directive:
- *   - 'continue'      â†’ normal processing, keep iterating
- *   - 'break_stream'  â†’ stream finished (break out of loops)
+ *   - 'continue'      â†?normal processing, keep iterating
+ *   - 'break_stream'  â†?stream finished (break out of loops)
  */
 export async function processStreamData(data: any, state: StreamProcessingState, ctx: StreamProcessingCtx): Promise<ProcessStreamResult> {
   const { streamWriter, completionId, model, enableContentFiltering, logId, resolvedEmail, ampState } = ctx;
@@ -210,7 +210,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
         logQwenSSE(ctx.qwenLogFile, ctx.sseEventCount || 0, localToolCalls.length, localToolCalls);
       }
     }
-    // Don't break on think-phase finished â€” with thinking_format=full,
+    // Don't break on think-phase finished â€?with thinking_format=full,
     // answer content arrives in a separate answer phase after think completes.
     // For all other phases, mark as finished but still run content extraction:
     // content may be bundled in the same SSE event as the finished status.
@@ -247,7 +247,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     if (state.reasoningBuffer.length < 20000) state.reasoningBuffer += vStr;
     // Write thinking content immediately for real-time reasoning_content streaming.
     // Clean XML artifacts to avoid leaking partial tool call syntax into reasoning (the
-    // deferred flush was removed to prevent duplicate emission â€” every chunk is written once).
+    // deferred flush was removed to prevent duplicate emission â€?every chunk is written once).
     if (vStr) {
       const cleaned = cleanTextOfXmlArtifacts(vStr).cleanedText;
       if (cleaned) {
@@ -286,7 +286,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // so cleanThinkTags sees the complete tag `<function=read>` and strips it via
   // prefix matching, instead of leaking partial fragments like `ction=read>`.
   //
-  // If the combined text has '>', the tag completed â€” toolCallDepth handles suppression.
+  // If the combined text has '>', the tag completed â€?toolCallDepth handles suppression.
   // If it still has no '>', cleanThinkTags still catches partial tags via TOOL_TAG_RE
   // prefix matching (the `` clause handles non-tool-call `<` content like "x < 3").
   // MAX_BUFFER_CHARS prevents indefinite buffering of `<` in non-XML text.
@@ -347,14 +347,14 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   }
 
   // Truncate lastFullContent to prevent unbounded growth (M-10)
-  // Use a generous limit (100000 chars â‰ˆ 25000 tokens) so the content delta
+  // Use a generous limit (100000 chars â‰?25000 tokens) so the content delta
   // pipeline always has stable, growing input for getSnapshotDelta to diff.
   // When truncation IS triggered, also reset the snapshot trackers so
   // filterContentPipeline rebuilds from scratch for the next chunk.
   if (state.lastFullContent.length > 100000) {
     const trimmedAmount = state.lastFullContent.length - 80000;
     state.lastFullContent = state.lastFullContent.slice(-80000);
-    // Adjust parse position relative to the trim (don't reset to 0 â€” that
+    // Adjust parse position relative to the trim (don't reset to 0 â€?that
     // would re-parse the entire 80KB buffer, causing duplicate tool calls
     // and a burst of replayed content to the client).
     state.lastParsePosition = Math.max(0, state.lastParsePosition - trimmedAmount);
@@ -423,3 +423,5 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   if (streamFinished) return 'break_stream';
   return 'continue';
 }
+
+
