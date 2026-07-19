@@ -4,7 +4,11 @@
  * into a form the model can analyze but cannot verbatim-repeat.
  */
 
-export function truncateToolResult(content: string, maxBytes: number = 4096): string {
+export function truncateToolResult(content: string, _maxBytes: number = 4096): string {
+  // Disabled: pass full tool result content to the model.
+  return content || '';
+
+  /* Original head+tail truncation (4096 bytes default):
   if (!content) return '';
   const encoded = new TextEncoder().encode(content);
   if (encoded.length <= maxBytes) return content;
@@ -19,6 +23,7 @@ export function truncateToolResult(content: string, maxBytes: number = 4096): st
   const tail = new TextDecoder('utf-8', { fatal: false }).decode(tailView);
 
   return `${head}\n... [truncated ${content.length - headBytes - tailBytes} chars] ...\n${tail}`;
+  */
 }
 
 function compressGitDiff(content: string, lines: string[], totalLines: number): string | null {
@@ -208,8 +213,14 @@ function compressLongContent(content: string, lines: string[], totalLines: numbe
  * Smart compression for tool results before they reach the LLM.
  * Prevents echo at the source by compressing structured tool output
  * into a form the model can analyze but cannot verbatim-repeat.
+ *
+ * Currently disabled — returns full content unchanged.
  */
 export function compressToolResult(content: string): string {
+  // Disabled: pass full tool result content to the model.
+  return content || '';
+
+  /* Original smart compression pipeline:
   if (!content || content.length < 500) return content;
 
   const lines = content.split('\n');
@@ -230,4 +241,5 @@ export function compressToolResult(content: string): string {
     compressLongContent(content, lines, totalLines, trimmed) ??
     truncateToolResult(content)
   );
+  */
 }

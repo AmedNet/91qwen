@@ -149,13 +149,17 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         }
       }
 
-      const truncated = compressToolResult(contentStr || '');
+      const toolResultText = compressToolResult(contentStr || '');
+      // Inline tool result so the model sees it directly in the prompt without reading context.txt
+      const inlineName = escXml(toolName || 'unknown');
+      const inlineResult = escXml(toolResultText);
+      segments.push(`<tool-result tool="${inlineName}">\n${inlineResult}\n</tool-result>`);
       toolResultObjects.push({
         type: 'function',
         tool: toolName || 'unknown',
         result: {
           success: true,
-          stdout: truncated,
+          stdout: toolResultText,
           stderr: '',
           command: toolName || '',
         },

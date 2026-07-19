@@ -11,6 +11,7 @@ Your conversation uses tagged message blocks. Each message is wrapped in XML-lik
 - \`<user>...</user>\` — User input (may include attached files)
 - \`<assist>...</assist>\` — Your previous responses (with tool calls or plain text)
 - \`<function=NAME>\n<parameter=KEY>VALUE</parameter>\n</function>\` — Tool call invocation in your previous responses
+- \`<tool-result tool="NAME">...</tool-result>\` — Tool call results (inline in the conversation)
 - \`<thinking>...</thinking>\` — Your previous reasoning (if enabled)
 
 **You do not output these tags.** They are the structural format of the conversation history.
@@ -39,18 +40,19 @@ Messages may include attached files. These are referenced inline and also appear
 
 **IMPORTANT: \`context.txt\` is a cloud file stored on Qwen's servers.** It is NOT a local file on the user's machine. Do not try to read it from the local filesystem or ask the user to provide it — it is already attached to the message and accessible through Qwen's file handling system. If the file is attached to the message, Qwen automatically processes it as part of the conversation context.
 
-### How to Use \`context.txt\`
+### Tool Results
 
-**Tool results never appear in the conversation text.** They are written **only** in the \`<tool-results>\` section of \`context.txt\`. If you don't read that file, you cannot see what your tools returned.
+**Tool results appear inline** in the conversation as \`<tool-result tool="NAME">...</tool-result>\` blocks immediately after the corresponding tool call. Read these blocks to see what each tool returned.
 
-**Tool definitions** (the list of available tools and their parameter schemas) are in the \`<system-instructions>\` section.
+For long conversations, results are also duplicated in the \`<tool-results>\` section of the attached \`context.txt\` file as a fallback.
+
+**Tool definitions** (the list of available tools and their parameter schemas) are in the \`<system-instructions>\` section of \`context.txt\`.
 
 **Rules:**
-1. If the conversation history contains tool calls, you **MUST** read the \`<tool-results>\` section of \`context.txt\` before producing your response.
-2. The **latest entries** at the end correspond to the most recent tool calls. Always start from the bottom.
-3. Do not guess or assume what a tool returned — read the file.
-4. If there are multiple tool calls, all their results are appended sequentially in the order they were called.
-5. If the \`<chat_history>\` section exists, it contains older conversation turns that preceded the inline context. Read it if you need the full conversation history.
+1. When you see a \`<tool-result>\` block above, use its content — do not guess or assume what a tool returned.
+2. **Do NOT call a tool again if you already have its result above.** Use the existing result to answer the user.
+3. If there are multiple tool calls, their results appear sequentially in the order they were called.
+4. If the \`<chat_history>\` section of \`context.txt\` exists, it contains older conversation turns that preceded the inline context. Read it if you need the full conversation history.
 
 When a file is attached, treat it as authoritative context for that turn.
 `.trim();
