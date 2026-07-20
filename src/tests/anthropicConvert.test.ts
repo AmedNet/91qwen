@@ -1,6 +1,8 @@
 // Tests for real exported functions from anthropicConvert.ts
 import { describe, expect, test } from 'bun:test';
 import {
+  buildReverseToolMap,
+  resolveToolName,
   anthropicMessagesToOpenAI,
   anthropicToolsToOpenAI,
   convertOpenAIResponseToAnthropic,
@@ -15,7 +17,7 @@ import {
   prepareToolCallForClaude,
 } from '../routes/anthropicConvert.ts';
 
-// ©¤©¤ normalizeSystemPrompt ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ normalizeSystemPrompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('normalizeSystemPrompt', () => {
   test('returns undefined for null/undefined', () => {
@@ -48,7 +50,7 @@ describe('normalizeSystemPrompt', () => {
   });
 });
 
-// ©¤©¤ flattenToolResultContent ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ flattenToolResultContent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('flattenToolResultContent', () => {
   test('handles null/undefined/empty', () => {
@@ -99,14 +101,14 @@ describe('flattenToolResultContent', () => {
   });
 
   test('handles search_result with array content', () => {
-    const content = [{ type: 'search_result', title: 'T', url: 'https://x.com', content: [{ text: 'part1' }, { text: 'part2' }] }];
+    const content = [{ type: 'search_result', title: 'T', url: 'https://x.com', content: [{ text: 'part1' }, { text: 'part2' }] }] as any;
     const r = flattenToolResultContent(content);
     expect(r.text).toContain('part1');
     expect(r.text).toContain('part2');
   });
 });
 
-// ©¤©¤ anthropicMessagesToOpenAI ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ anthropicMessagesToOpenAI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('anthropicMessagesToOpenAI', () => {
   test('converts system as array to system message', () => {
@@ -272,7 +274,7 @@ describe('anthropicMessagesToOpenAI', () => {
   });
 });
 
-// ©¤©¤ mergeParsedToolCalls ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ mergeParsedToolCalls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('mergeParsedToolCalls', () => {
   test('deduplicates by name+args even when IDs differ', () => {
@@ -320,7 +322,7 @@ describe('mergeParsedToolCalls', () => {
   });
 });
 
-// ©¤©¤ prepareToolCallForClaude ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ prepareToolCallForClaude â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('prepareToolCallForClaude', () => {
   test('validates Bash with command', () => {
@@ -392,7 +394,7 @@ describe('prepareToolCallForClaude', () => {
   });
 });
 
-// ©¤©¤ convertOpenAIResponseToAnthropic ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ convertOpenAIResponseToAnthropic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('convertOpenAIResponseToAnthropic', () => {
   test('converts text-only response', () => {
@@ -486,7 +488,7 @@ describe('convertOpenAIResponseToAnthropic', () => {
   });
 });
 
-// ©¤©¤ mapModel ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ mapModel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('mapModel', () => {
   test('maps known Claude models', () => {
@@ -507,7 +509,7 @@ describe('mapModel', () => {
   });
 });
 
-// ©¤©¤ anthropicToolsToOpenAI ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ anthropicToolsToOpenAI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('anthropicToolsToOpenAI', () => {
   test('converts Anthropic tool format to OpenAI format', () => {
@@ -537,7 +539,7 @@ describe('anthropicToolsToOpenAI', () => {
   });
 });
 
-// ©¤©¤ normalizeToolName ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ normalizeToolName â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('normalizeToolName', () => {
   test('normalizes known tool names to PascalCase', () => {
@@ -550,8 +552,8 @@ describe('normalizeToolName', () => {
   });
 
   test('strips noisy prefix', () => {
-    expect(normalizeToolName('¡ï-Bash')).toBe('Bash');
-    expect(normalizeToolName('¡ï-Read')).toBe('Read');
+    expect(normalizeToolName('â˜…-Bash')).toBe('Bash');
+    expect(normalizeToolName('â˜…-Read')).toBe('Read');
   });
 
   test('passes through unknown names unchanged', () => {
@@ -560,7 +562,7 @@ describe('normalizeToolName', () => {
   });
 });
 
-// ©¤©¤ mapParamName / mapToolArgs ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ mapParamName / mapToolArgs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('mapParamName / mapToolArgs', () => {
   test('maps snake_case to camelCase', () => {
@@ -582,7 +584,7 @@ describe('mapParamName / mapToolArgs', () => {
   });
 });
 
-// ©¤©¤ isDuplicateToolCall ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ isDuplicateToolCall â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe('isDuplicateToolCall', () => {
   test('matches by ID', () => {
@@ -610,13 +612,145 @@ describe('isDuplicateToolCall', () => {
   });
 });
 
+// -- buildReverseToolMap --------------------------------------------------
 
+describe('buildReverseToolMap', () => {
+  test('builds map from OpenAI-format tools', () => {
+    const tools = [
+      { type: 'function', function: { name: 'Bash', parameters: {} } },
+      { type: 'function', function: { name: 'Read', parameters: {} } },
+    ];
+    const map = buildReverseToolMap(tools);
+    expect(map.get('Bash')).toBe('Bash');
+    expect(map.get('Read')).toBe('Read');
+  });
 
+  test('maps normalized name back to original', () => {
+    const tools = [
+      { type: 'function', function: { name: 'bash', parameters: {} } },
+      { type: 'function', function: { name: 'read', parameters: {} } },
+    ];
+    const map = buildReverseToolMap(tools);
+    expect(map.get('Bash')).toBe('bash');
+    expect(map.get('Read')).toBe('read');
+  });
 
+  test('handles Anthropic-format tools (name field)', () => {
+    const tools = [
+      { name: 'Bash', description: 'Run command', input_schema: {} },
+    ];
+    const map = buildReverseToolMap(tools);
+    expect(map.get('Bash')).toBe('Bash');
+  });
 
+  test('returns empty map for undefined/empty', () => {
+    expect(buildReverseToolMap(undefined).size).toBe(0);
+    expect(buildReverseToolMap([]).size).toBe(0);
+  });
 
+  test('skips tools without name', () => {
+    const tools = [{ type: 'function', function: { parameters: {} } }];
+    const map = buildReverseToolMap(tools as any);
+    expect(map.size).toBe(0);
+  });
 
+  test('maps lowercase original for broader matching', () => {
+    const tools = [
+      { type: 'function', function: { name: 'Bash', parameters: {} } },
+    ];
+    const map = buildReverseToolMap(tools);
+    expect(map.get('bash')).toBe('Bash');
+  });
+});
 
+// -- resolveToolName -------------------------------------------------------
 
+describe('resolveToolName', () => {
+  test('returns original name when map is undefined', () => {
+    expect(resolveToolName('Bash')).toBe('Bash');
+  });
 
+  test('returns original name when map is empty', () => {
+    expect(resolveToolName('Bash', new Map())).toBe('Bash');
+  });
 
+  test('resolves from map', () => {
+    const map = new Map([['Bash', 'mcp__server__Bash']]);
+    expect(resolveToolName('Bash', map)).toBe('mcp__server__Bash');
+  });
+
+  test('falls back to normalized name when not in map', () => {
+    const map = new Map([['Read', 'Read']]);
+    expect(resolveToolName('Bash', map)).toBe('Bash');
+  });
+
+  test('falls back to lowercase lookup', () => {
+    const map = new Map([['bash', 'my_bash_tool']]);
+    expect(resolveToolName('Bash', map)).toBe('my_bash_tool');
+  });
+});
+
+// -- prepareToolCallForClaude with reverseToolMap --------------------------
+
+describe('prepareToolCallForClaude with reverseToolMap', () => {
+  test('resolves tool name using reverseToolMap', () => {
+    const map = new Map([['Bash', 'mcp__tools__Bash']]);
+    const r = prepareToolCallForClaude({ name: 'bash', arguments: { command: 'ls' } }, map);
+    expect(r.valid).toBe(true);
+    expect(r.name).toBe('mcp__tools__Bash');
+  });
+
+  test('works without reverseToolMap (backward compat)', () => {
+    const r = prepareToolCallForClaude({ name: 'bash', arguments: { command: 'ls' } });
+    expect(r.valid).toBe(true);
+    expect(r.name).toBe('Bash');
+  });
+
+  test('resolves invalid tool call name too', () => {
+    const map = new Map([['Bash', 'original_bash']]);
+    const r = prepareToolCallForClaude({ name: 'bash', arguments: 'not-json' }, map);
+    expect(r.valid).toBe(false);
+    expect(r.name).toBe('original_bash');
+  });
+});
+
+// -- convertOpenAIResponseToAnthropic with reverseToolMap -----------------
+
+describe('convertOpenAIResponseToAnthropic with reverseToolMap', () => {
+  test('uses reverseToolMap to resolve tool names in response', () => {
+    const resp = {
+      choices: [{
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls"}' } },
+          ],
+        },
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    };
+    const map = new Map([['Bash', 'custom_Bash']]);
+    const out = convertOpenAIResponseToAnthropic(resp, 'claude-sonnet-4-20250514', map);
+    expect(out.content[0].name).toBe('custom_Bash');
+  });
+
+  test('works without reverseToolMap (backward compat)', () => {
+    const resp = {
+      choices: [{
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls"}' } },
+          ],
+        },
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    };
+    const out = convertOpenAIResponseToAnthropic(resp, 'claude-sonnet-4-20250514');
+    expect(out.content[0].name).toBe('Bash');
+  });
+});

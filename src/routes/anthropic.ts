@@ -23,6 +23,7 @@ import {
   type AnthropicMessage,
   type AnthropicSystem,
 } from './anthropicConvert.ts';
+import { buildReverseToolMap } from './anthropicConvert.ts';
 import {
   acquireSessionWithCorrections,
   buildQwenMessages,
@@ -114,7 +115,7 @@ async function setupAnthropicSession(
   let inlineContent = processedMessages[0].content as string;
   let chatHistoryContent = '';
   if (typeof inlineContent === 'string' && inlineContent.length > MAX_INLINE_CHARS) {
-    const parts = inlineContent.split(/\n\n(?=<user>|<assist>)/);
+    const parts = inlineContent.split(/\n\n(?=<user>|<assist>|<tool-result)/);
     let keptLen = 0;
     let splitIdx = parts.length;
     for (let i = parts.length - 1; i >= 0; i--) {
@@ -345,6 +346,7 @@ async function handleAnthropicStream(
   nextParentId: string | null,
   sessionHeaders: any,
   promptTokenEstimate: number = 0,
+  reverseToolMap?: Map<string, string>,
 ): Promise<Response> {
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
@@ -598,7 +600,7 @@ async function handleAnthropicStream(
       const validToolCalls: ParsedToolCall[] = [];
       const validArgs: any[] = [];
       for (const tc of allToolCalls) {
-        const result = prepareToolCallForClaude(tc);
+        const result = prepareToolCallForClaude(tc, reverseToolMap);
         if (result.valid) {
           logStore.log(
             'debug',
@@ -783,6 +785,10 @@ export async function anthropicMessages(c: Context) {
     const openaiMessages = anthropicMessagesToOpenAI(messages, system);
     const convertedTools = anthropicToolsToOpenAI(tools);
 
+    // Build reverse tool map: normalized name -> original name from request
+    // Ensures response tool_use blocks use the exact names Claude Code registered
+    const reverseToolMap = buildReverseToolMap(convertedTools);
+
     // Build synthetic OpenAIRequest
     const body: OpenAIRequest = {
       model: mappedModel,
@@ -879,7 +885,7 @@ export async function anthropicMessages(c: Context) {
         logStore.log('error', 'chat', `[Anthropic] OpenAI endpoint returned error: ${JSON.stringify(openAIResp.error)}`);
         return c.json(openAIResp, <any>openAIResponse.status);
       }
-      const anthropicResp = convertOpenAIResponseToAnthropic(openAIResp, anthropicModel);
+      const anthropicResp = convertOpenAIResponseToAnthropic(openAIResp, anthropicModel, reverseToolMap);
       logStore.log(
         'debug',
         'chat',
@@ -902,6 +908,7 @@ export async function anthropicMessages(c: Context) {
       nextParentId,
       sessionHeaders,
       promptTokenEstimate,
+      reverseToolMap,
     );
     logStore.log('debug', 'chat', `[Anthropic] Streaming completed latency=${Date.now() - _requestStartTime}ms`);
     cancelWatchdog();

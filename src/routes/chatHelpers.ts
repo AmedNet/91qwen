@@ -104,17 +104,27 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       if (sanitized.length === 0) continue;
 
       const charLimit = Math.floor(availableTokens * 3.0);
-      const truncated =
-        sanitized.length > charLimit
-          ? sanitized.substring(0, charLimit) +
-            `\n\n[TRUNCATED: input exceeded ${charLimit} characters (model: ${body.model}, available tokens: ${availableTokens})]`
-          : sanitized;
+      let truncated = sanitized;
+      if (sanitized.length > charLimit) {
+        // Truncate at segment boundary to avoid breaking XML tags
+        let cutPoint = charLimit;
+        const lastUserTag = sanitized.lastIndexOf('\n<user>', charLimit);
+        const lastAssistTag = sanitized.lastIndexOf('\n<assist>', charLimit);
+        const lastToolTag = sanitized.lastIndexOf('\n<tool-result', charLimit);
+        const lastBoundary = Math.max(lastUserTag, lastAssistTag, lastToolTag);
+        if (lastBoundary > charLimit * 0.5) {
+          cutPoint = lastBoundary;
+        }
+        truncated = sanitized.substring(0, cutPoint) +
+          `\n\n[TRUNCATED: input exceeded ${charLimit} characters (model: ${body.model}, available tokens: ${availableTokens})]`;
+      }
 
       segments.push(`<user>\n${truncated}\n</user>`);
     } else if (msg.role === 'assistant') {
       let assistantContent = contentStr || '';
-      const reasoning = msg.reasoning_content;
-      if (reasoning) assistantContent = `<thinking>\n${reasoning}\n</thinking>\n\n${assistantContent}`;
+      // Do NOT feed reasoning_content back to the model.
+      // When Qwen sees its own previous thinking, it enters an echo loop
+      // repeating the same reasoning endlessly (observed with qwen3.7-max).
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {

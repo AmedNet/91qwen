@@ -130,8 +130,8 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   let chatHistoryContent = '';
 
   if (typeof inlineContent === 'string' && inlineContent.length > MAX_INLINE_CHARS) {
-    // Split on message boundaries: \n\n followed by <user> or <assist>
-    const parts = inlineContent.split(/\n\n(?=<user>|<assist>)/);
+    // Split on message boundaries: \n\n followed by <user>, <assist>, or <tool-result
+    const parts = inlineContent.split(/\n\n(?=<user>|<assist>|<tool-result)/);
 
     // Walk backwards — keep as many recent segments as fit within limit
     let keptLen = 0;

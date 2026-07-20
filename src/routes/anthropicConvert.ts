@@ -1,5 +1,5 @@
 /**
- * Anthropic Messages â†?OpenAI / Claude Code conversion helpers.
+ * Anthropic Messages ->OpenAI / Claude Code conversion helpers.
  * Kept separate from the route handler so unit tests can import without HTTP deps.
  */
 
@@ -27,7 +27,7 @@ export interface AnthropicMessage {
 
 export type AnthropicSystem = string | AnthropicContentBlock[];
 
-/** Claude Code / Anthropic model id â†?Qwen dotted model name. */
+/** Claude Code / Anthropic model id ->Qwen dotted model name. */
 export const ANTHROPIC_TO_QWEN: Record<string, string> = {
   'claude-sonnet-4-20250514': 'qwen3.7-max',
   'claude-sonnet-4-20241022': 'qwen3.6-plus',
@@ -81,6 +81,27 @@ export function normalizeToolName(name: string): string {
     skill: 'Skill',
   };
   return CASE_MAP[stripped.toLowerCase()] || stripped;
+}
+
+/** Build a map from normalized tool name -> original name as sent in the request tools array. */
+export function buildReverseToolMap(tools?: any[]): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!tools || !Array.isArray(tools)) return map;
+  for (const t of tools) {
+    const originalName = t.function?.name || t.name;
+    if (!originalName) continue;
+    const normalized = normalizeToolName(originalName);
+    map.set(normalized, originalName);
+    // Also map the raw lowercase version for broader matching
+    map.set(originalName.toLowerCase(), originalName);
+  }
+  return map;
+}
+
+/** Resolve a normalized tool name back to its original request name using the reverse map. */
+export function resolveToolName(normalizedName: string, reverseToolMap?: Map<string, string>): string {
+  if (!reverseToolMap || reverseToolMap.size === 0) return normalizedName;
+  return reverseToolMap.get(normalizedName) || reverseToolMap.get(normalizedName.toLowerCase()) || normalizedName;
 }
 
 /** Map Qwen snake_case aliases to Claude Code camelCase for non-file tools. */
@@ -285,7 +306,7 @@ export function anthropicMessagesToOpenAI(messages: AnthropicMessage[], system?:
               function: { name: block.name, arguments: JSON.stringify(block.input || {}) },
             });
           } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
-            // skip â€?model reasoning, not input to Qwen
+            // skip ->model reasoning, not input to Qwen
           } else {
             console.warn(`[Anthropic] Unknown assistant block: ${block.type}`);
           }
@@ -358,7 +379,7 @@ export function mergeParsedToolCalls(xmlCalls: ParsedToolCall[], localCalls: Par
   return merged;
 }
 
-export function prepareToolCallForClaude(tc: { name: string; arguments: unknown; id?: string }): {
+export function prepareToolCallForClaude(tc: { name: string; arguments: unknown; id?: string }, reverseToolMap?: Map<string, string>): {
   valid: boolean;
   name: string;
   args: Record<string, unknown>;
@@ -369,20 +390,20 @@ export function prepareToolCallForClaude(tc: { name: string; arguments: unknown;
   } catch {
     /* ignore */
   }
-  if (!args || typeof args !== 'object') return { valid: false, name: normalizeToolName(tc.name), args: {} };
+  if (!args || typeof args !== 'object') return { valid: false, name: resolveToolName(normalizeToolName(tc.name), reverseToolMap), args: {} };
   const name = normalizeToolName(tc.name);
   const mapped = normalizeToolArgs(name, args as Record<string, unknown>);
-  return { valid: isValidClaudeCodeToolCall(name, mapped), name, args: mapped };
+  return { valid: isValidClaudeCodeToolCall(name, mapped), name: resolveToolName(name, reverseToolMap), args: mapped };
 }
 
-export function convertOpenAIResponseToAnthropic(openAIResp: any, requestModel: string): any {
+export function convertOpenAIResponseToAnthropic(openAIResp: any, requestModel: string, reverseToolMap?: Map<string, string>): any {
   const choice = openAIResp.choices?.[0];
   const message = choice?.message || {};
   const content: any[] = [];
 
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
-      const result = prepareToolCallForClaude({ name: tc.function?.name, arguments: tc.function?.arguments, id: tc.id });
+      const result = prepareToolCallForClaude({ name: tc.function?.name, arguments: tc.function?.arguments, id: tc.id }, reverseToolMap);
       if (!result.valid) continue;
       content.push({ type: 'tool_use', id: tc.id, name: result.name, input: result.args });
     }

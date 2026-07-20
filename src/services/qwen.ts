@@ -93,6 +93,8 @@ export interface QwenPayload {
   parent_id: string | null;
   messages: QwenMessage[];
   timestamp: number;
+  tools?: unknown[];
+  tool_choice?: unknown;
 }
 
 export interface QwenStreamResult {
@@ -240,10 +242,11 @@ export async function createQwenStream(
     parent_id: actualParentId,
     messages: qwenMessages,
     timestamp: timestamp + 1,
-    // Only send tools via feature_config.local_mcp (Qwen native format).
-    // Do NOT inject top-level tools/tool_choice — that triggers OpenAI
-    // compatibility mode which silently downgrades thinking_format to summary.
-    // local_mcp is already populated in chatHelpers.ts when body.tools exist.
+    // Send tools at top level as primary mechanism (reliable).
+    // feature_config.local_mcp is kept as supplementary for Qwen-native routing.
+    // Both are needed: local_mcp alone intermittently fails with "Tool does not exists".
+    ...(tools && (tools as any[]).length > 0 ? { tools } : {}),
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
   };
 
   const urlObj = new URL(QWEN_CHAT_COMPLETIONS_URL);
@@ -397,6 +400,14 @@ export async function createQwenStream(
       'qwen',
       `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'}`,
     );
+    // ponytail: when Qwen returns a non-2xx status code with a JSON error body
+    // (rate limits, chat-in-progress, tool-not-found, etc.), parse the error
+    // and throw a typed RetryableQwenStreamError so the retry loop can switch
+    // accounts or retry with backoff. Without this, we'd feed the error JSON
+    // as SSE chunks into the streaming pipeline and the client sees garbage.
+    if (!response.ok) {
+      await handleErrorResponse(response, lastDebugEntryId || '');
+    }
     return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile };
   };
 
