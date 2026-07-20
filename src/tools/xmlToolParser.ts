@@ -99,16 +99,43 @@ export function cleanTextOfXmlArtifacts(text: string): { toolCalls: ParsedXmlToo
   return { toolCalls, cleanedText: fullyCleaned };
 }
 
+/**
+ * Qwen models often forget underscores in snake_case parameter names
+ * (e.g. "filepath" instead of "file_path", "oldstring" instead of "old_string").
+ * This map re-canonicalizes known mistakes before the tool call is emitted to the client.
+ */
+const PARAM_NAME_FIXUPS: Record<string, string> = {
+  filepath: 'file_path',
+  newstring: 'new_string',
+  oldstring: 'old_string',
+  toolcallid: 'tool_call_id',
+  replaceall: 'replace_all',
+  dryrun: 'dry_run',
+  caseinsensitive: 'case_insensitive',
+  outputmode: 'output_mode',
+  headlimit: 'head_limit',
+  maxresults: 'max_results',
+  notebookpath: 'notebook_path',
+  targetdirectory: 'target_directory',
+  globpattern: 'glob_pattern',
+};
+
+function fixupParamName(key: string): string {
+  const lowered = key.toLowerCase();
+  return PARAM_NAME_FIXUPS[lowered] || key;
+}
+
 export function xmlToolCallToParsed(
   block: ParsedXmlToolCall,
   _index: number,
 ): { id: string; name: string; arguments: Record<string, unknown> } {
   const args: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(block.parameters)) {
+    const fixedKey = fixupParamName(key);
     try {
-      args[key] = JSON.parse(value);
+      args[fixedKey] = JSON.parse(value);
     } catch {
-      args[key] = value;
+      args[fixedKey] = value;
     }
   }
   const rawName = block.name;
