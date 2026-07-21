@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+﻿import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -26,6 +26,10 @@ const modelSpecs = JSON.parse(readFileSync(fileURLToPath(new URL('../models.json
 const SYSTEM_REMINDER_RE = /<system-reminder\b[^>]*>([\s\S]*?)<\/system-reminder>/gi;
 const TAG_STRIP_RE = /<(?:system|instruction|prompt|rule)\b[^>]*>[\s\S]*?<\/(?:system|instruction|prompt|rule)>/gi;
 const THINK_TAG_STRIP_RE = new RegExp(`<(?:${THINK_TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?<\/(?:${THINK_TAG_NAMES.join('|')})>`, 'gi');
+// Strip Qwen thinking output lines (∴/∵ prefix used in thinking summaries)
+const THINKING_PREFIX_LINE_RE = /^[∴∵].*$/gm;
+// Strip incomplete thinking tags (no closing tag — truncated at chunk boundary)
+const THINK_TAG_INCOMPLETE_RE = new RegExp(`<(?:${THINK_TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?$`, 'gi');
 const ROLE_PREFIX_RE = /^(?:System|Assistant|User|Human):\s*/gim;
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
 
@@ -97,6 +101,8 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       let sanitized = text
         .replace(TAG_STRIP_RE, '')
         .replace(THINK_TAG_STRIP_RE, '')
+        .replace(THINKING_PREFIX_LINE_RE, '')
+        .replace(THINK_TAG_INCOMPLETE_RE, '')
         .replace(ROLE_PREFIX_RE, '')
         .replace(CONTROL_CHAR_RE, '')
         .trim();
@@ -125,6 +131,34 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       // Do NOT feed reasoning_content back to the model.
       // When Qwen sees its own previous thinking, it enters an echo loop
       // repeating the same reasoning endlessly (observed with qwen3.7-max).
+      // Strip thinking tags, thinking prefix lines, and incomplete thinking tags
+      assistantContent = assistantContent
+        .replace(THINK_TAG_STRIP_RE, '')
+        .replace(THINKING_PREFIX_LINE_RE, '')
+        .replace(THINK_TAG_INCOMPLETE_RE, '')
+        .trim();
+
+      // Truncate repetitive assistant content (loop residue from previous turns)
+      if (assistantContent.length > 500) {
+        const lines = assistantContent.split('\n');
+        const seen = new Set<string>();
+        const deduped: string[] = [];
+        let repeatCount = 0;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.length > 20 && seen.has(trimmed)) {
+            repeatCount++;
+            if (repeatCount > 3) continue; // skip excessive repeats
+          } else {
+            if (trimmed.length > 20) seen.add(trimmed);
+            repeatCount = 0;
+          }
+          deduped.push(line);
+        }
+        if (repeatCount > 3) {
+          assistantContent = deduped.join('\n').trimEnd() + '\n[... repetitive content truncated]';
+        }
+      }
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
@@ -152,13 +186,21 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       segments.push(`<assist>\n${assistantContent}\n</assist>`);
     } else if (msg.role === 'tool' || msg.role === 'function') {
       let toolName = msg.name;
-      if (!toolName && msg.tool_call_id) {
+      let toolCallArgs: any = null;
+      if (msg.tool_call_id) {
         for (let j = i - 1; j >= 0; j--) {
           const prevMsg = messages[j];
           if (prevMsg.role === 'assistant' && prevMsg.tool_calls) {
             const call = prevMsg.tool_calls.find((tc: any) => tc.id === msg.tool_call_id);
             if (call) {
-              toolName = call.function?.name;
+              if (!toolName) toolName = call.function?.name;
+              // Extract the actual command/arguments from the tool call
+              const rawArgs = call.function?.arguments;
+              if (typeof rawArgs === 'string') {
+                try { toolCallArgs = JSON.parse(rawArgs); } catch { toolCallArgs = null; }
+              } else if (rawArgs && typeof rawArgs === 'object') {
+                toolCallArgs = rawArgs;
+              }
               break;
             }
           }
@@ -171,6 +213,27 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       const inlineName = escXml(toolName || 'unknown');
       const inlineResult = escXml(toolResultText);
       segments.push(`<tool-result tool="${inlineName}">\n${inlineResult}\n</tool-result>`);
+
+      // Extract a meaningful command string from tool call arguments
+      let commandStr = toolName || '';
+      if (toolCallArgs && typeof toolCallArgs === 'object') {
+        // For shell/bash tools, use the command parameter
+        const cmd = toolCallArgs.command || toolCallArgs.cmd || toolCallArgs.script;
+        if (typeof cmd === 'string' && cmd.trim()) {
+          commandStr = cmd.trim();
+        } else {
+          // For other tools, serialize the arguments as a summary
+          const argEntries = Object.entries(toolCallArgs).filter(([, v]) => v !== undefined && v !== null && v !== '');
+          if (argEntries.length > 0) {
+            const parts = argEntries.map(([k, v]) => {
+              const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
+              return val.length > 80 ? `${k}=<${val.slice(0, 77)}...>` : `${k}=${val}`;
+            });
+            commandStr = `${toolName || 'unknown'}(${parts.join(', ')})`;
+          }
+        }
+      }
+
       toolResultObjects.push({
         type: 'function',
         tool: toolName || 'unknown',
@@ -178,7 +241,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
           success: !isErrorResult,
           stdout: isErrorResult ? '' : toolResultText,
           stderr: isErrorResult ? toolResultText.replace(/^\[ERROR\]\s*/, '') : '',
-          command: toolName || '',
+          command: commandStr,
         },
       });
     }
@@ -187,7 +250,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   // Single user message with all history wrapped in <user>/<assist> tags
   let prompt = segments.length > 0 ? segments.join('\n\n') : '';
 
-  const featureConfig = buildFeatureConfig(true);
+  const featureConfig = buildFeatureConfig(!body.model.includes("-no-thinking"));
 
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const localMcp: Record<string, any> = {};

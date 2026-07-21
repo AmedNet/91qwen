@@ -13,6 +13,8 @@ export interface StreamLoopResult {
   buffer: string;
   nextParentId: string | null;
   error?: string;
+  /** When true, the stream was terminated by mid-stream RateLimited — caller should retry with next account. */
+  retryAccount?: boolean;
 }
 
 export async function runStreamLoop(
@@ -85,6 +87,12 @@ export async function runStreamLoop(
           streamDone = true;
           break;
         }
+        if (result === 'retry_account') {
+          streamDone = true;
+          // Return immediately — caller will restart with next account.
+          // Don't emit any partial content; the client sees a clean retry.
+          return { buffer: bufferRef.text, nextParentId, retryAccount: true };
+        }
       } catch (e) {
         console.error('[Chat] Streaming: parse error on chunk, ignoring partial:', (e as Error)?.message, 'raw:', dataStr.slice(0, 200));
       }
@@ -108,6 +116,10 @@ export async function handlePostStreamCompletion(
     buffer: string;
     enableContentFiltering: boolean;
     includeUsage: boolean;
+    /** Callback to disable the current account on RateLimited. */
+    disableAccount: (email: string) => void;
+    /** When true, skip post-stream processing — caller is retrying with a new account. */
+    skipPostStream?: boolean;
   },
   cleanup: {
     reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -130,12 +142,26 @@ export async function handlePostStreamCompletion(
     buffer,
     enableContentFiltering,
     includeUsage,
+    disableAccount,
+    skipPostStream,
   } = args;
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
+
+  // When the caller is retrying with a new account after mid-stream RateLimited,
+  // skip all post-stream processing — don't emit partial content to the client.
+  if (skipPostStream) {
+    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
+    return;
+  }
 
   try {
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
+      // Check for RateLimited — disable account so it won't be reused
+      if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
+        disableAccount(resolvedEmail);
+        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: disabled ${resolvedEmail} — ${upstreamError.message}`);
+      }
       try {
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
       } catch (e) {}

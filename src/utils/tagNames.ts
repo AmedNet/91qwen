@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Central registry of known XML tag names used across the stripping/parsing pipeline.
  *
  * All stripping code MUST import from this file rather than hardcoding tag names.
@@ -27,7 +27,7 @@ export const TOOL_CALL_KEYWORDS = ['function', 'parameter'] as const;
 export const THINK_TAG_NAMES = ['think', 'thinking', 'thought'] as const;
 
 /** Known XML tag names for tool result blocks (legacy format). */
-export const TOOL_RESULT_KEYWORDS = ['tool_result'] as const;
+export const TOOL_RESULT_KEYWORDS = ['tool_result', 'tool-result'] as const;
 
 /** Every known tool-related XML tag name (all Qwen API versions). */
 export const ALL_TOOL_KEYWORDS = [...TOOL_CALL_KEYWORDS, ...TOOL_RESULT_KEYWORDS, 'tool_call', 'tool_use'] as const;

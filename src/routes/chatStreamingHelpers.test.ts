@@ -24,7 +24,10 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    chunksSinceLastTagOpen: 0,
     pendingChunk: '',
+    recentChunks: [],
+    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -49,10 +52,11 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
       triggered: false,
     },
     qwenAbortController: new AbortController(),
+    disableAccount: () => {},
+    retryWithNewAccount: () => {},
   };
 
   const chunks = [
-    'Both',
     ' files now set `',
     'thinking_format: "',
     'full"`.\n\n',
@@ -159,7 +163,10 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    chunksSinceLastTagOpen: 0,
     pendingChunk: '',
+    recentChunks: [],
+    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -184,6 +191,8 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
       triggered: false,
     },
     qwenAbortController: new AbortController(),
+    disableAccount: () => {},
+    retryWithNewAccount: () => {},
   };
 
   // Simulate a tool call tag split across chunks: <function=read>\n...content...
@@ -242,7 +251,10 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    chunksSinceLastTagOpen: 0,
     pendingChunk: '',
+    recentChunks: [],
+    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -267,6 +279,8 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
       triggered: false,
     },
     qwenAbortController: new AbortController(),
+    disableAccount: () => {},
+    retryWithNewAccount: () => {},
   };
 
   // Non-tool-call text with < that might trigger the buffer:
@@ -340,7 +354,10 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    chunksSinceLastTagOpen: 0,
     pendingChunk: '',
+    recentChunks: [],
+    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -365,19 +382,16 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
       triggered: false,
     },
     qwenAbortController: new AbortController(),
+    disableAccount: () => {},
+    retryWithNewAccount: () => {},
   };
 
-  // Create content that exceeds MAX_BUFFER_CHARS (200) without '>' appearing
-  // Chunk N: starts with '<' and no '>' → buffered
-  // Chunk N+1: more text with '<' still no '>' → combined still under 200 → buffer again
-  // We need enough chunks to exceed 200 chars without any '>'
-  const longBase = 'A'.repeat(100);
-  // Chunk has '<' and no '>', and combined with previous never has '>'
-  // The chunk itself is 101 chars (100 A's + '<'), which is < 200. Combined with buffer it grows.
-  // Chunk 1: '<' + 'AAAA...' (101 chars) → buffered (p=101)
-  // Chunk 2: 'BBBB...' (100 chars) → combined 201 > 200 → force-release
-  const chunk1 = '<' + longBase;
-  const chunk2 = 'B'.repeat(100);
+  // Force-release scenario: a tag-like chunk grows beyond MAX_BUFFER_CHARS.
+  // Use <funct (prefix of "function") so the pre-check allows buffering,
+  // then append long content to exceed 200 chars. The content has no '>'
+  // so the tag never completes, but length exceeds MAX_BUFFER_CHARS.
+  const chunk1 = '<funct' + 'A'.repeat(50);  // ~56 chars, has <funct prefix (looks like function tag)
+  const chunk2 = 'B'.repeat(160);  // combined > 200 → force-release
 
   // Process chunk 1
   await processStreamData(
@@ -388,8 +402,8 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     ctx,
   );
 
-  // After chunk 1: should be buffered
-  assert.strictEqual(state.pendingChunk, chunk1, 'chunk with < and no > should be buffered');
+  // After chunk 1: should be buffered (looks like function tag start)
+  assert.strictEqual(state.pendingChunk, chunk1, 'chunk with tag-like < and no > should be buffered');
   assert.strictEqual(state.lastFullContent, '', 'lastFullContent should NOT accumulate buffered chunk');
 
   // Process chunk 2: combined length exceeds MAX_BUFFER_CHARS → force-release

@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+﻿import crypto from 'node:crypto';
 import { TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 
 export interface ParsedXmlToolCall {
@@ -11,7 +11,7 @@ export interface ParsedXmlToolCall {
 // (called 50-200 times per streaming request).
 const FKW = TOOL_CALL_KEYWORDS[0]; // 'function' — the block-level keyword
 const PKW = TOOL_CALL_KEYWORDS[1]; // 'parameter' — the parameter keyword
-const FUNCTION_BLOCK_RE = new RegExp(`<${FKW}=[^\\s>]+[\\s\\S]*?>[\\s\\S]*?(?:<\\/${FKW}>|$)`, 'g');
+const FUNCTION_BLOCK_RE = new RegExp(`<${FKW}=[^\\s>]+[\\s\\S]*?>[\\s\\S]*?<\\/${FKW}>`, 'g');
 const PARAM_RE = new RegExp(`<${PKW}=([^\\s>]+)>([\\s\\S]*?)<\\/${PKW}>`, 'g');
 const FUNC_NAME_RE = new RegExp(`^<${FKW}=([^\\s>]+)>`);
 
@@ -104,7 +104,7 @@ export function cleanTextOfXmlArtifacts(text: string): { toolCalls: ParsedXmlToo
  * (e.g. "filepath" instead of "file_path", "oldstring" instead of "old_string").
  * This map re-canonicalizes known mistakes before the tool call is emitted to the client.
  */
-const PARAM_NAME_FIXUPS: Record<string, string> = {
+export const PARAM_NAME_FIXUPS: Record<string, string> = {
   filepath: 'file_path',
   newstring: 'new_string',
   oldstring: 'old_string',
@@ -118,11 +118,54 @@ const PARAM_NAME_FIXUPS: Record<string, string> = {
   notebookpath: 'notebook_path',
   targetdirectory: 'target_directory',
   globpattern: 'glob_pattern',
+  alloweddomains: 'allowed_domains',
+  blockeddomains: 'blocked_domains',
+  subagenttype: 'subagent_type',
+  runinbackground: 'run_in_background',
+  cellid: 'cell_id',
+  newsource: 'new_source',
+  editmode: 'edit_mode',
+  celltype: 'cell_type',
+  dangerouslydisablesandbox: 'dangerouslyDisableSandbox',
+  notebookPath: 'notebookPath',
 };
+
+/** Known canonical parameter names for Claude Code tools.
+ *  Single source of truth — imported by chatStreamingHelpers.ts.
+ *  Covers all Claude Code agent tool parameters. */
+export const CANONICAL_PARAM_NAMES = [
+  // Edit / Write / Read
+  'file_path', 'old_string', 'new_string', 'content',
+  'offset', 'limit', 'pages',
+  // Bash
+  'command', 'description', 'dangerouslyDisableSandbox', 'timeout', 'run_in_background',
+  // Glob / Grep
+  'pattern', 'path', 'glob_pattern', 'output_mode', 'head_limit',
+  // WebFetch / WebSearch
+  'url', 'prompt', 'query', 'allowed_domains', 'blocked_domains',
+  // Task / Agent
+  'subagent_type', 'model',
+  // NotebookEdit
+  'notebook_path', 'notebookPath', 'cell_id', 'new_source', 'edit_mode', 'cell_type',
+  // TodoWrite
+  'todos',
+  // Generic / cross-cutting
+  'tool_call_id', 'replace_all', 'dry_run', 'case_insensitive',
+  'max_results', 'target_directory',
+];
 
 function fixupParamName(key: string): string {
   const lowered = key.toLowerCase();
-  return PARAM_NAME_FIXUPS[lowered] || key;
+  const fixed = PARAM_NAME_FIXUPS[lowered];
+  if (fixed) return fixed;
+  // Fuzzy match: normalize by removing underscores and compare
+  const normalized = lowered.replace(/_/g, '');
+  for (const canonical of CANONICAL_PARAM_NAMES) {
+    if (canonical.toLowerCase().replace(/_/g, '') === normalized) {
+      return canonical;
+    }
+  }
+  return key;
 }
 
 export function xmlToolCallToParsed(
@@ -139,7 +182,7 @@ export function xmlToolCallToParsed(
     }
   }
   const rawName = block.name;
-  const name = rawName.startsWith('★-') ? rawName.slice(2) : rawName;
+  const name = rawName.replace(/^[^A-Za-z0-9]+-?/, '');
   return {
     id: `call_${crypto.randomUUID()}`,
     name,

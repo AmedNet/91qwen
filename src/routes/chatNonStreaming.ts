@@ -1,6 +1,7 @@
 import { Context } from 'hono';
 import { logStore } from '../services/logStore.ts';
 import { sessionPool } from '../services/sessionPool.ts';
+import { setAccountDisabled } from '../services/auth.ts';
 import { detectParallelToolLoop } from '../tools/guard.ts';
 import type { Message, OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
@@ -30,6 +31,8 @@ export interface NonStreamingContext {
   sessionHeaders: any;
   toolCalling: boolean;
   cleanOutput: boolean;
+  /** Mutable signal set when RateLimited is detected — caller checks after return. */
+  retrySignal?: { needsRetry: boolean; failedEmail: string };
 }
 
 interface StreamProcessorState {
@@ -177,11 +180,30 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   if (chunk.error) {
     const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
     logStore.addError(ctx.logId, `Qwen upstream SSE error: ${errMsg}`);
+    // Check for RateLimited mid-stream — signal retry via retrySignal
+    if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && ctx.resolvedEmail) {
+      setAccountDisabled(ctx.resolvedEmail, true);
+      if (ctx.retrySignal) {
+        ctx.retrySignal.needsRetry = true;
+        ctx.retrySignal.failedEmail = ctx.resolvedEmail;
+      }
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via non-streaming SSE error: disabled ${ctx.resolvedEmail}, signaling retry`);
+    }
     return;
   }
   const deltaStatus = chunk.choices?.[0]?.delta?.status;
   if (deltaStatus === 'error') {
-    logStore.addError(ctx.logId, 'Qwen stream delta returned error status');
+    const deltaCode = chunk.choices?.[0]?.delta?.code;
+    const deltaMsg = chunk.choices?.[0]?.delta?.message || '';
+    logStore.addError(ctx.logId, `Qwen stream delta returned error status: code=${deltaCode} msg=${deltaMsg}`);
+    if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && ctx.resolvedEmail) {
+      setAccountDisabled(ctx.resolvedEmail, true);
+      if (ctx.retrySignal) {
+        ctx.retrySignal.needsRetry = true;
+        ctx.retrySignal.failedEmail = ctx.resolvedEmail;
+      }
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via non-streaming delta status: disabled ${ctx.resolvedEmail}, signaling retry`);
+    }
     return;
   }
 
@@ -361,10 +383,19 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
 }
 
 async function processContentChunks(state: StreamProcessorState, ctx: NonStreamingContext): Promise<Response> {
-  const { c, logId } = ctx;
+  const { c, logId, resolvedEmail } = ctx;
 
   const upstreamError = parseQwenErrorPayload(state.buffer);
   if (upstreamError) {
+    // Check for RateLimited — disable account so it won't be reused
+    if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
+      setAccountDisabled(resolvedEmail, true);
+      if (ctx.retrySignal) {
+        ctx.retrySignal.needsRetry = true;
+        ctx.retrySignal.failedEmail = resolvedEmail;
+      }
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via non-streaming flush: disabled ${resolvedEmail} — ${upstreamError.message}`);
+    }
     logStore.finalizeRequest(logId);
     return c.json(
       {

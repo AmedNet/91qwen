@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { pickAccount, setAccountDisabled, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -424,6 +424,19 @@ async function handleAnthropicStream(
           } catch {
             continue;
           }
+
+          // ── RateLimited / upstream error detection ──────────────────
+          // Check for upstream Qwen error sent as SSE data chunk
+          if (chunk.error) {
+            const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
+            logStore.addError(logId, `Qwen upstream SSE error: ${errMsg}`);
+            if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && resolvedEmail) {
+              setAccountDisabled(resolvedEmail, true);
+              logStore.log('warn', 'qwen', `[Anthropic] RateLimited via SSE: disabled ${resolvedEmail} — ${errMsg}`);
+            }
+            break; // terminate stream on upstream error
+          }
+
           // ponytail: qwenRawChunks stores text content, not raw SSE JSON
           // raw SSE is not stored — qwenRawChunks tracks each content delta
 
@@ -438,9 +451,19 @@ async function handleAnthropicStream(
             if (chunk.usage.input_tokens) promptTokensFromChunks = chunk.usage.input_tokens;
           }
 
-          // Extract local MCP tool calls
+          // Extract local MCP tool calls — and check for error status
           const deltaStatus = chunk.choices?.[0]?.delta?.status;
           const deltaPhase = chunk.choices?.[0]?.delta?.phase;
+          if (deltaStatus === 'error') {
+            const deltaCode = chunk.choices?.[0]?.delta?.code;
+            const deltaMsg = chunk.choices?.[0]?.delta?.message || '';
+            logStore.addError(logId, `Qwen stream delta returned error status: code=${deltaCode} msg=${deltaMsg}`);
+            if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && resolvedEmail) {
+              setAccountDisabled(resolvedEmail, true);
+              logStore.log('warn', 'qwen', `[Anthropic] RateLimited via delta status: disabled ${resolvedEmail} — code=${deltaCode} msg=${deltaMsg}`);
+            }
+            break; // terminate stream on upstream error
+          }
           if (deltaStatus === 'finished' && deltaPhase === 'local_tool') {
             const calls = extractLocalMcpToolCalls(chunk);
             logStore.log('debug', 'chat', `[Anthropic] local_mcp SSE chunk: extracted ${calls.length} tool calls`);
@@ -860,6 +883,7 @@ export async function anthropicMessages(c: Context) {
 
     if (!isStream) {
       // Non-streaming: reuse handleNonStreamingRequest then convert response
+      const retrySignal = { needsRetry: false, failedEmail: '' };
       const nonStreamingCtx: NonStreamingContext = {
         c,
         logId,
@@ -872,9 +896,40 @@ export async function anthropicMessages(c: Context) {
         sessionHeaders,
         toolCalling,
         cleanOutput,
+        retrySignal,
       };
       logStore.log('debug', 'chat', `[Anthropic] Processing non-streaming via handleNonStreamingRequest`);
       const openAIResponse = await handleNonStreamingRequest(nonStreamingCtx);
+      if (retrySignal.needsRetry) {
+        // RateLimited — retry with new account
+        logStore.log('info', 'chat', `[Anthropic] Non-streaming RateLimited on ${retrySignal.failedEmail}, retrying with next account`);
+        // Re-acquire session with new account
+        const retrySetup = await setupAnthropicSession(
+          openaiMessages, body, contextCheck.availableTokens!, toolCalling, logId,
+        );
+        const retryCtx: NonStreamingContext = {
+          c,
+          logId,
+          completionId: 'chatcmpl-' + crypto.randomUUID(),
+          body,
+          session: retrySetup.session,
+          stream: retrySetup.stream,
+          resolvedEmail: retrySetup.resolvedEmail,
+          initialParentId: retrySetup.nextParentId,
+          sessionHeaders: retrySetup.sessionHeaders,
+          toolCalling,
+          cleanOutput,
+        };
+        const retryResponse = await handleNonStreamingRequest(retryCtx);
+        const retryBody = await retryResponse.json();
+        if (retryBody.error) {
+          cancelWatchdog();
+          return c.json(retryBody, retryResponse.status);
+        }
+        const anthropicResponse = convertOpenAIResponseToAnthropic(retryBody, anthropicModel, anthropicVersion, anthropicBeta, anthropicModel);
+        cancelWatchdog();
+        return c.json(anthropicResponse, retryResponse.status);
+      }
       const openAIResp = await openAIResponse.json();
       logStore.log(
         'debug',

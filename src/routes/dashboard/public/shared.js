@@ -118,13 +118,13 @@ function applyDarkMode(enabled) {
   var sun = document.getElementById('dmSun');
   if (enabled) {
     html.classList.add('dark-mode');
-    if (label) label.textContent = 'Dark';
+    if (label) label.textContent = '深色';
     if (moon) moon.style.display = '';
     if (sun) sun.style.display = 'none';
     if (sw) sw.classList.add('active');
   } else {
     html.classList.remove('dark-mode');
-    if (label) label.textContent = 'Light';
+    if (label) label.textContent = '浅色';
     if (moon) moon.style.display = 'none';
     if (sun) sun.style.display = '';
     if (sw) sw.classList.remove('active');

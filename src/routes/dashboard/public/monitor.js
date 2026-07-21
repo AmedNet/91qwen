@@ -35,22 +35,22 @@ async function refreshMonitor() {
   // ── KPI Row ──
   var t = data.totals || {};
   setText('kpiTotalReqs', fmtNumber(t.totalRequests));
-  setText('kpiTotalReqsSub', (t.totalRequests || 0) + ' total');
+  setText('kpiTotalReqsSub', (t.totalRequests || 0) + ' 总计');
   setText('kpiSuccess', fmtNumber(t.totalSuccess));
-  setText('kpiSuccessSub', t.totalRequests > 0 ? Math.round((t.totalSuccess / t.totalRequests) * 100) + '% rate' : '');
+  setText('kpiSuccessSub', t.totalRequests > 0 ? Math.round((t.totalSuccess / t.totalRequests) * 100) + '% 成功率' : '');
   setText('kpiErrors', fmtNumber(t.totalErrors));
-  setText('kpiErrorsSub', t.overallErrorRate + '% err rate');
+  setText('kpiErrorsSub', t.overallErrorRate + '% 错误率');
   setText('kpiAvgLat', fmtLatency(t.overallAvgLatencyMs));
-  setText('kpiAvgLatSub', 'avg response time');
+  setText('kpiAvgLatSub', '平均响应时间');
   setText('kpiP95Lat', fmtLatency(t.p95LatencyMs));
-  setText('kpiP95LatSub', '95th percentile');
+  setText('kpiP95LatSub', '95百分位');
   setText('kpiMedianLat', fmtLatency(t.medianLatencyMs));
-  setText('kpiMedianLatSub', 'median');
+  setText('kpiMedianLatSub', '中位数');
 
   // Entry count badge
   var entryBadge = document.getElementById('entryCountBadge');
   if (entryBadge) {
-    entryBadge.textContent = fmtNumber(data.totalEntries) + ' entries';
+    entryBadge.textContent = fmtNumber(data.totalEntries) + ' 条记录';
     entryBadge.className = 'badge ' + (t.totalErrors > 0 ? 'badge-warning' : 'badge-accent');
   }
 
@@ -63,9 +63,9 @@ async function refreshMonitor() {
   var tr = data.timeRange;
   var timeEl = document.getElementById('timeRange');
   if (tr && tr.from && tr.to) {
-    timeEl.textContent = 'Data from ' + fmtTime(tr.from) + ' to ' + fmtTime(tr.to);
+    timeEl.textContent = '数据范围: ' + fmtTime(tr.from) + ' 至 ' + fmtTime(tr.to);
   } else {
-    timeEl.textContent = 'No data yet';
+    timeEl.textContent = '暂无数据';
   }
 
   // ── Per-Account Table ──
@@ -112,10 +112,10 @@ async function refreshMonitor() {
           '</div>';
       }
       if (a.recentErrors.length > 3) {
-        errHtml += '<div style="font-size:0.6rem;color:var(--text-secondary)">+' + (a.recentErrors.length - 3) + ' more</div>';
+        errHtml += '<div style="font-size:0.6rem;color:var(--text-secondary)">+ 还有 ' + (a.recentErrors.length - 3) + ' 条</div>';
       }
     } else {
-      errHtml = '<span style="color:var(--success);font-size:0.7rem">None</span>';
+      errHtml = '<span style="color:var(--success);font-size:0.7rem">无</span>';
     }
 
     // Latency coloring

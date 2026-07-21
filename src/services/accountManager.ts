@@ -494,7 +494,10 @@ export function getAccountByEmail(email: string): AccountEntry | null {
 }
 export function setAccountDisabled(email: string, disabled: boolean): void {
   const acct = getAccountByEmail(email);
-  if (!acct) throw new Error(`Account not found: ${email}`);
+  if (!acct) {
+    logStore.log('warn', 'auth', `setAccountDisabled: account not found: ${email}`);
+    return;
+  }
   acct.disabled = disabled;
   saveAccountsToFile(accounts);
 }

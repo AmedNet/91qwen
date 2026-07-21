@@ -27,7 +27,7 @@ const serveHtml = (html: string) => (c: any) => {
   // Apply dark-mode class on <html> server-side to prevent flash on page navigation
   let output = html.replace(/(<script\b)/, scriptInjection + '$1');
   if (darkMode) {
-    output = output.replace('<html lang="en">', '<html lang="en" class="dark-mode">');
+    output = output.replace('<html lang="zh-CN">', '<html lang="zh-CN" class="dark-mode">');
   }
   c.header(
     'Content-Security-Policy',

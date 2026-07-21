@@ -1,6 +1,6 @@
 import { logStore } from '../services/logStore.ts';
 import { logQwenSSE } from '../services/qwenLogger.ts';
-import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
+import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, CANONICAL_PARAM_NAMES, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
 import type { ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
@@ -34,25 +34,116 @@ const SELF_CLOSING_TAG_PATTERN = new RegExp(`^[\\n\\s]*<\\/?(?:${THINK_TAG_NAMES
 const MAX_BUFFER_CHARS = 200;
 
 /**
+ * Maximum depth for tool call nesting. Prevents runaway depth from
+ * unbalanced tags (e.g. two opens and one close) from permanently
+ * suppressing content. Capped at 5 — realistic maximum for parallel
+ * tool calls (Qwen doesn't nest, but safety first).
+ */
+const MAX_TOOL_CALL_DEPTH = 5;
+
+/**
+ * When toolCallDepth > 0 but no new `<function=` open tag appears for this
+ * many consecutive chunks, force-reset depth to 0. This prevents permanent
+ * content suppression when `</function>` never arrives (e.g. truncated stream).
+ * 20 chunks at ~50ms each ≈ 1 second of streaming without a close tag.
+ */
+const CHUNK_STUCK_THRESHOLD = 20;
+
+
+/**
+ * Loop detection: if the last N content chunks are near-identical, the model
+ * is stuck in a repetition loop (observed with qwen3.7-plus thinking phase).
+ */
+const LOOP_WINDOW = 6;
+const LOOP_MIN_CHARS = 30;
+const LOOP_SIMILARITY = 0.85;
+
+function chunkSimilarity(a: string, b: string): number {
+  if (a.length === 0 && b.length === 0) return 1;
+  if (a.length === 0 || b.length === 0) return 0;
+  if (Math.max(a.length, b.length) / Math.min(a.length, b.length) > 3) return 0;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length > b.length ? a : b;
+  let matches = 0;
+  const longerChars = new Map<string, number>();
+  for (const ch of longer) longerChars.set(ch, (longerChars.get(ch) || 0) + 1);
+  for (const ch of shorter) {
+    const count = longerChars.get(ch) || 0;
+    if (count > 0) { matches++; longerChars.set(ch, count - 1); }
+  }
+  return (2 * matches) / (a.length + b.length);
+}
+
+/**
+ * Returns the length of the longest common prefix between two strings
+ * (character-by-character comparison). Used as a secondary loop signal:
+ * genuine repetition almost always shares a significant prefix,
+ * while Chinese text with coincidental character-bag overlap won't.
+ */
+function commonPrefixLen(a: string, b: string): number {
+  let i = 0;
+  const len = Math.min(a.length, b.length);
+  while (i < len && a[i] === b[i]) i++;
+  return i;
+}
+
+/**
+ * Returns the count of identical lines (after trimming) shared between
+ * two chunks. Genuine loops produce identical lines; coincidental
+ * character-bag similarity from Chinese text won't.
+ */
+function sharedLineCount(a: string, b: string): number {
+  const linesA = new Set(a.split('\n').map(l => l.trim()).filter(l => l.length > 5));
+  const linesB = b.split('\n').map(l => l.trim()).filter(l => l.length > 5);
+  let count = 0;
+  for (const line of linesB) {
+    if (linesA.has(line)) count++;
+  }
+  return count;
+}
+
+function detectLoop(recentChunks: string[]): boolean {
+  if (recentChunks.length < LOOP_WINDOW) return false;
+  const window = recentChunks.slice(-LOOP_WINDOW);
+  if (window.some(c => c.length < LOOP_MIN_CHARS)) return false;
+  const ref = window[0];
+  let similarCount = 0;
+  for (let i = 1; i < window.length; i++) {
+    const sim = chunkSimilarity(ref, window[i]);
+    if (sim >= LOOP_SIMILARITY) {
+      // Secondary check: genuine loops share a significant prefix OR
+      // share at least 1 identical line. This filters out Chinese text
+      // where character-bag similarity can be high from shared
+      // grammatical particles (的, 是, 了, etc.) despite different semantics.
+      const prefix = commonPrefixLen(ref, window[i]);
+      const sharedLines = sharedLineCount(ref, window[i]);
+      if (prefix >= 15 || sharedLines >= 1) {
+        similarCount++;
+      }
+    }
+  }
+  return similarCount >= LOOP_WINDOW - 2;
+}
+
+/** Deterministic JSON serialization (sorted keys) for dedup comparison. */
+function canonicalJson(obj: unknown): string {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(canonicalJson).join(',') + ']';
+  const keys = Object.keys(obj as Record<string, unknown>).sort();
+  return '{' + keys.map(k =>
+    JSON.stringify(k) + ':' + canonicalJson((obj as Record<string, unknown>)[k])
+  ).join(',') + '}';
+}
+
+/**
  * Qwen models sometimes forget underscores in snake_case parameter names
  * (e.g. "filepath" instead of "file_path"). This map re-canonicalizes
  * known mistakes in local_mcp tool parameters before emission.
  * Mirrors PARAM_NAME_FIXUPS in xmlToolParser.ts for the XML path.
+ * Uses the imported XML_PARAM_NAME_FIXUPS as base, extended with local_mcp-specific entries.
  */
 const LOCAL_MCP_PARAM_FIXUPS: Record<string, string> = {
-  filepath: 'file_path',
-  newstring: 'new_string',
-  oldstring: 'old_string',
-  toolcallid: 'tool_call_id',
-  replaceall: 'replace_all',
-  dryrun: 'dry_run',
-  caseinsensitive: 'case_insensitive',
-  outputmode: 'output_mode',
-  headlimit: 'head_limit',
-  maxresults: 'max_results',
-  notebookpath: 'notebook_path',
-  targetdirectory: 'target_directory',
-  globpattern: 'glob_pattern',
+  ...XML_PARAM_NAME_FIXUPS,
 };
 
 function fixupLocalMcpArgs(params: Record<string, unknown>): Record<string, unknown> {
@@ -60,7 +151,20 @@ function fixupLocalMcpArgs(params: Record<string, unknown>): Record<string, unkn
   const fixed: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
     const lowered = k.toLowerCase();
-    fixed[LOCAL_MCP_PARAM_FIXUPS[lowered] || k] = v;
+    // Direct fixup lookup first
+    const direct = LOCAL_MCP_PARAM_FIXUPS[lowered];
+    if (direct) { fixed[direct] = v; continue; }
+    // Fuzzy match: normalize by removing underscores and compare against canonical names
+    const normalized = lowered.replace(/_/g, '');
+    let found = false;
+    for (const canonical of CANONICAL_PARAM_NAMES) {
+      if (canonical.toLowerCase().replace(/_/g, '') === normalized) {
+        fixed[canonical] = v;
+        found = true;
+        break;
+      }
+    }
+    if (!found) fixed[k] = v;
   }
   return fixed;
 }
@@ -123,6 +227,14 @@ export interface StreamProcessingState {
   /** Depth tracking for nested tool call XML blocks. >0 means suppress content emission. */
   toolCallDepth: number;
   /**
+   * Chunk counter since the last `<function=` open tag was seen.
+   * When toolCallDepth > 0 but no new open tag appears for CHUNK_STUCK_THRESHOLD
+   * consecutive chunks, the depth counter is force-reset to 0.
+   * This prevents permanent content suppression when `</function>` never arrives
+   * (e.g. model output was truncated mid-tool-call).
+   */
+  chunksSinceLastTagOpen: number;
+  /**
    * One-chunk buffer for handling XML tag splits across SSE chunk boundaries.
    * When a chunk contains `<` without `>`, it might be a tag split (e.g. `<func` + `tion=read>`).
    * We buffer the incomplete chunk and wait for the next chunk. If combining them completes a
@@ -131,6 +243,10 @@ export interface StreamProcessingState {
    * of `<` in non-XML text (e.g. "x < 3").
    */
   pendingChunk: string;
+  /** Sliding window of recent content chunks for loop detection. */
+  recentChunks: string[];
+  /** Count of consecutive chunks detected as repetitive. */
+  loopStreak: number;
 }
 
 export interface StreamProcessingCtx {
@@ -146,9 +262,13 @@ export interface StreamProcessingCtx {
   qwenAbortController: AbortController;
   qwenLogFile?: string;
   sseEventCount?: number;
+  /** Callback to disable the current account (e.g. on RateLimited). */
+  disableAccount: (email: string) => void;
+  /** Callback to signal that mid-stream RateLimited requires account retry. */
+  retryWithNewAccount: (failedEmail: string) => void;
 }
 
-export type ProcessStreamResult = 'continue' | 'break_stream';
+export type ProcessStreamResult = 'continue' | 'break_stream' | 'retry_account';
 
 /**
  * Shared content filter pipeline standardizing the order:
@@ -203,6 +323,13 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
+    // Check for RateLimited in SSE error payload — disable account and signal retry
+    if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && resolvedEmail) {
+      ctx.disableAccount(resolvedEmail);
+      ctx.retryWithNewAccount(resolvedEmail);
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via SSE: disabled ${resolvedEmail}, signaling retry — ${errMsg}`);
+      return 'retry_account';
+    }
     return 'break_stream';
   }
   const deltaStatus = data.choices?.[0]?.delta?.status;
@@ -212,6 +339,15 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
+    // Check for RateLimit in delta error — extract error details if available
+    const deltaCode = data.choices?.[0]?.delta?.code;
+    const deltaMsg = data.choices?.[0]?.delta?.message || '';
+    if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && resolvedEmail) {
+      ctx.disableAccount(resolvedEmail);
+      ctx.retryWithNewAccount(resolvedEmail);
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via delta status: disabled ${resolvedEmail}, signaling retry — code=${deltaCode} msg=${deltaMsg}`);
+      return 'retry_account';
+    }
     return 'break_stream';
   }
   let streamFinished = false;
@@ -221,7 +357,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     if (deltaPhase === 'local_tool') {
       const localToolCalls = extractLocalMcpToolCalls(data);
       const newToolCalls = localToolCalls.filter((tc) => {
-        const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
+        const key = `${tc.name}:${canonicalJson(tc.arguments)}`;
         if (state.loggedToolCalls.has(key)) return false;
         state.loggedToolCalls.add(key);
         return true;
@@ -329,14 +465,63 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   }
 
   if (rawText.includes('<') && !rawText.includes('>') && rawText.length < MAX_BUFFER_CHARS) {
-    state.pendingChunk = rawText;
-    return 'continue';
+    // Pre-check: only buffer if the `<` looks like a tool/think tag start.
+    // Check both full keywords AND prefixes of known keywords — a chunk like
+    // `<func` should be buffered because it's the start of `<function=read>`.
+    // Non-tag `<` (e.g. "x < 3", "grep '<pattern>'") should NOT trigger buffering.
+    const allTagNames = [...TOOL_CALL_KEYWORDS, ...THINK_TAG_NAMES];
+    const looksLikeTag = allTagNames.some(
+      (kw) => rawText.includes(`<${kw}`) || rawText.includes(`</${kw}`),
+    );
+    // Also check prefixes: after `<`, is the text a prefix of any known keyword?
+    // `<fu` → matches `function`, `<th` → matches `think`/`thought`
+    const looksLikePrefix = !looksLikeTag && (() => {
+      const ltIdx = rawText.lastIndexOf('<');
+      if (ltIdx === -1) return false;
+      const afterLt = rawText.slice(ltIdx + 1).toLowerCase();
+      // At least 2 chars after `<` to be a meaningful prefix
+      if (afterLt.length < 2) return true; // too short to tell — buffer just in case
+      return allTagNames.some((kw) => {
+        // Compare only a short prefix — `<functAAAA...` should match `function`
+        // because the first 3+ chars match, even if trailing chars diverge.
+        const minLen = Math.min(3, afterLt.length, kw.length);
+        return kw.slice(0, minLen) === afterLt.slice(0, minLen);
+      });
+    })();
+    if (looksLikeTag || looksLikePrefix) {
+      state.pendingChunk = rawText;
+      return 'continue';
+    }
+    // Fall through: `<` without `>` that doesn't look like a known tag —
+    // treat as regular content (e.g. "x < 3", "grep '<pattern>'", etc.)
   }
 
   // At this point the text won't be delayed. Accumulate and process.
   state.lastRawContent += rawText;
+
   state.lastFullContent += rawText;
 
+  // ── Loop detection: break on repetitive output ────────────
+  if (rawText.length >= LOOP_MIN_CHARS && state.toolCallDepth === 0 && state.recentChunks) {
+    state.recentChunks.push(rawText);
+    if (state.recentChunks.length > LOOP_WINDOW * 2) {
+      state.recentChunks = state.recentChunks.slice(-LOOP_WINDOW);
+    }
+    if (detectLoop(state.recentChunks)) {
+      state.loopStreak++;
+      if (state.loopStreak >= 2) {
+        logStore.log('warn', 'chat', `[Chat] Loop detected — breaking stream (streak=${state.loopStreak})`);
+        logStore.addError(logId, 'Model output loop detected — stream terminated');
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+          entry.finalResponse.finishReason = 'loop_detected';
+        });
+        return 'break_stream';
+      }
+    } else {
+      state.loopStreak = 0;
+    }
+  }
   // Performance: skip all downstream work when there's no new raw content.
   // This avoids the expensive parseXmlToolCalls (100KB buffer) and
   // filterContentPipeline on thinking-only or empty chunks.
@@ -349,15 +534,32 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   const FKW = TOOL_CALL_KEYWORDS[0];
   const tagOpen = rawText.includes(`<${FKW}=`);
   const tagClose = rawText.includes(`</${FKW}>`);
-  if (tagOpen) state.toolCallDepth++;
-  if (tagClose) state.toolCallDepth = Math.max(0, state.toolCallDepth - 1);
+  if (tagOpen) {
+    state.toolCallDepth = Math.min(state.toolCallDepth + 1, MAX_TOOL_CALL_DEPTH);
+    state.chunksSinceLastTagOpen = 0;
+  } else if (state.toolCallDepth > 0) {
+    state.chunksSinceLastTagOpen = (state.chunksSinceLastTagOpen || 0) + 1;
+    // Safety valve: if no new open tag for too many consecutive chunks
+    // while still inside a tool call block, the closing tag is never coming
+    // (truncated stream, malformed output). Force-reset to prevent
+    // permanent content suppression.
+    if (state.chunksSinceLastTagOpen >= CHUNK_STUCK_THRESHOLD) {
+      logStore.log('warn', 'chat', `[Chat] Tool call depth stuck at ${state.toolCallDepth} for ${CHUNK_STUCK_THRESHOLD} chunks — force-resetting to 0`);
+      state.toolCallDepth = 0;
+      state.chunksSinceLastTagOpen = 0;
+    }
+  }
+  if (tagClose) {
+    state.toolCallDepth = Math.max(0, state.toolCallDepth - 1);
+    state.chunksSinceLastTagOpen = 0;
+  }
 
   // Parse tool calls from the accumulated content
   const newToolCallContent = state.lastFullContent;
   const { toolCalls: xmlToolCalls } = parseXmlToolCalls(newToolCallContent);
   if (xmlToolCalls.length > 0) {
     const newToolCalls = xmlToolCalls.filter((tc) => {
-      const key = `${tc.name}:${JSON.stringify(tc.parameters)}`;
+      const key = `${tc.name}:${canonicalJson(tc.parameters)}`;
       if (state.loggedToolCalls.has(key)) return false;
       state.loggedToolCalls.add(key);
       return true;
@@ -410,7 +612,13 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   let deltaCleaned: string | null = null;
   let deltaThinking = '';
   if (state.toolCallDepth === 0) {
-    const filterDelta = filterContentPipeline(rawText, enableContentFiltering, true);
+    // Force-release: when rawText has `<` but no `>`, escape `<` for the filter
+    // pipeline only (rawText accumulation in lastFullContent keeps the original).
+    // This prevents cleanThinkTags from stripping force-released content as partial tags.
+    const filterInput = (!rawText.includes('>') && rawText.includes('<'))
+      ? rawText.replace(/</g, '&lt;')
+      : rawText;
+    const filterDelta = filterContentPipeline(filterInput, enableContentFiltering, true);
     deltaCleaned = filterDelta.cleanText;
     deltaThinking = filterDelta.thinking;
   }

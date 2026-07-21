@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { pickAccount, setAccountDisabled, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -204,7 +204,20 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         const file = await uploadLargeTextAsFile(accountEmail, combinedContent, 'context.txt');
         processedMessages[0] = { ...processedMessages[0], files: [file] };
       } catch (err: any) {
-        logStore.log('debug', 'chat', '[Chat] Failed to upload context file: ' + (err.message || err));
+        logStore.log('warn', 'chat', '[Chat] Failed to upload context file, falling back to inline: ' + (err.message || err));
+        // Fallback: inject context as inline content in the first user message
+        const inlineContext = `\n\n<context.txt>\n${combinedContent}\n</context.txt>`;
+        const firstMsg = processedMessages[0];
+        if (typeof firstMsg.content === 'string') {
+          processedMessages[0] = { ...firstMsg, content: firstMsg.content + inlineContext };
+        } else if (Array.isArray(firstMsg.content)) {
+          const textParts = firstMsg.content.filter((c: any) => c.type === 'text');
+          if (textParts.length > 0) {
+            textParts[textParts.length - 1].text = (textParts[textParts.length - 1].text || '') + inlineContext;
+          } else {
+            firstMsg.content.push({ type: 'text', text: inlineContext });
+          }
+        }
       }
     }
 
@@ -433,7 +446,7 @@ export async function chatCompletions(c: Context) {
       );
     }
 
-    const { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupSession(
+    let { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupSession(
       messages,
       body,
       contextCheck.availableTokens!,
@@ -443,36 +456,86 @@ export async function chatCompletions(c: Context) {
 
     const completionId = 'chatcmpl-' + crypto.randomUUID();
 
-    if (!isStream) {
-      return handleNonStreamingRequest({
+    // ── Streaming with mid-stream RateLimited retry ─────────────────
+    // The retrySignal object is mutated by processStreamData when a
+    // mid-stream RateLimited SSE chunk is detected. After the stream
+    // completes (with [DONE] and no partial content), we check the flag
+    // and re-enter the account selection loop to try the next account.
+    //
+    // Non-streaming also supports retry via the same signal, checked
+    // after handleNonStreamingRequest returns.
+    const retrySignal = { needsRetry: false, failedEmail: '' };
+
+    const MAX_STREAM_RETRIES = 3; // separate from MAX_ACCOUNT_RETRIES in setupSession
+    for (let streamAttempt = 0; streamAttempt <= MAX_STREAM_RETRIES; streamAttempt++) {
+      retrySignal.needsRetry = false;
+      retrySignal.failedEmail = '';
+
+      if (streamAttempt > 0) {
+        // Re-acquire everything with a new account
+        const retrySetup = await setupSession(
+          messages,
+          body,
+          contextCheck.availableTokens!,
+          toolCalling,
+          logId,
+        );
+        // Reassign variables for this attempt
+        session = retrySetup.session;
+        nextParentId = retrySetup.nextParentId;
+        sessionHeaders = retrySetup.sessionHeaders;
+        resolvedEmail = retrySetup.resolvedEmail;
+        stream = retrySetup.stream;
+        qwenAbortController = retrySetup.qwenAbortController;
+      }
+
+      if (!isStream) {
+        const result = await handleNonStreamingRequest({
+          c,
+          logId,
+          completionId,
+          body,
+          session,
+          stream,
+          resolvedEmail,
+          initialParentId: nextParentId,
+          sessionHeaders,
+          toolCalling,
+          cleanOutput,
+          retrySignal,
+        });
+        if (!retrySignal.needsRetry) return result;
+        logStore.log('info', 'chat', `[Chat] Non-streaming retry: switching from ${retrySignal.failedEmail} (attempt ${streamAttempt + 1})`);
+        continue;
+      }
+
+      const streamingResult = await handleStreamingRequest({
         c,
         logId,
         completionId,
         body,
         session,
         stream,
+        qwenAbortController,
         resolvedEmail,
         initialParentId: nextParentId,
         sessionHeaders,
         toolCalling,
         cleanOutput,
+        disableAccount: (email: string) => setAccountDisabled(email, true),
+        retrySignal,
       });
+
+      if (!retrySignal.needsRetry) return streamingResult;
+      logStore.log('info', 'chat', `[Chat] Streaming retry: switching from ${retrySignal.failedEmail} (attempt ${streamAttempt + 1})`);
+      // Loop continues — next iteration calls setupSession with lastFailedEmail
+      // baked into the retrySignal, which pickAccount will skip.
     }
 
-    return await handleStreamingRequest({
-      c,
-      logId,
-      completionId,
-      body,
-      session,
-      stream,
-      qwenAbortController,
-      resolvedEmail,
-      initialParentId: nextParentId,
-      sessionHeaders,
-      toolCalling,
-      cleanOutput,
-    });
+    // All stream retries exhausted — tag the error so the catch block maps it to 429
+    const exhaustedErr = new Error('All accounts rate-limited during streaming. Please wait and try again later.');
+    (exhaustedErr as any).upstreamStatus = 429;
+    throw exhaustedErr;
   } catch (err: any) {
     console.error(`[Chat] <<< Request failed after ${Date.now() - _requestStartTime}ms: ${err?.message || err}`);
     console.error('Error in chatCompletions:', err);

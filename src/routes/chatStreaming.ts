@@ -23,6 +23,10 @@ export interface StreamingContext {
   toolCalling: boolean;
   cleanOutput: boolean;
   qwenLogFile?: string;
+  /** Callback to disable an account (e.g. on RateLimited detected during streaming). */
+  disableAccount: (email: string) => void;
+  /** Mutable signal set by streaming processor when mid-stream RateLimited requires retry. */
+  retrySignal?: { needsRetry: boolean; failedEmail: string };
 }
 
 function buildPromptString(messages: Message[]): string {
@@ -37,7 +41,7 @@ function buildPromptString(messages: Message[]): string {
 }
 
 export async function handleStreamingRequest(ctx: StreamingContext): Promise<Response> {
-  const { c, logId, completionId, body, session, stream, qwenAbortController, resolvedEmail, sessionHeaders, cleanOutput } = ctx;
+  const { c, logId, completionId, body, session, stream, qwenAbortController, resolvedEmail, sessionHeaders, cleanOutput, disableAccount, retrySignal } = ctx;
 
   const finalPrompt = buildPromptString(body.messages);
 
@@ -74,6 +78,13 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         qwenAbortController,
         qwenLogFile: ctx.qwenLogFile,
         emittedToolCallCount: 0,
+        disableAccount,
+        retryWithNewAccount: (failedEmail: string) => {
+          if (retrySignal) {
+            retrySignal.needsRetry = true;
+            retrySignal.failedEmail = failedEmail;
+          }
+        },
       };
 
       const bufferRef = { text: '' };
@@ -120,6 +131,8 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           buffer: loopResult.buffer,
           enableContentFiltering,
           includeUsage: !!body.stream_options?.include_usage,
+          disableAccount,
+          skipPostStream: !!loopResult.retryAccount,
         },
         {
           reader,
@@ -191,6 +204,9 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    chunksSinceLastTagOpen: 0,
     pendingChunk: '',
+    recentChunks: [],
+    loopStreak: 0,
   };
 }

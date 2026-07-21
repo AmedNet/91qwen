@@ -17,9 +17,9 @@ async function refreshHealth() {
   var total = accts.total != null ? accts.total : 0;
   var avail = accts.available != null ? accts.available : 0;
   setText('kpiTotalAccounts', total);
-  setText('kpiTotalAccountsSub', avail + ' available');
+  setText('kpiTotalAccountsSub', avail + ' 可用');
   var pct = total > 0 ? Math.round((avail / total) * 100) : 0;
-  setText('kpiAuthenticatedSub', pct + '% available');
+  setText('kpiAuthenticatedSub', pct + '% 可用');
   if (data.uptime != null) {
     uptimeSeconds = data.uptime;
     uptimeBase = Date.now();
@@ -35,7 +35,7 @@ async function refreshHealth() {
     }
     setText('kpiAuthenticated', authed);
     var authPct = total > 0 ? Math.round((authed / total) * 100) : 0;
-    setText('kpiAuthenticatedSub', authPct + '% of ' + total);
+    setText('kpiAuthenticatedSub', authPct + '% / ' + total);
     setText('kpiTotalRequests', totalReqs);
   }
 }
@@ -52,9 +52,9 @@ async function refreshPool() {
   setText('poolAvailable', avail);
   setText('poolTotal', total);
   setText('kpiActiveSessions', inUse);
-  setText('kpiActiveSessionsSub', 'of ' + total + ' sessions');
+  setText('kpiActiveSessionsSub', '共 ' + total + ' 会话');
   setText('kpiQueue', wait);
-  setText('kpiQueueSub', 'queued');
+  setText('kpiQueueSub', '排队中');
   var pct = total > 0 ? Math.min(100, Math.round((inUse / total) * 100)) : 0;
   var bar = document.getElementById('poolBarFill');
   bar.style.width = pct + '%';
@@ -65,7 +65,7 @@ async function refreshModelHealth() {
   var data = await apiFetch('/metrics/model-health');
   var tbody = document.getElementById('modelBody');
   if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state">No model activity recorded</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state">暂无模型活动记录</div></td></tr>';
     return;
   }
   var keys = Object.keys(data).sort();

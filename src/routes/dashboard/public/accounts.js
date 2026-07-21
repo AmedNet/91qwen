@@ -46,27 +46,27 @@ function getAuthStatus(acct) {
 }
 
 function getAuthLabel(status) {
-  if (status === 'live') return 'Authenticated';
-  if (status === 'pending') return 'Starting...';
-  if (status === 'connecting') return 'Connecting...';
-  if (status === 'expired') return 'Expired';
-  if (status === 'throttled') return 'Throttled';
-  return 'Not authenticated';
+  if (status === 'live') return '已认证';
+  if (status === 'pending') return '启动中...';
+  if (status === 'connecting') return '连接中...';
+  if (status === 'expired') return '已过期';
+  if (status === 'throttled') return '已限流';
+  return '未认证';
 }
 
 function makeThrottleBadge(acct) {
   if (acct.throttled) {
-    var label = 'Throttled';
+    var label = '已限流';
     if (acct.throttledUnlockAt) {
       var unlockTime = new Date(acct.throttledUnlockAt);
       var timeStr = unlockTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      label += ' until ' + timeStr;
+      label += '，解禁时间 ' + timeStr;
     } else if (acct.throttledRemainingMs != null) {
       label += ' ' + fmtTTL(acct.throttledRemainingMs);
     }
     return '<span class="badge badge-warning">' + label + '</span>';
   }
-  return '<span class="badge badge-neutral">OK</span>';
+  return '<span class="badge badge-neutral">正常</span>';
 }
 
 function renderAccountsTable(accts) {
@@ -77,7 +77,7 @@ function renderAccountsTable(accts) {
     return;
   }
   document.getElementById('emptyState').style.display = 'none';
-  setText('acctCount', accts.length + ' total');
+  setText('acctCount', accts.length + ' 个账户');
   var rows = '';
   for (var i = 0; i < accts.length; i++) {
     var a = accts[i];
@@ -121,12 +121,12 @@ function renderAccountsTable(accts) {
       '<td><div class="action-cell">' +
       '<button class="account-btn small danger" data-email="' +
       escHtml(a.email) +
-      '" data-action="remove">Remove</button>' +
+      '" data-action="remove">移除</button>' +
       '<button class="account-btn small primary" data-email="' +
       escHtml(a.email) +
       '" data-action="login"' +
       hideLogin +
-      '>Login</button>' +
+      '>登录</button>' +
       '</div></td></tr>';
   }
   document.getElementById('acctBody').innerHTML = rows;
@@ -142,7 +142,7 @@ async function loadAccounts() {
 function handleAdd(email, password) {
   var btn = document.getElementById('addBtn');
   btn.disabled = true;
-  btn.textContent = 'Adding...';
+  btn.textContent = '添加中...';
   setError(null);
   (async function () {
     try {
@@ -159,14 +159,14 @@ function handleAdd(email, password) {
       }
       if (!res.ok) {
         throw new Error(
-          result && result.error && result.error.message ? result.error.message : 'Failed to add account (' + res.status + ')',
+          result && result.error && result.error.message ? result.error.message : '添加账户失败 (' + res.status + ')',
         );
       }
       if (result.loginSucceeded) {
-        showToast('Account added and logged in: ' + email, 'success');
+        showToast('账户已添加并登录: ' + email, 'success');
         pollAuth(email, 15);
       } else {
-        showToast(result.loginError || 'Account added but login failed. Click Login to open browser.', 'warning');
+        showToast(result.loginError || '账户已添加但登录失败。请点击登录按钮在浏览器中完成认证。', 'warning');
         pollAuth(email, 15);
       }
       loadAccounts();
@@ -175,7 +175,7 @@ function handleAdd(email, password) {
       showToast(e.message, 'error');
     } finally {
       btn.disabled = false;
-      btn.textContent = 'Add Account';
+      btn.textContent = '添加账户';
     }
   })();
 }
@@ -200,10 +200,10 @@ function handleRemove(email) {
       }
       if (!res.ok) {
         throw new Error(
-          result && result.error && result.error.message ? result.error.message : 'Failed to remove account (' + res.status + ')',
+          result && result.error && result.error.message ? result.error.message : '移除账户失败 (' + res.status + ')',
         );
       }
-      showToast('Account removed: ' + email, 'success');
+      showToast('账户已移除: ' + email, 'success');
       loadAccounts();
     } catch (e) {
       setError(e.message);
@@ -219,7 +219,7 @@ function handleRemove(email) {
 function handleManualLogin(email) {
   var btn = document.querySelector('button[data-email="' + escHtml(email) + '"][data-action="login"]');
   if (btn) {
-    btn.textContent = 'Authorizing...';
+    btn.textContent = '认证中...';
     btn.disabled = true;
   }
   setError(null);
@@ -236,9 +236,9 @@ function handleManualLogin(email) {
         result = null;
       }
       if (!res.ok) {
-        throw new Error(result && result.error && result.error.message ? result.error.message : 'Login failed (' + res.status + ')');
+        throw new Error(result && result.error && result.error.message ? result.error.message : '登录失败 (' + res.status + ')');
       }
-      showToast('Browser opened for ' + email + '. Complete login manually.', 'info');
+      showToast('已为 ' + email + ' 打开浏览器。请在浏览器中完成登录。', 'info');
       pollAuth(email, 30);
     } catch (e) {
       setError(e.message);
@@ -268,7 +268,7 @@ function pollAuth(email, maxAttempts) {
         if (data[i].email === email && data[i].authenticated) {
           clearInterval(timer);
           delete activePollTimers[email];
-          showToast('Login completed for ' + email, 'success');
+          showToast('登录完成: ' + email, 'success');
           loadAccounts();
           return;
         }
@@ -296,7 +296,7 @@ async function handleToggleDisabled(event, email, currentlyDisabled) {
     body: JSON.stringify({ disabled: newDisabled }),
   });
   if (res.ok) {
-    showToast(email + ' ' + (newDisabled ? 'disabled' : 'enabled'), 'success');
+    showToast(email + ' ' + (newDisabled ? '已禁用' : '已启用'), 'success');
     loadAccounts();
   } else {
     var err = await res.json().catch(function () {
@@ -320,7 +320,7 @@ function init() {
     var email = document.getElementById('emailInput').value.trim();
     var password = document.getElementById('passwordInput').value;
     if (!email || !password) {
-      showToast('Email and password are required', 'error');
+      showToast('邮箱和密码为必填项', 'error');
       return;
     }
     handleAdd(email, password);

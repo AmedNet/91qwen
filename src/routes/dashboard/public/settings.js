@@ -3,78 +3,78 @@ var originalData = {};
 
 var SETTINGS_SECTIONS = [
   {
-    title: 'Server',
-    desc: 'Port, security, and browser engine settings.',
+    title: '服务器',
+    desc: '端口、安全与浏览器引擎设置。',
     fields: [
-      { key: 'PORT', label: 'PORT', type: 'number', restartRequired: true },
-      { key: 'API_KEY', label: 'API_KEY', type: 'password' },
+      { key: 'PORT', label: '端口号', type: 'number', restartRequired: true },
+      { key: 'API_KEY', label: 'API 密钥', type: 'password' },
     ],
   },
   {
-    title: 'Pipeline',
-    desc: 'Output transformation, streaming mode, and tool-call behaviour.',
+    title: '处理管线',
+    desc: '输出转换、流式模式与工具调用行为。',
     fields: [
-      { key: 'TOOL_CALLING', label: 'TOOL_CALLING', type: 'checkbox' },
-      { key: 'CLEAN_OUTPUT', label: 'CLEAN_OUTPUT', type: 'checkbox' },
+      { key: 'TOOL_CALLING', label: '工具调用', type: 'checkbox' },
+      { key: 'CLEAN_OUTPUT', label: '清理输出', type: 'checkbox' },
       {
         key: 'STREAMING_MODE',
-        label: 'STREAMING_MODE',
+        label: '流式模式',
         type: 'select',
         options: [
-          { value: 'auto', label: 'Auto (respect client)' },
-          { value: 'stream', label: 'Always stream' },
-          { value: 'non-stream', label: 'Never stream' },
+          { value: 'auto', label: '自动（尊重客户端）' },
+          { value: 'stream', label: '始终流式' },
+          { value: 'non-stream', label: '始终非流式' },
         ],
       },
-      { key: 'MAX_TOOL_CALLS_PER_RESPONSE', label: 'MAX_TOOL_CALLS_PER_RESPONSE', type: 'number' },
+      { key: 'MAX_TOOL_CALLS_PER_RESPONSE', label: '单次响应最大工具调用数', type: 'number' },
     ],
   },
   {
-    title: 'Session & Auth',
-    desc: 'Token lifetimes, refresh windows, and session cleanup.',
+    title: '会话与认证',
+    desc: 'Token 有效期、刷新窗口与会话清理。',
     fields: [
-      { key: 'QWEN_FETCH_TIMEOUT_MS', label: 'QWEN_FETCH_TIMEOUT_MS', type: 'number' },
-      { key: 'AUTH_TOKEN_MAX_AGE_MS', label: 'AUTH_TOKEN_MAX_AGE_MS', type: 'number' },
-      { key: 'AUTH_REFRESH_BEFORE_MS', label: 'AUTH_REFRESH_BEFORE_MS', type: 'number' },
-      { key: 'DELETE_SESSION', label: 'DELETE_SESSION', type: 'checkbox' },
+      { key: 'QWEN_FETCH_TIMEOUT_MS', label: 'Qwen 请求超时(毫秒)', type: 'number' },
+      { key: 'AUTH_TOKEN_MAX_AGE_MS', label: '认证 Token 最长有效期(毫秒)', type: 'number' },
+      { key: 'AUTH_REFRESH_BEFORE_MS', label: '认证提前刷新时间(毫秒)', type: 'number' },
+      { key: 'DELETE_SESSION', label: '完成后删除会话', type: 'checkbox' },
     ],
   },
   {
-    title: 'Rate Limiting',
-    desc: 'Cooldowns and throttling to prevent account bans.',
-    fields: [{ key: 'RATE_LIMIT_COOLDOWN_MS', label: 'RATE_LIMIT_COOLDOWN_MS', type: 'number' }],
+    title: '速率限制',
+    desc: '冷却与限流设置，防止账户被封禁。',
+    fields: [{ key: 'RATE_LIMIT_COOLDOWN_MS', label: '限流冷却时间(毫秒)', type: 'number' }],
   },
   {
-    title: 'Retry & Startup',
-    desc: 'Retry logic, backoff, and auto-open dashboard settings.',
+    title: '重试与启动',
+    desc: '重试逻辑、退避策略与自动打开仪表盘设置。',
     fields: [
-      { key: 'RETRY_ENABLED', label: 'RETRY_ENABLED', type: 'checkbox' },
-      { key: 'RETRY_MAX_ATTEMPTS', label: 'RETRY_MAX_ATTEMPTS', type: 'number' },
-      { key: 'RETRY_BASE_DELAY_MS', label: 'RETRY_BASE_DELAY_MS', type: 'number' },
-      { key: 'RETRY_MAX_DELAY_MS', label: 'RETRY_MAX_DELAY_MS', type: 'number' },
-      { key: 'RETRY_BACKOFF_MULTIPLIER', label: 'RETRY_BACKOFF_MULTIPLIER', type: 'number', step: '0.1' },
-      { key: 'OPEN_DASHBOARD_ON_START', label: 'OPEN_DASHBOARD_ON_START', type: 'checkbox', restartRequired: true },
+      { key: 'RETRY_ENABLED', label: '启用重试', type: 'checkbox' },
+      { key: 'RETRY_MAX_ATTEMPTS', label: '最大重试次数', type: 'number' },
+      { key: 'RETRY_BASE_DELAY_MS', label: '重试基础延迟(毫秒)', type: 'number' },
+      { key: 'RETRY_MAX_DELAY_MS', label: '重试最大延迟(毫秒)', type: 'number' },
+      { key: 'RETRY_BACKOFF_MULTIPLIER', label: '重试退避倍数', type: 'number', step: '0.1' },
+      { key: 'OPEN_DASHBOARD_ON_START', label: '启动时打开仪表盘', type: 'checkbox', restartRequired: true },
     ],
   },
   {
-    title: 'Logging',
-    desc: 'Per-request log storage and retention.',
+    title: '日志',
+    desc: '每个请求的日志存储与保留。',
     fields: [
-      { key: 'SAVE_REQUEST_LOGS', label: 'SAVE_REQUEST_LOGS', type: 'checkbox' },
-      { key: 'MAX_LOGS', label: 'MAX_LOGS', type: 'number' },
+      { key: 'SAVE_REQUEST_LOGS', label: '保存请求日志', type: 'checkbox' },
+      { key: 'MAX_LOGS', label: '最大日志数', type: 'number' },
     ],
   },
   {
     title: 'Claude Code',
-    desc: 'Auto-configure qwen-gate as a Claude Code proxy. Creates .claude/settings.json in the project root.',
-    fields: [{ key: 'CLAUDE_CODE_PROXY', label: 'CLAUDE_CODE_PROXY', type: 'checkbox' }],
+    desc: '自动配置 qwen-gate 作为 Claude Code 代理。在项目根目录创建 .claude/settings.json。',
+    fields: [{ key: 'CLAUDE_CODE_PROXY', label: 'Claude Code 代理', type: 'checkbox' }],
   },
   {
-    title: 'System & Accounts',
-    desc: 'System prompts and account management actions.',
+    title: '系统与账户',
+    desc: '系统提示词与账户管理操作。',
     fields: [
-      { key: 'USE_CUSTOM_INSTRUCTION', label: 'USE_CUSTOM_INSTRUCTION', type: 'checkbox' },
-      { key: 'CUSTOM_INSTRUCTION', label: 'CUSTOM_INSTRUCTION', type: 'text' },
+      { key: 'USE_CUSTOM_INSTRUCTION', label: '启用自定义指令', type: 'checkbox' },
+      { key: 'CUSTOM_INSTRUCTION', label: '自定义指令内容', type: 'text' },
     ],
   },
 ];
@@ -107,9 +107,9 @@ function renderSettingsForm() {
 function renderDeleteAllChatsSection() {
   return (
     '<div class="settings-section" style="border-color:var(--danger);margin-top:24px">' +
-    '<div class="settings-section-title" style="color:var(--danger)">Danger Zone</div>' +
-    '<p class="settings-section-desc" style="color:var(--text-secondary)">Irreversible account-wide actions. Proceed with caution.</p>' +
-    '<button class="delete-all-btn" onclick="handleDeleteAllChats()">Delete All Chats</button></div>'
+    '<div class="settings-section-title" style="color:var(--danger)">危险区域</div>' +
+    '<p class="settings-section-desc" style="color:var(--text-secondary)">不可逆的账户级操作，请谨慎进行。</p>' +
+    '<button class="delete-all-btn" onclick="handleDeleteAllChats()">删除所有对话</button></div>'
   );
 }
 
@@ -120,9 +120,9 @@ function renderClaudeCodeInfo() {
   var baseUrl = 'http://' + host + ':' + port;
   return (
     '<div class="settings-section" style="margin-top:24px">' +
-    '<div class="settings-section-title">Claude Code Proxy Active</div>' +
-    '<p class="settings-section-desc">qwen-gate is configured as a Claude Code proxy. ' +
-    'Set these environment variables when running Claude Code, or the <code>.claude/settings.json</code> file has been auto-configured for you.</p>' +
+    '<div class="settings-section-title">Claude Code 代理已激活</div>' +
+    '<p class="settings-section-desc">qwen-gate 已配置为 Claude Code 代理。' +
+    '运行 Claude Code 时请设置以下环境变量，或者 <code>.claude/settings.json</code> 文件已自动配置。</p>' +
     '<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;margin-top:8px">' +
     '<code style="display:block;padding:4px 0">ANTHROPIC_BASE_URL=' +
     baseUrl +
@@ -130,25 +130,25 @@ function renderClaudeCodeInfo() {
     '<code style="display:block;padding:4px 0">ANTHROPIC_AUTH_TOKEN=unused</code>' +
     '</div>' +
     '<p style="margin-top:8px;font-size:0.85em;color:var(--text-secondary)">' +
-    'The <code>.claude/settings.json</code> file is auto-created in the project root when this toggle is on, ' +
-    'and cleaned up when toggled off.' +
+    '当此开关打开时，<code>.claude/settings.json</code> 文件会在项目根目录自动创建，' +
+    '关闭时自动清理。' +
     '</p></div>'
   );
 }
 
 async function handleDeleteAllChats() {
   var bodyHtml =
-    '<p style="margin:0 0 12px">This will permanently <strong>delete all conversations</strong> from every Qwen account.</p>' +
-    '<p style="margin:0;color:var(--danger)"><strong>This action cannot be undone.</strong></p>';
+    '<p style="margin:0 0 12px">这将<strong>永久删除</strong>所有 Qwen 账户的对话记录。</p>' +
+    '<p style="margin:0;color:var(--danger)"><strong>此操作不可撤销。</strong></p>';
   var footerHtml =
-    '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">Cancel</button>' +
-    '<button class="modal-btn modal-btn-primary" id="confirmDeleteBtn" onclick="executeDeleteAllChats()">Yes, delete all</button>';
-  showModal('Delete All Chats', bodyHtml, footerHtml);
+    '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">取消</button>' +
+    '<button class="modal-btn modal-btn-primary" id="confirmDeleteBtn" onclick="executeDeleteAllChats()">确认删除全部</button>';
+  showModal('删除所有对话', bodyHtml, footerHtml);
 }
 
 function renderSettingsField(field, val) {
   var restartBadge = field.restartRequired
-    ? '<span class="restart-badge" title="This setting only takes effect after a server restart">Restart required</span>'
+    ? '<span class="restart-badge" title="此设置需要重启服务器后才能生效">需重启</span>'
     : '';
   if (field.type === 'action') {
     return (
@@ -269,8 +269,8 @@ function updateRestartBadge(key) {
     if (!badge) {
       var el = document.createElement('span');
       el.className = 'restart-badge';
-      el.title = 'This setting only takes effect after a server restart';
-      el.textContent = 'Restart required';
+      el.title = '此设置需要重启服务器后才能生效';
+      el.textContent = '需重启';
       wrap.appendChild(el);
     }
   } else {
@@ -316,7 +316,7 @@ async function loadSettings() {
 async function saveSettings() {
   var btn = document.getElementById('settingsSaveBtn');
   btn.disabled = true;
-  btn.textContent = 'Saving...';
+  btn.textContent = '保存中...';
   var msgEl = document.getElementById('settingsMessage');
   try {
     var headers = { 'Content-Type': 'application/json' };
@@ -327,7 +327,7 @@ async function saveSettings() {
     });
     var result = await res.json();
     if (!res.ok) {
-      msgEl.innerHTML = '<div class="settings-message error">' + escHtml(result.error || 'Save failed (' + res.status + ')') + '</div>';
+      msgEl.innerHTML = '<div class="settings-message error">' + escHtml(result.error || '保存失败 (' + res.status + ')') + '</div>';
     } else {
       if (result.config) {
         var keys = Object.keys(result.config);
@@ -336,7 +336,7 @@ async function saveSettings() {
         }
         renderSettingsForm();
       }
-      msgEl.innerHTML = '<div class="settings-message success">Settings saved successfully.</div>';
+      msgEl.innerHTML = '<div class="settings-message success">设置保存成功。</div>';
       setTimeout(function () {
         msgEl.innerHTML = '';
       }, 4000);
@@ -345,7 +345,7 @@ async function saveSettings() {
     msgEl.innerHTML = '<div class="settings-message error">' + escHtml(e.message) + '</div>';
   }
   btn.disabled = false;
-  btn.textContent = 'Save Changes';
+  btn.textContent = '保存更改';
 }
 
 /* ── Modal ── */
@@ -368,7 +368,7 @@ async function handleSettingsAction(action) {
     var footerHtml =
       '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">Cancel</button>' +
       '<button class="modal-btn modal-btn-primary" id="confirmDeleteBtn" onclick="executeDeleteAllChats()">Yes, delete all</button>';
-    showModal('Delete All Chats', bodyHtml, footerHtml);
+    showModal('删除所有对话', bodyHtml, footerHtml);
   }
 }
 
@@ -376,9 +376,9 @@ async function executeDeleteAllChats() {
   var btn = document.getElementById('confirmDeleteBtn');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Deleting...';
+    btn.textContent = '删除中...';
   }
-  document.getElementById('modalFooter').innerHTML = '<span style="font-size:0.8125rem;color:var(--text-secondary)">Processing...</span>';
+  document.getElementById('modalFooter').innerHTML = '<span style="font-size:0.8125rem;color:var(--text-secondary)">处理中...</span>';
   var bodyEl = document.getElementById('modalBody');
   bodyEl.innerHTML = '<div id="deleteProgress"></div>';
   var progressEl = document.getElementById('deleteProgress');
@@ -396,8 +396,8 @@ async function executeDeleteAllChats() {
         var errJson = JSON.parse(errBody);
         if (errJson.error) errMsg = errJson.error;
       } catch {}
-      progressEl.innerHTML = '<div style="color:var(--danger)">Error: ' + escHtml(errMsg) + '</div>';
-      var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">Close</button>';
+      progressEl.innerHTML = '<div style="color:var(--danger)">错误: ' + escHtml(errMsg) + '</div>';
+      var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">关闭</button>';
       document.getElementById('modalFooter').innerHTML = footerHtml;
       return;
     }
@@ -417,18 +417,18 @@ async function executeDeleteAllChats() {
           var data = JSON.parse(line.slice(6));
           if (data.type === 'result') {
             progressEl.innerHTML +=
-              '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-weight:600;color:var(--success)">[OK] Done: ' +
+              '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-weight:600;color:var(--success)">[OK] 完成: ' +
               data.deleted +
               ' / ' +
               data.total +
-              ' accounts</div>';
+              ' 个账户</div>';
             if (data.errors && data.errors.length > 0) {
               for (var ei = 0; ei < data.errors.length; ei++) {
                 progressEl.innerHTML +=
                   '<div style="color:var(--danger);font-size:0.75rem;padding:2px 0">[FAIL] ' + escHtml(data.errors[ei]) + '</div>';
               }
             }
-            var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">Close</button>';
+            var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">关闭</button>';
             document.getElementById('modalFooter').innerHTML = footerHtml;
             return;
           }
@@ -475,14 +475,14 @@ async function executeDeleteAllChats() {
       }
     }
     /* If stream ended with no result event, show fallback */
-    var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">Close</button>';
+    var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">关闭</button>';
     document.getElementById('modalFooter').innerHTML = footerHtml;
     if (doneCount === 0 && errorCount === 0) {
-      progressEl.innerHTML = '<div style="color:var(--text-secondary)">No accounts processed. The server may have returned an error.</div>';
+      progressEl.innerHTML = '<div style="color:var(--text-secondary)">未处理任何账户，服务器可能返回了错误。</div>';
     }
   } catch (e) {
-    bodyEl.innerHTML = '<p style="color:var(--danger)">Error: ' + escHtml(e.message) + '</p>';
-    var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">Close</button>';
+    bodyEl.innerHTML = '<p style="color:var(--danger)">错误: ' + escHtml(e.message) + '</p>';
+    var footerHtml = '<button class="modal-btn modal-btn-secondary" onclick="hideModal()">关闭</button>';
     document.getElementById('modalFooter').innerHTML = footerHtml;
   }
 }

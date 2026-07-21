@@ -1,7 +1,7 @@
-import crypto from 'node:crypto';
+﻿import crypto from 'node:crypto';
 import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
-import { decrementInFlight, getTokenWithAccount, pickAccount, throttleAccount } from './auth.ts';
+import { decrementInFlight, getTokenWithAccount, pickAccount, setAccountDisabled, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
@@ -16,9 +16,9 @@ export const QWEN_CHAT_COMPLETIONS_URL = `${QWEN_API_BASE}/api/v2/chat/completio
 export const QWEN_SETTINGS_URL = `${QWEN_API_BASE}/api/v2/users/user/settings/update`;
 
 /** Build shared feature_config for Qwen message payloads. */
-export function buildFeatureConfig(_enableThinking: boolean): Record<string, any> {
+export function buildFeatureConfig(enableThinking: boolean): Record<string, any> {
   return {
-    thinking_enabled: true,
+    thinking_enabled: enableThinking,
     output_schema: 'phase',
     research_mode: 'normal',
     auto_thinking: false,
@@ -282,19 +282,23 @@ export async function createQwenStream(
           const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
           const details = errorJson.data?.details || errorJson.message || 'Qwen returned an error';
           const wait = errorJson.data?.num !== undefined ? ` Wait about ${errorJson.data.num} hour(s) before trying again.` : '';
-          if (code === 'RateLimited' && currentAccountEmail) {
-            const throttleMs = (errorJson.data?.num || 1) * 3600_000;
-            // Use the full duration from Qwen (e.g. 7 hours) — do NOT cap at 2h.
-            // Capping caused accounts to become "available" while Qwen still rejected them.
-            throttleAccount(currentAccountEmail, throttleMs);
+          if (code === 'RateLimited') {
+            // Daily usage limit reached — permanently disable this account until user re-enables it.
+            // The wait time from Qwen is uncertain and can be many hours, so throttling is unreliable.
+            if (currentAccountEmail) {
+              setAccountDisabled(currentAccountEmail, true);
+              logStore.log('warn', 'qwen', `[Qwen] RateLimited: disabled ${currentAccountEmail} — ${details}`);
+            } else {
+              logStore.log('warn', 'qwen', `[Qwen] RateLimited but currentAccountEmail is empty — cannot disable account. Details: ${details}`);
+            }
             const nextAccount = await pickAccount(currentAccountEmail);
             if (nextAccount) {
               currentAccountEmail = nextAccount.email;
               // pickAccount incremented inFlight for the new account, but we're about to throw
               // so decrement it — the caller will retry with a fresh pickAccount
               decrementInFlight(nextAccount.email);
-            } else if (!nextAccount) {
-              // All accounts are throttled — include wait time in error for the user
+            } else {
+              // All accounts are disabled or throttled — include wait time in error for the user
               throw new QwenUpstreamError(`All accounts rate-limited. ${details}.${wait}`, code, 429);
             }
           }

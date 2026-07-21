@@ -1,11 +1,11 @@
 import { sidebarHtml } from './sidebar.ts';
 
 export const accountsHtml = `<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen Gate — Accounts</title>
+<title>Qwen Gate — 账户</title>
 <link rel="stylesheet" href="/dashboard/static/shared.css">
 <link rel="stylesheet" href="/dashboard/static/accounts.css">
 </head>
@@ -14,7 +14,7 @@ export const accountsHtml = `<!DOCTYPE html>
 ${sidebarHtml('accounts')}
   <main class="main-content">
     <div class="page-header">
-      <h1>Accounts</h1>
+      <h1>账户</h1>
     </div>
 
     <!-- Error Display -->
@@ -23,14 +23,14 @@ ${sidebarHtml('accounts')}
     <!-- Add Account Form -->
     <div class="panel">
       <div class="panel-header open">
-        <span class="panel-title">Add Account</span>
+        <span class="panel-title">添加账户</span>
       </div>
       <div class="panel-body open">
-        <div style="font-size:0.75rem;color:var(--text-secondary);margin-bottom:12px;line-height:1.5;background:var(--bg-elevated);padding:10px 14px;border-radius:var(--radius-sm)"><strong>⚠️ Best practice:</strong> Use <strong>3+ accounts</strong> for round-robin rotation to bypass cooldown limits. Do <strong>not</strong> use your personal Qwen account — create dedicated accounts.</div>
+        <div style="font-size:0.75rem;color:var(--text-secondary);margin-bottom:12px;line-height:1.5;background:var(--bg-elevated);padding:10px 14px;border-radius:var(--radius-sm)"><strong>⚠️ 最佳实践：</strong>使用 <strong>3 个以上账户</strong> 进行轮换，以绕过冷却限制。请<strong>勿</strong>使用个人 Qwen 账户——创建专用账户。</div>
         <form class="account-form" id="addForm">
-          <input type="email" class="account-input" id="emailInput" placeholder="Email" required autocomplete="email">
-          <input type="password" class="account-input" id="passwordInput" placeholder="Password" required autocomplete="new-password">
-          <button type="submit" class="account-btn" id="addBtn">Add Account</button>
+          <input type="email" class="account-input" id="emailInput" placeholder="邮箱" required autocomplete="email">
+          <input type="password" class="account-input" id="passwordInput" placeholder="密码" required autocomplete="new-password">
+          <button type="submit" class="account-btn" id="addBtn">添加账户</button>
         </form>
       </div>
     </div>
@@ -38,7 +38,7 @@ ${sidebarHtml('accounts')}
     <!-- Accounts Table -->
     <div class="panel">
       <div class="panel-header open">
-        <span class="panel-title">Accounts</span>
+        <span class="panel-title">账户列表</span>
         <span id="acctCount" style="font-size:0.7rem;color:var(--text-secondary);font-weight:500"></span>
       </div>
       <div class="panel-body open">
@@ -46,20 +46,20 @@ ${sidebarHtml('accounts')}
           <table id="acctTable">
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Auth Status</th>
-                <th>In Flight</th>
-                <th>Total Reqs</th>
-                <th>Throttle</th>
+                <th>邮箱</th>
+                <th>认证状态</th>
+                <th>进行中</th>
+                <th>总请求数</th>
+                <th>限流</th>
                 <th>Token TTL</th>
-                <th>Disabled</th>
-                <th>Actions</th>
+                <th>已禁用</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody id="acctBody"></tbody>
           </table>
         </div>
-        <div class="empty-state" id="emptyState">No accounts configured. Add one above.</div>
+        <div class="empty-state" id="emptyState">尚未配置账户，请在上方添加。</div>
       </div>
     </div>
   </main>
@@ -68,11 +68,11 @@ ${sidebarHtml('accounts')}
 <!-- Confirmation Modal -->
 <div class="modal-overlay" id="confirmOverlay">
   <div class="modal">
-    <h3>Remove Account</h3>
-    <p>Are you sure you want to remove <strong id="confirmEmail"></strong>? This cannot be undone.</p>
+    <h3>移除账户</h3>
+    <p>确定要移除 <strong id="confirmEmail"></strong>？此操作不可撤销。</p>
     <div class="modal-actions">
-      <button class="modal-cancel" id="confirmNo">Cancel</button>
-      <button class="modal-confirm" id="confirmYes">Remove</button>
+      <button class="modal-cancel" id="confirmNo">取消</button>
+      <button class="modal-confirm" id="confirmYes">移除</button>
     </div>
   </div>
 </div>

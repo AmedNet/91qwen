@@ -121,7 +121,7 @@ function renderNetworkEntries(entries) {
   var filteredCountEl = document.getElementById('filteredCount');
   if (filteredCountEl) {
     var total = entries.length;
-    filteredCountEl.textContent = filtered.length === total ? total + ' entries' : filtered.length + ' of ' + total + ' entries';
+    filteredCountEl.textContent = filtered.length === total ? total + ' 条记录' : filtered.length + ' / ' + total + ' 条记录';
   }
 
   /* Keep empty/error state inside container, clear everything else */
@@ -221,36 +221,36 @@ function renderEntryDetail(entry) {
   /* Request Headers */
   html +=
     '<div class="detail-section">' +
-    '<div class="section-header"><span class="section-arrow">\u25b6</span> Request Headers</div>' +
+    '<div class="section-header"><span class="section-arrow">\u25b6</span> \u8bf7\u6c42\u5934</div>' +
     '<div class="section-body"><pre>' +
-    escHtml(reqHeaders ? JSON.stringify(reqHeaders, null, 2) : '(none)') +
+    escHtml(reqHeaders ? JSON.stringify(reqHeaders, null, 2) : '(\u65e0)') +
     '</pre></div>' +
     '</div>';
 
   /* Request Body */
   html +=
     '<div class="detail-section">' +
-    '<div class="section-header"><span class="section-arrow">\u25b6</span> Request Body</div>' +
+    '<div class="section-header"><span class="section-arrow">\u25b6</span> \u8bf7\u6c42\u4f53</div>' +
     '<div class="section-body"><pre>' +
-    escHtml(reqBody ? fmtJson(reqBody) : '(empty)') +
+    escHtml(reqBody ? fmtJson(reqBody) : '(\u7a7a)') +
     '</pre></div>' +
     '</div>';
 
   /* Response Headers */
   html +=
     '<div class="detail-section">' +
-    '<div class="section-header"><span class="section-arrow">\u25b6</span> Response Headers</div>' +
+    '<div class="section-header"><span class="section-arrow">\u25b6</span> \u54cd\u5e94\u5934</div>' +
     '<div class="section-body"><pre>' +
-    escHtml(resHeaders ? JSON.stringify(resHeaders, null, 2) : '(none)') +
+    escHtml(resHeaders ? JSON.stringify(resHeaders, null, 2) : '(\u65e0)') +
     '</pre></div>' +
     '</div>';
 
   /* Response Body */
   html +=
     '<div class="detail-section">' +
-    '<div class="section-header"><span class="section-arrow">\u25b6</span> Response Body</div>' +
+    '<div class="section-header"><span class="section-arrow">\u25b6</span> \u54cd\u5e94\u4f53</div>' +
     '<div class="section-body"><pre>' +
-    escHtml(resBody ? fmtJson(resBody) : '(empty)') +
+    escHtml(resBody ? fmtJson(resBody) : '(\u7a7a)') +
     '</pre></div>' +
     '</div>';
 
@@ -258,9 +258,9 @@ function renderEntryDetail(entry) {
   if (stream && stream.chunks && stream.chunks.length > 0) {
     html +=
       '<div class="detail-section">' +
-      '<div class="section-header"><span class="section-arrow">\u25b6</span> Stream Chunks (' +
+      '<div class="section-header"><span class="section-arrow">\u25b6</span> \u6d41\u5f0f\u6570\u636e\u5757 (' +
       stream.totalChunks +
-      ' total, showing ' +
+      ' \u603b\u8ba1, \u663e\u793a ' +
       stream.chunks.length +
       ')</div>' +
       '<div class="section-body"><pre>' +
@@ -273,7 +273,7 @@ function renderEntryDetail(entry) {
   if (entry.errors && entry.errors.length > 0) {
     html +=
       '<div class="detail-section">' +
-      '<div class="section-header"><span class="section-arrow">\u25b6</span> Errors (' +
+      '<div class="section-header"><span class="section-arrow">\u25b6</span> \u9519\u8bef (' +
       entry.errors.length +
       ')</div>' +
       '<div class="section-body" style="background:var(--danger-soft)"><pre style="color:var(--danger)">' +

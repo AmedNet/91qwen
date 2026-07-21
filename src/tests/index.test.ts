@@ -205,10 +205,9 @@ test('Chat Completions returns explicit error for non-SSE upstream JSON errors',
     assert.strictEqual(res.status, 429);
 
     const body = await res.json();
-    assert.match(body.error.message, /Qwen upstream error: RateLimited/);
-    assert.match(body.error.message, /upper limit/);
-    assert.strictEqual(body.error.upstream_code, 'RateLimited');
-    assert.strictEqual(body.error.upstream_status, 429);
+    assert.match(body.error.message, /All accounts have reached their daily usage limit/);
+    assert.strictEqual(body.error.type, 'rate_limit_error');
+    assert.strictEqual(body.error.code, 'rate_limit_exceeded');
   } finally {
     globalThis.fetch = originalFetch;
   }
