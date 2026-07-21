@@ -51,6 +51,19 @@ export class QwenUpstreamError extends Error {
   }
 }
 
+/** Thrown when Qwen rejects a tool call because the LLM used a tool name
+ *  that doesn't match any registered tool. This is an LLM mistake, NOT an
+ *  account/infra issue — callers should NOT retry with a different account;
+ *  they should pass the error back to the LLM so it can correct the name. */
+export class QwenToolNotFoundError extends Error {
+  readonly upstreamStatus: number;
+  constructor(message: string, upstreamStatus: number) {
+    super(message);
+    this.name = 'QwenToolNotFoundError';
+    this.upstreamStatus = upstreamStatus;
+  }
+}
+
 class UpstreamStatusError extends Error {
   readonly status: number;
   constructor(message: string, status: number) {
@@ -331,16 +344,63 @@ export async function createQwenStream(
           throw new RetryableQwenStreamError(`Qwen CAPTCHA — switched accounts. ${details}`, 3000);
         }
 
-        if (
-          errorJson?.data?.details?.includes('is not exist') ||
-          errorJson?.data?.details?.includes('not exist') ||
-          errorJson?.data?.details?.includes('does not exist')
-        ) {
+        // Tool-not-found detection: Qwen rejects a tool call because the LLM
+        // hallucinated or typo'd a tool name. Must include "tool" or "function"
+        // context to avoid false matching on unrelated "not exist" errors like
+        // "session does not exist" or "user does not exist".
+        const notExistDetails = errorJson?.data?.details || '';
+        const isNotExistError = notExistDetails.includes('is not exist') ||
+          notExistDetails.includes('not exist') ||
+          notExistDetails.includes('does not exist');
+        const isToolContext = notExistDetails.includes('Tool') ||
+          notExistDetails.includes('tool') ||
+          notExistDetails.includes('function') ||
+          notExistDetails.includes('Function');
+        if (isNotExistError && isToolContext) {
           errorEntry(debugEntryId, errorJson.data.details);
-          throw new RetryableQwenStreamError(`Qwen: ${errorJson.data.details}`, 0);
+
+          // ── Build an actionable error message for LLM self-correction ──
+          // Extract the tool name Qwen complained about from the error details
+          const toolNameMatch = notExistDetails.match(/(?:Tool|tool|Function|function)\s*['"]([^'"]+)['"]|['"]([^'"]+)['"]\s*(?:does not exist|not exist|is not exist)/i);
+          const complainedTool = toolNameMatch?.[1] || toolNameMatch?.[2] || 'unknown';
+          const availableToolNames: string[] = (tools as any[] | undefined)
+            ?.map((t: any) => t?.function?.name || t?.name)
+            .filter((n: string | undefined): n is string => !!n) || [];
+
+          // Fuzzy match: find similar available tool names (Levenshtein-like heuristics)
+          let suggestion = '';
+          if (complainedTool !== 'unknown' && availableToolNames.length > 0) {
+            const complainedLower = complainedTool.toLowerCase().replace(/[-_]/g, '');
+            const scored = availableToolNames.map((n) => {
+              const clean = n.toLowerCase().replace(/[-_]/g, '');
+              // Simple similarity: count common characters in order
+              let common = 0; let ci = 0;
+              for (let ni = 0; ni < clean.length && ci < complainedLower.length; ni++) {
+                if (clean[ni] === complainedLower[ci]) { common++; ci++; }
+              }
+              const longerLen = Math.max(clean.length, complainedLower.length);
+              return { name: n, score: longerLen > 0 ? common / longerLen : 0 };
+            });
+            const best = scored.sort((a, b) => b.score - a.score).slice(0, 3).filter(s => s.score > 0.4);
+            if (best.length > 0) {
+              suggestion = `\n\nDid you mean: ${best.map(s => `"${s.name}"`).join(', ')}?`;
+            }
+          }
+
+          const toolList = availableToolNames.length > 0
+            ? `\n\nAvailable tools: [${availableToolNames.join(', ')}]`
+            : '';
+
+          throw new QwenToolNotFoundError(
+            `Qwen: ${errorJson.data.details}\n\n` +
+            `The tool "${complainedTool}" was rejected because it doesn't match any registered tool. ` +
+            `This is NOT a system limitation — you likely misspelled or hallucinated the tool name.${suggestion}${toolList}\n\n` +
+            `Please retry with the EXACT correct tool name from the available list.`,
+            400,
+          );
         }
       } catch (parseOrRetryError) {
-        if (parseOrRetryError instanceof RetryableQwenStreamError || parseOrRetryError instanceof QwenUpstreamError) {
+        if (parseOrRetryError instanceof RetryableQwenStreamError || parseOrRetryError instanceof QwenUpstreamError || parseOrRetryError instanceof QwenToolNotFoundError) {
           throw parseOrRetryError;
         }
       }

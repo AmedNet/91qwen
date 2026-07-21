@@ -154,17 +154,39 @@ export const CANONICAL_PARAM_NAMES = [
   'max_results', 'target_directory',
 ];
 
-function fixupParamName(key: string): string {
+/**
+ * Convert camelCase to snake_case at word boundaries.
+ * "outputMode" → "output_mode", "notebookPath" → "notebook_path"
+ */
+export function camelToSnake(s: string): string {
+  // Preserve ALL_CAPS tokens (e.g. "JSON", "URL", "MCP")
+  return s.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+}
+
+export function fixupParamName(key: string): string {
   const lowered = key.toLowerCase();
+  // 1. Direct lookup in known fixups
   const fixed = PARAM_NAME_FIXUPS[lowered];
   if (fixed) return fixed;
-  // Fuzzy match: normalize by removing underscores and compare
+  // 2. camelCase → snake_case conversion (e.g. "outputMode" → "output_mode")
+  const snaked = camelToSnake(key);
+  if (snaked !== lowered) {
+    const snakedFixed = PARAM_NAME_FIXUPS[snaked.toLowerCase()];
+    if (snakedFixed) return snakedFixed;
+    // Check if the snaked version matches a canonical name directly
+    for (const canonical of CANONICAL_PARAM_NAMES) {
+      if (canonical === snaked) return canonical;
+    }
+  }
+  // 3. Fuzzy match: normalize by removing underscores and compare
   const normalized = lowered.replace(/_/g, '');
   for (const canonical of CANONICAL_PARAM_NAMES) {
     if (canonical.toLowerCase().replace(/_/g, '') === normalized) {
       return canonical;
     }
   }
+  // 4. If snaked version differs from original and wasn't caught above, return snaked
+  if (snaked !== lowered) return snaked;
   return key;
 }
 

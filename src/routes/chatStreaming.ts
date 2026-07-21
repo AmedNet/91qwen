@@ -27,7 +27,18 @@ export interface StreamingContext {
   disableAccount: (email: string) => void;
   /** Mutable signal set by streaming processor when mid-stream RateLimited requires retry. */
   retrySignal?: { needsRetry: boolean; failedEmail: string };
+  /** Callback to re-acquire session with a new account for mid-stream retry. */
+  retrySetup?: () => Promise<{
+    session: { chatId: string; parentId: string | null; cachedHeaders: any; accountEmail?: string };
+    stream: ReadableStream;
+    qwenAbortController: AbortController;
+    resolvedEmail: string;
+    nextParentId: string | null;
+    sessionHeaders: any;
+  }>;
 }
+
+const MAX_STREAM_RETRIES = 3;
 
 function buildPromptString(messages: Message[]): string {
   return messages
@@ -41,14 +52,11 @@ function buildPromptString(messages: Message[]): string {
 }
 
 export async function handleStreamingRequest(ctx: StreamingContext): Promise<Response> {
-  const { c, logId, completionId, body, session, stream, qwenAbortController, resolvedEmail, sessionHeaders, cleanOutput, disableAccount, retrySignal } = ctx;
-
+  const { c, logId, completionId, body, session, stream, qwenAbortController, resolvedEmail, sessionHeaders, cleanOutput, disableAccount, retrySignal, retrySetup } = ctx;
   const finalPrompt = buildPromptString(body.messages);
-
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
   c.header('Connection', 'close');
-
   return honoStream(c, async (streamWriter: any) => {
     const _streamStartTime = Date.now();
     logStore.log('debug', 'stream', `[Stream] >>> Streaming started for ${logId}, model=${body.model}, tools=${body.tools?.length || 0}`);
@@ -57,98 +65,171 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
     let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     const ampState: AmplificationGuardState = { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false };
 
+    // Mutable state for retry loop — updated on each attempt with new session/stream
+    let curSession = session;
+    let curStream = stream;
+    let curAbort = qwenAbortController;
+    let curEmail = resolvedEmail;
+    let curHeaders = sessionHeaders;
+    let curParentId = ctx.initialParentId;
+
     try {
-      heartbeatInterval = createHeartbeat(streamWriter);
-      await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({ role: 'assistant', content: '' })]));
-
-      streamReader = stream.getReader();
-      const reader: ReadableStreamDefaultReader<Uint8Array> = streamReader;
-      const enableContentFiltering = cleanOutput;
-      const streamState = buildInitialStreamState(finalPrompt, ctx.initialParentId);
-
-      const streamCtx: StreamProcessingCtx = {
-        streamWriter,
-        completionId,
-        model: body.model,
-        enableContentFiltering,
-        cleanOutput,
-        logId,
-        resolvedEmail,
-        ampState,
-        qwenAbortController,
-        qwenLogFile: ctx.qwenLogFile,
-        emittedToolCallCount: 0,
-        disableAccount,
-        retryWithNewAccount: (failedEmail: string) => {
-          if (retrySignal) {
-            retrySignal.needsRetry = true;
-            retrySignal.failedEmail = failedEmail;
-          }
-        },
-      };
-
-      const bufferRef = { text: '' };
-      const loopResult = await runStreamLoop(c, reader, streamState, streamCtx, ampState, bufferRef);
-
-      if (loopResult.error) {
-        // Upstream went silent — silently terminate stream, log server-side only
-        logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
-        logStore.addError(logId, loopResult.error);
-        await streamWriter.write('data: [DONE]\n\n');
-        logStore.updateEntry(logId, (entry) => {
-          if (streamState.reasoningBuffer) entry.reasoningContent = streamState.reasoningBuffer;
-          if (streamState.lastFullContent) entry.remainingText = streamState.lastFullContent;
-          entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
-          entry.finalResponse.finishReason = 'error';
-        });
-        logStore.finalizeRequest(ctx.logId);
-        // Release session and trigger deleteSession() — without this, the session
-        // leaks in the pool and the chat persists on Qwen's servers indefinitely.
-        cleanupImmediately(
-          streamReader,
-          heartbeatInterval,
-          session.chatId,
-          ctx.initialParentId,
-          sessionHeaders,
-          resolvedEmail,
-          sessionPool,
-          false,
-        );
-        streamReleased = true;
-        return;
-      }
-
-      await handlePostStreamCompletion(
-        {
+      for (let attempt = 0; attempt <= MAX_STREAM_RETRIES; attempt++) {
+        if (attempt > 0) {
+          logStore.log('info', 'stream', `[Stream] Retry attempt ${attempt}/${MAX_STREAM_RETRIES} for ${logId}`);
+        }
+        heartbeatInterval = createHeartbeat(streamWriter);
+        // Only emit the initial role chunk on the first attempt
+        if (attempt === 0) {
+          await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({ role: 'assistant', content: '' })]));
+        }
+        streamReader = curStream.getReader();
+        const reader: ReadableStreamDefaultReader<Uint8Array> = streamReader;
+        const enableContentFiltering = cleanOutput;
+        const streamState = buildInitialStreamState(finalPrompt, curParentId);
+        const streamCtx: StreamProcessingCtx = {
           streamWriter,
           completionId,
           model: body.model,
-          streamState,
-          ampState,
-          logId,
-          resolvedEmail,
-          emittedToolCallCount: streamCtx.emittedToolCallCount,
-          buffer: loopResult.buffer,
           enableContentFiltering,
-          includeUsage: !!body.stream_options?.include_usage,
+          cleanOutput,
+          logId,
+          resolvedEmail: curEmail,
+          ampState,
+          qwenAbortController: curAbort,
+          qwenLogFile: ctx.qwenLogFile,
+          emittedToolCallCount: 0,
           disableAccount,
-          skipPostStream: !!loopResult.retryAccount,
-        },
-        {
-          reader,
-          heartbeatInterval,
-          chatId: session.chatId,
-          sessionHeaders,
-          email: resolvedEmail,
-          sessionPool,
-        },
-      );
+          retryWithNewAccount: (failedEmail: string) => {
+            if (retrySignal) {
+              retrySignal.needsRetry = true;
+              retrySignal.failedEmail = failedEmail;
+            }
+          },
+        };
+        const bufferRef = { text: '' };
+        const loopResult = await runStreamLoop(c, reader, streamState, streamCtx, ampState, bufferRef);
 
-      streamReleased = true;
-      logStore.log('debug', 'stream', `[Stream] <<< Streaming completed for ${logId} in ${Date.now() - _streamStartTime}ms`);
+        // Mid-stream RateLimited — retry with new account if possible
+        if (loopResult.retryAccount) {
+          // Clean up current session without emitting content
+          cleanupImmediately(
+            streamReader, heartbeatInterval,
+            curSession.chatId, curParentId, curHeaders, curEmail,
+            sessionPool, false,
+          );
+          streamReleased = true;
+          heartbeatInterval = undefined;
+          streamReader = null;
+
+          if (attempt < MAX_STREAM_RETRIES && retrySetup) {
+            try {
+              const ns = await retrySetup();
+              curSession = ns.session;
+              curStream = ns.stream;
+              curAbort = ns.qwenAbortController;
+              curEmail = ns.resolvedEmail;
+              curHeaders = ns.sessionHeaders;
+              curParentId = ns.nextParentId;
+              if (retrySignal) { retrySignal.needsRetry = false; retrySignal.failedEmail = ''; }
+              streamReleased = false;
+              continue;
+            } catch (retryErr: any) {
+              logStore.log('error', 'stream', `[Stream] Retry setup failed for ${logId}: ${retryErr.message}`);
+              logStore.addError(logId, `Retry setup failed: ${retryErr.message}`);
+              // Fall through to clean termination below
+            }
+          }
+
+          // Exhausted retries or setup failed — terminate cleanly
+          try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
+          logStore.updateEntry(logId, (entry) => {
+            entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+            entry.finalResponse.finishReason = 'error';
+          });
+          logStore.finalizeRequest(ctx.logId);
+          break;
+        }
+
+        if (loopResult.error) {
+          logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
+          logStore.addError(logId, loopResult.error);
+          await streamWriter.write('data: [DONE]\n\n');
+          logStore.updateEntry(logId, (entry) => {
+            if (streamState.reasoningBuffer) entry.reasoningContent = streamState.reasoningBuffer;
+            if (streamState.lastFullContent) entry.remainingText = streamState.lastFullContent;
+            entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+            entry.finalResponse.finishReason = 'error';
+          });
+          logStore.finalizeRequest(ctx.logId);
+          cleanupImmediately(
+            streamReader, heartbeatInterval,
+            curSession.chatId, curParentId, curHeaders, curEmail,
+            sessionPool, false,
+          );
+          streamReleased = true;
+          break;
+        }
+        const postResult = await handlePostStreamCompletion(
+          {
+            streamWriter, completionId, model: body.model,
+            streamState, ampState, logId,
+            resolvedEmail: curEmail,
+            emittedToolCallCount: streamCtx.emittedToolCallCount,
+            buffer: loopResult.buffer,
+            enableContentFiltering,
+            includeUsage: !!body.stream_options?.include_usage,
+            disableAccount,
+            skipPostStream: attempt > 0, // skip post-stream on retry — content already emitted by first attempt
+          },
+          {
+            reader, heartbeatInterval,
+            chatId: curSession.chatId,
+            sessionHeaders: curHeaders,
+            email: curEmail,
+            sessionPool,
+          },
+        );
+        streamReleased = true;
+
+        // Post-stream RateLimited — retry with new account if possible
+        if (postResult.retryAccount) {
+          // Session already released by handlePostStreamCompletion (scheduleCleanup called inside)
+          heartbeatInterval = undefined;
+          streamReader = null;
+
+          if (attempt < MAX_STREAM_RETRIES && retrySetup) {
+            try {
+              const ns = await retrySetup();
+              curSession = ns.session;
+              curStream = ns.stream;
+              curAbort = ns.qwenAbortController;
+              curEmail = ns.resolvedEmail;
+              curHeaders = ns.sessionHeaders;
+              curParentId = ns.nextParentId;
+              streamReleased = false;
+              continue;
+            } catch (retryErr: any) {
+              logStore.log('error', 'stream', `[Stream] Post-stream retry setup failed for ${logId}: ${retryErr.message}`);
+              logStore.addError(logId, `Post-stream retry setup failed: ${retryErr.message}`);
+            }
+          }
+
+          // Exhausted retries or setup failed — terminate cleanly
+          try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
+          logStore.updateEntry(logId, (entry) => {
+            entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+            entry.finalResponse.finishReason = 'error';
+          });
+          logStore.finalizeRequest(ctx.logId);
+          break;
+        }
+
+        logStore.log('debug', 'stream', `[Stream] <<< Streaming completed for ${logId} in ${Date.now() - _streamStartTime}ms`);
+        break;
+      }
     } finally {
       if (!streamReleased) {
-        // Always write [DONE] so the SSE stream terminates cleanly, even on error
         try {
           await streamWriter.write('data: [DONE]\n\n');
         } catch {
@@ -160,14 +241,9 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         });
         logStore.finalizeRequest(ctx.logId);
         cleanupImmediately(
-          streamReader,
-          heartbeatInterval,
-          session.chatId,
-          ctx.initialParentId,
-          sessionHeaders,
-          resolvedEmail,
-          sessionPool,
-          false,
+          streamReader, heartbeatInterval,
+          curSession.chatId, curParentId, curHeaders, curEmail,
+          sessionPool, false,
         );
       }
     }

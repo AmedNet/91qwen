@@ -1,6 +1,6 @@
 import { logStore } from '../services/logStore.ts';
 import { logQwenSSE } from '../services/qwenLogger.ts';
-import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, CANONICAL_PARAM_NAMES, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
+import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, CANONICAL_PARAM_NAMES, camelToSnake, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
 import type { ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
@@ -151,10 +151,20 @@ function fixupLocalMcpArgs(params: Record<string, unknown>): Record<string, unkn
   const fixed: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
     const lowered = k.toLowerCase();
-    // Direct fixup lookup first
+    // 1. Direct fixup lookup first
     const direct = LOCAL_MCP_PARAM_FIXUPS[lowered];
     if (direct) { fixed[direct] = v; continue; }
-    // Fuzzy match: normalize by removing underscores and compare against canonical names
+    // 2. camelCase → snake_case (e.g. "outputMode" → "output_mode")
+    const snaked = camelToSnake(k);
+    if (snaked !== lowered) {
+      const snakedFixed = LOCAL_MCP_PARAM_FIXUPS[snaked.toLowerCase()];
+      if (snakedFixed) { fixed[snakedFixed] = v; continue; }
+      for (const canonical of CANONICAL_PARAM_NAMES) {
+        if (canonical === snaked) { fixed[canonical] = v; break; }
+      }
+      if (fixed[snaked]) continue;
+    }
+    // 3. Fuzzy match: normalize by removing underscores and compare
     const normalized = lowered.replace(/_/g, '');
     let found = false;
     for (const canonical of CANONICAL_PARAM_NAMES) {
@@ -164,7 +174,10 @@ function fixupLocalMcpArgs(params: Record<string, unknown>): Record<string, unkn
         break;
       }
     }
-    if (!found) fixed[k] = v;
+    if (!found) {
+      // 4. If snaked version differs from original, prefer snaked
+      fixed[snaked !== lowered ? snaked : k] = v;
+    }
   }
   return fixed;
 }

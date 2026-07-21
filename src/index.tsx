@@ -8,6 +8,7 @@ import { rateLimitMiddleware, startAutoCleanup, stopAutoCleanup } from './middle
 import { accountsRouter } from './routes/accounts.ts';
 import { anthropicMessages } from './routes/anthropic.ts';
 import { chatCompletions } from './routes/chat.ts';
+import { responsesCreate, responsesGet } from './routes/responses.ts';
 import { configRouter } from './routes/config.ts';
 import { registerDashboardRoutes } from './routes/dashboard/dashboardRoutes.ts';
 import { debugNetworkApp } from './routes/debugNetwork.ts';
@@ -213,6 +214,38 @@ app.post(
     }
   },
 );
+
+// Responses API — Codex CLI compatibility
+app.use('/v1/responses', async (c, next) => {
+  const contentLength = Number(c.req.header('content-length') || 0);
+  if (contentLength > MAX_BODY_BYTES) {
+    return c.json({ error: { message: 'Request body too large' } }, 413);
+  }
+  await next();
+});
+
+app.post(
+  '/v1/responses',
+  async (c, next) => {
+    const result = await rateLimitMiddleware(c, 'chat-completions');
+    if (result) return result;
+    await next();
+  },
+  async (c) => {
+    const startMs = Date.now();
+    logStore.log('info', 'http', `[Responses] /v1/responses ENTER url=${c.req.url}`);
+    try {
+      const response = await responsesCreate(c);
+      logStore.log('info', 'http', `[Responses] /v1/responses EXIT duration=${Date.now() - startMs}ms`);
+      return response;
+    } catch (err: any) {
+      logStore.log('error', 'http', `[Responses] /v1/responses UNCAUGHT after ${Date.now() - startMs}ms: ${err.message || err}`);
+      throw err;
+    }
+  },
+);
+
+app.get('/v1/responses/:id', responsesGet);
 
 app.get(
   '/v1/models',

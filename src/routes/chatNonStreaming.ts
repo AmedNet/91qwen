@@ -1,4 +1,4 @@
-import { Context } from 'hono';
+﻿import { Context } from 'hono';
 import { logStore } from '../services/logStore.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { setAccountDisabled } from '../services/auth.ts';
@@ -13,9 +13,7 @@ import {
   processToolCallsThroughGuard,
   ToolSpamGuard,
 } from './chatHelpers.ts';
-
 const MAX_TOOL_CALLS_PER_TURN = 8;
-
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 import { extractLocalMcpToolCalls } from './chatStreamingHelpers.ts';
 
@@ -100,26 +98,18 @@ function buildQwenRequest(ctx: NonStreamingContext): StreamProcessorState {
 }
 
 function processThinkingDelta(delta: any, state: StreamProcessorState): void {
-  // Handle thinking_summary format (thinking_format: "summary")
-  // Content is in extra.summary_thought.content[] array
   if (delta.phase === 'thinking_summary') {
     const thoughts = delta.extra?.summary_thought?.content;
     if (!thoughts) return;
-
     const rawNew = thoughts.slice(state.currentThoughtIndex).join('\n');
     if (!rawNew) return;
-
     const commonLen = commonPrefixLen(rawNew, state.reasoningBuffer);
     const vStr = rawNew.substring(commonLen);
     if (!vStr) return;
-
     state.currentThoughtIndex = thoughts.length;
     state.reasoningBuffer += vStr;
     return;
   }
-
-  // Handle think format (thinking_format: "full")
-  // Content is in delta.content (token-by-token)
   if (delta.phase === 'think') {
     if (delta.content !== undefined && delta.content !== '') {
       state.reasoningBuffer += delta.content;
@@ -132,9 +122,7 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
   if (delta.content === undefined) return;
   const vStr = delta.content || '';
   if (!vStr || vStr === 'FINISHED') return;
-
   logStore.addRawChunk(ctx.logId, vStr);
-
   if (vStr) {
     if (state.lastFullContent.length > 0) {
       const detection = detectCumulativeChunk(vStr, state.lastFullContent);
@@ -143,7 +131,6 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
       state.lastFullContent = vStr;
     }
   }
-
   const contentToCheck = state.lastFullContent.substring(state.lastParsedPosition);
   if (contentToCheck.length > 0) {
     const { toolCalls } = parseXmlToolCalls(contentToCheck);
@@ -164,10 +151,8 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
 function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonStreamingContext): void {
   const trimmed = line.trim();
   if (!trimmed || !trimmed.startsWith('data: ')) return;
-
   const dataStr = trimmed.slice(6);
   if (dataStr === '[DONE]') return;
-
   let chunk: any;
   try {
     chunk = JSON.parse(dataStr);
@@ -180,7 +165,6 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   if (chunk.error) {
     const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
     logStore.addError(ctx.logId, `Qwen upstream SSE error: ${errMsg}`);
-    // Check for RateLimited mid-stream — signal retry via retrySignal
     if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && ctx.resolvedEmail) {
       setAccountDisabled(ctx.resolvedEmail, true);
       if (ctx.retrySignal) {
@@ -191,6 +175,7 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
     }
     return;
   }
+
   const deltaStatus = chunk.choices?.[0]?.delta?.status;
   if (deltaStatus === 'error') {
     const deltaCode = chunk.choices?.[0]?.delta?.code;
@@ -234,9 +219,6 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   } else if (delta.phase === 'answer') {
     processAnswerDelta(delta, state, ctx);
   } else if (delta.phase === 'local_tool') {
-    // Qwen returns tool calls in the local_tool phase via extra.local_mcp["★"].
-    // These may arrive with or without XML tool call blocks in the answer phase,
-    // so we must extract them here to avoid losing tool calls.
     const localToolCalls = extractLocalMcpToolCalls(chunk);
     if (localToolCalls.length > 0) {
       processToolCallsThroughGuard(localToolCalls, state.toolCallsOut, {
@@ -254,8 +236,6 @@ function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
   const { toolCalls } = parseXmlToolCalls(state.lastFullContent);
   if (toolCalls.length > 0) {
     const parsed = toolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
-    // Filter out already-processed tool calls to avoid corrupting ToolSpamGuard state
-    // Stable dedup: sort object keys so property order doesn't cause false negatives
     const stableArgs = (args: Record<string, unknown>): string => {
       const keys = Object.keys(args).sort();
       return '{' + keys.map((k) => `${JSON.stringify(k)}:${JSON.stringify(args[k])}`).join(',') + '}';
@@ -283,9 +263,7 @@ function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
       });
     }
   }
-
   if (state.toolCallsOut.length < 3) return;
-
   const parsedForLoopCheck: ParsedToolCall[] = state.toolCallsOut.map((tc: any) => ({
     id: tc.id,
     name: tc.function.name,
@@ -302,7 +280,6 @@ function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
     logStore.log('debug', 'chat', `[🔄 PARALLEL LOOP] ${loopCheck.errors[0]}`);
     state.correctionPrompts.push(loopCheck.correctionPrompt);
     logStore.addError(logId, `Parallel loop: ${loopCheck.errors[0]}`);
-    // Filter out duplicate tool calls from the response
     if (loopCheck.valid && loopCheck.valid.length < parsedForLoopCheck.length) {
       const validIds = new Set(loopCheck.valid.map((v) => v.id));
       state.toolCallsOut = state.toolCallsOut.filter((tc) => validIds.has(tc.id));
@@ -312,7 +289,6 @@ function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
 
 function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingContext): Response {
   const { c, logId, completionId, body, session, cleanOutput } = ctx;
-
   const reasoningTokensEstimate = state.reasoningBuffer ? Math.ceil(state.reasoningBuffer.length / 4) : 0;
   const usage = {
     prompt_tokens: state.promptTokens,
@@ -321,7 +297,6 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
     completion_tokens_details: { reasoning_tokens: reasoningTokensEstimate },
     prompt_tokens_details: { cached_tokens: 0 },
   };
-
   const contentForUser = cleanTextOfXmlArtifacts(state.lastFullContent).cleanedText;
   state.lastFullContent = contentForUser;
   const { cleanText: baseFilteredContent, thinking: filteredReasoning } = cleanOutput
@@ -330,16 +305,13 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
   if (filteredReasoning) {
     state.reasoningBuffer = state.reasoningBuffer ? state.reasoningBuffer + '\n' + filteredReasoning : filteredReasoning;
   }
-
   const filteredContent = baseFilteredContent;
-
   const message: any = { role: 'assistant', content: state.toolCallsOut.length ? null : filteredContent };
   if (state.reasoningBuffer) message.reasoning_content = state.reasoningBuffer;
   if (state.toolCallsOut.length) {
     state.toolCallsOut.forEach((tc, idx) => (tc.index = idx));
     message.tool_calls = state.toolCallsOut;
   }
-
   logStore.updateEntry(logId, (entry) => {
     const now = Date.now();
     const startedAt = new Date(entry.timestamp).getTime();
@@ -352,17 +324,13 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
     entry.rawFullContent = state.lastFullContent;
     entry.remainingText = state.lastFullContent;
   });
-
   for (const prompt of state.correctionPrompts) {
     logStore.addError(logId, prompt);
   }
-
   logStore.addProcessedOutput(logId, filteredContent);
-
   if (state.correctionPrompts.length > 0) {
     pendingCorrections.set(session.chatId, [...state.correctionPrompts]);
   }
-
   return c.json({
     id: completionId,
     object: 'chat.completion',
@@ -384,10 +352,8 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
 
 async function processContentChunks(state: StreamProcessorState, ctx: NonStreamingContext): Promise<Response> {
   const { c, logId, resolvedEmail } = ctx;
-
   const upstreamError = parseQwenErrorPayload(state.buffer);
   if (upstreamError) {
-    // Check for RateLimited — disable account so it won't be reused
     if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
       setAccountDisabled(resolvedEmail, true);
       if (ctx.retrySignal) {
@@ -410,7 +376,6 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
       upstreamError.status,
     );
   }
-
   flushAndDetectLoops(state, logId);
   const response = buildResponseFromState(state, ctx);
   logStore.finalizeRequest(logId);
@@ -422,21 +387,23 @@ export async function handleNonStreamingRequest(ctx: NonStreamingContext): Promi
   const state = buildQwenRequest(ctx);
   let nonStreamReleased = false;
   let logFinalized = false;
-
   try {
     while (true) {
       const { done, value } = await state.reader.read();
       if (done) break;
-
       state.buffer += state.decoder.decode(value, { stream: true });
       const lines = state.buffer.split('\n');
       state.buffer = lines.pop() || '';
-
       for (const line of lines) {
         parseQwenResponse(line, state, ctx);
       }
+      // Early termination: if RateLimited was detected mid-stream, stop reading
+      // the remaining data. The caller will check retrySignal and retry.
+      if (ctx.retrySignal?.needsRetry) {
+        logStore.log('info', 'chat', `[Chat] Non-streaming early termination: RateLimited detected on ${resolvedEmail}`);
+        break;
+      }
     }
-
     nonStreamReleased = true;
     sessionPool.release(session.chatId, state.nextParentId, sessionHeaders, resolvedEmail);
     const result = await processContentChunks(state, ctx);

@@ -5,6 +5,7 @@
 
 import crypto from 'node:crypto';
 import type { ParsedToolCall } from '../types/openai.ts';
+import { camelToSnake } from '../tools/xmlToolParser.ts';
 
 export interface AnthropicContentBlock {
   type: string;
@@ -104,7 +105,7 @@ export function resolveToolName(normalizedName: string, reverseToolMap?: Map<str
   return reverseToolMap.get(normalizedName) || reverseToolMap.get(normalizedName.toLowerCase()) || normalizedName;
 }
 
-/** Map Qwen snake_case aliases to Claude Code camelCase for non-file tools. */
+/** Map Qwen snake_case / camelCase aliases to Claude Code camelCase for non-file tools. */
 export function mapParamName(paramName: string): string {
   const SNAKE_TO_CAMEL: Record<string, string> = {
     file_path: 'filePath',
@@ -119,8 +120,20 @@ export function mapParamName(paramName: string): string {
     max_results: 'maxResults',
     target_directory: 'targetDirectory',
     glob_pattern: 'globPattern',
+    notebook_path: 'notebookPath',
   };
-  return SNAKE_TO_CAMEL[paramName] || paramName;
+  // Direct lookup (already snake_case)
+  const direct = SNAKE_TO_CAMEL[paramName];
+  if (direct) return direct;
+  // camelCase → snake_case → lookup
+  // Only apply if the snaked version has an explicit mapping in our table,
+  // otherwise pass through unchanged to avoid over-fixup of edge cases.
+  const snaked = camelToSnake(paramName);
+  if (snaked !== paramName.toLowerCase()) {
+    const snakedLookup = SNAKE_TO_CAMEL[snaked];
+    if (snakedLookup) return snakedLookup;
+  }
+  return paramName;
 }
 
 const FILE_TOOL_NAMES = new Set(['Read', 'Edit', 'Write']);

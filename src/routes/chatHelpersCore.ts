@@ -1,4 +1,4 @@
-import { logStore } from '../services/logStore.ts';
+﻿import { logStore } from '../services/logStore.ts';
 import { validateSingleToolCall } from '../tools/guard.ts';
 import { TOOL_CALL_KEYWORDS, TOOL_RESULT_KEYWORDS } from '../utils/tagNames.ts';
 import { QWEN_THINK_TAG_PATTERN as THINK_TAG_PATTERN } from '../utils/thinkTagStripper.ts';
@@ -386,7 +386,7 @@ export function checkAmplificationGuard(
 ): boolean {
   if (!state.triggered) {
     const projectedRatio = (state.emittedOutputBytes + newOutputLen) / Math.max(1, state.rawInputBytes);
-    if (projectedRatio > 3 && state.emittedOutputBytes > 1000) {
+    if (projectedRatio > 10 && state.emittedOutputBytes > 5000) {
       state.triggered = true;
       const ratio = Math.round(projectedRatio * 100) / 100;
       console.error(

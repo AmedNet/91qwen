@@ -4,7 +4,7 @@
  * Implements LiteLLM-style weighted fallback chain selection
  */
 
-import modelsConfig from '../models.json';
+import modelsConfig from '../models.json' with { type: 'json' };
 import { logStore } from './logStore.ts';
 
 export interface FallbackEntry {

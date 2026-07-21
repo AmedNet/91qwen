@@ -1,7 +1,8 @@
-﻿import { randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { modelRouter } from '../services/modelRouter.ts';
+import { DEFAULT_SYSTEM_PROMPT } from '../services/defaultSystemPrompt.ts';
 import { buildFeatureConfig, createQwenStream } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import type { ModelSpec } from '../types/openai.ts';
@@ -72,6 +73,9 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const segments: string[] = [];
   const systemParts: string[] = [];
+  // Always inject gateway formatting instructions first — delivered via context.txt
+  // alongside any client system prompt to avoid conflicts with account-level personalization.
+  systemParts.push(DEFAULT_SYSTEM_PROMPT);
   const toolResultObjects: any[] = [];
 
   for (let i = 0; i < messages.length; i++) {

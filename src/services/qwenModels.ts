@@ -106,10 +106,14 @@ export async function configureAccount(email: string, instruction?: string): Pro
       payload.personalization = { instruction, enable_for_new_chat: true };
     } else if (!instruction) {
       const useCustom = config.get('USE_CUSTOM_INSTRUCTION') === 'true';
-      const resolved = useCustom ? config.get('CUSTOM_INSTRUCTION') : DEFAULT_SYSTEM_PROMPT;
-      if (resolved && resolved.trim().length > 0) {
-        payload.personalization = { instruction: resolved, enable_for_new_chat: true };
+      if (useCustom) {
+        const resolved = config.get('CUSTOM_INSTRUCTION');
+        if (resolved && resolved.trim().length > 0) {
+          payload.personalization = { instruction: resolved, enable_for_new_chat: true };
+        }
       }
+      // When not using custom instruction, don't set account personalization.
+      // Gateway formatting instructions are delivered via context.txt instead.
     }
     const { response, debugId } = await postQwenSettings(email, payload);
     settingsDebugId = debugId;

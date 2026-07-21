@@ -459,8 +459,9 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
     assert.strictEqual(msg.sub_chat_type, 't2t', 'Sub chat type should remain t2t');
     assert.strictEqual(msg.extra?.meta?.subChatType, 't2t', 'Extra subChatType should remain t2t');
 
-    // Verify file attachment format
-    const file = msg.files[0];
+    // Verify file attachment format — context.txt may be uploaded alongside images
+    // (systemContent is non-empty due to DEFAULT_SYSTEM_PROMPT injection)
+    const file = msg.files.find((f: any) => f.type === 'image') || msg.files[0];
     assert.strictEqual(file.type, 'image', 'File attachment type should be image');
     assert.strictEqual(file.file_class, 'vision', 'File class should be vision');
   } finally {

@@ -1,11 +1,11 @@
-import crypto from 'node:crypto';
+﻿import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { pickAccount, setAccountDisabled, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
-import { RetryableQwenStreamError } from '../services/qwen.ts';
+import { RetryableQwenStreamError, QwenToolNotFoundError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -180,7 +180,7 @@ async function setupAnthropicSession(
       if (chatHistoryContent) parts.push(`<chat_history>\n${chatHistoryContent}\n</chat_history>`);
       try {
         const file = await uploadLargeTextAsFile(accountEmail, parts.join('\n\n'), 'context.txt');
-        processedMessages[0] = { ...processedMessages[0], files: [file] };
+        processedMessages[0] = { ...processedMessages[0], files: [...(processedMessages[0].files || []), file] };
       } catch (err: any) {
         logStore.log('debug', 'chat', '[Anthropic] Failed to upload context file: ' + (err.message || err));
       }
@@ -240,6 +240,11 @@ async function setupAnthropicSession(
         lastError = err;
         continue;
       }
+      // QwenToolNotFoundError: LLM used a wrong tool name — don't switch accounts.
+      if (err instanceof QwenToolNotFoundError) {
+        logStore.log('error', 'chat', `[Anthropic]   -> tool not found (LLM error), throwing immediately`);
+        throw err;
+      }
       if (
         (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
         (err.message || '').includes('CAPTCHA') ||
@@ -269,7 +274,7 @@ async function setupAnthropicSession(
     }
     let { stream, abortController: qwenAbortController } = streamResult;
 
-    const FIRST_CHUNK_MS = 60_000;
+    const FIRST_CHUNK_MS = 120_000;
     const streamReader = stream.getReader();
     let firstChunk: any;
     let firstChunkTimer: ReturnType<typeof setTimeout> | undefined;
@@ -347,13 +352,21 @@ async function handleAnthropicStream(
   sessionHeaders: any,
   promptTokenEstimate: number = 0,
   reverseToolMap?: Map<string, string>,
+  retrySetup?: () => Promise<{
+    session: { chatId: string; parentId: string | null; cachedHeaders: any; accountEmail?: string };
+    stream: ReadableStream;
+    qwenAbortController: AbortController;
+    resolvedEmail: string;
+    nextParentId: string | null;
+    sessionHeaders: any;
+  }>,
 ): Promise<Response> {
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
   c.header('Connection', 'close');
 
   return honoStream(c, async (streamWriter: any) => {
-    // Ping keepalive every 10s (issue 5)
+    // Ping keepalive every 10s
     const pingInterval = setInterval(() => {
       if (streamWriter.aborted || streamWriter.closed) {
         clearInterval(pingInterval);
@@ -362,127 +375,182 @@ async function handleAnthropicStream(
       streamWriter.write('event: ping\ndata: {"type":"ping"}\n\n').catch(() => clearInterval(pingInterval));
     }, 10_000);
 
-    // Clean up ping on abort
     streamWriter.onAbort(() => clearInterval(pingInterval));
 
-    let streamReleased = false;
-    let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-    try {
-      streamReader = stream.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let emittedMessageStart = false;
-      let emittedThinkingBlock = false;
-      let emittedTextBlock = false;
-      let lastFullContent = '';
-      let targetResponseId: string | null = null;
-      let currentThoughtIndex = 0;
-      let reasoningBuffer = '';
-      let completionTokens = 0;
-      let promptTokensFromChunks = 0;
-      let localToolCallsAccum: any[] = [];
-      let hasEmittedContent = false;
-      let textBlockIndex = 0;
+    const MAX_STREAM_RETRIES = 3;
+    let curSession = session;
+    let curStream = stream;
+    let curAbort = qwenAbortController;
+    let curEmail = resolvedEmail;
+    let curHeaders = sessionHeaders;
+    let curParentId = nextParentId;
 
-      const STREAM_IDLE_TIMEOUT = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60_000));
+    for (let attempt = 0; attempt <= MAX_STREAM_RETRIES; attempt++) {
+      if (attempt > 0) {
+        logStore.log('info', 'chat', `[Anthropic] Streaming retry attempt ${attempt}/${MAX_STREAM_RETRIES}`);
+      }
 
-      while (true) {
-        let idleTimer: ReturnType<typeof setTimeout> | undefined;
-        let readResult: { done: boolean; value?: Uint8Array };
-        try {
-          readResult = await Promise.race([
-            streamReader.read(),
-            new Promise<any>((_, reject) => {
-              idleTimer = setTimeout(
-                () => reject(new Error(`Stream idle timeout — no data for ${STREAM_IDLE_TIMEOUT / 1000}s`)),
-                STREAM_IDLE_TIMEOUT,
-              );
-            }),
-          ]);
-        } catch (streamErr: any) {
-          logStore.log('warn', 'chat', `[Anthropic] ${streamErr.message || 'Stream read error'} (logId=${logId})`);
-          break;
-        } finally {
-          if (idleTimer) clearTimeout(idleTimer);
-        }
-        if (readResult.done) break;
-        if (readResult.value) {
-          buffer += decoder.decode(readResult.value, { stream: true });
-        } else {
-          continue;
-        }
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          const dataStr = trimmed.slice(6);
-          if (dataStr === '[DONE]') continue;
-          let chunk: any;
+      let rateLimitedDetected = false;
+      let streamReleased = false;
+      let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+      try {
+        streamReader = curStream.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let emittedMessageStart = false;
+        let emittedThinkingBlock = false;
+        let emittedTextBlock = false;
+        let lastFullContent = '';
+        let targetResponseId: string | null = null;
+        let currentThoughtIndex = 0;
+        let reasoningBuffer = '';
+        let completionTokens = 0;
+        let promptTokensFromChunks = 0;
+        let localToolCallsAccum: any[] = [];
+        let hasEmittedContent = false;
+        let textBlockIndex = 0;
+
+        const STREAM_IDLE_TIMEOUT = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 180_000));
+
+        while (true) {
+          let idleTimer: ReturnType<typeof setTimeout> | undefined;
+          let readResult: { done: boolean; value?: Uint8Array };
           try {
-            chunk = JSON.parse(dataStr);
-          } catch {
+            readResult = await Promise.race([
+              streamReader.read(),
+              new Promise<any>((_, reject) => {
+                idleTimer = setTimeout(
+                  () => reject(new Error(`Stream idle timeout — no data for ${STREAM_IDLE_TIMEOUT / 1000}s`)),
+                  STREAM_IDLE_TIMEOUT,
+                );
+              }),
+            ]);
+          } catch (streamErr: any) {
+            logStore.log('warn', 'chat', `[Anthropic] ${streamErr.message || 'Stream read error'} (logId=${logId})`);
+            break;
+          } finally {
+            if (idleTimer) clearTimeout(idleTimer);
+          }
+          if (readResult.done) break;
+          if (readResult.value) {
+            buffer += decoder.decode(readResult.value, { stream: true });
+          } else {
             continue;
           }
-
-          // ── RateLimited / upstream error detection ──────────────────
-          // Check for upstream Qwen error sent as SSE data chunk
-          if (chunk.error) {
-            const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
-            logStore.addError(logId, `Qwen upstream SSE error: ${errMsg}`);
-            if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && resolvedEmail) {
-              setAccountDisabled(resolvedEmail, true);
-              logStore.log('warn', 'qwen', `[Anthropic] RateLimited via SSE: disabled ${resolvedEmail} — ${errMsg}`);
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data: ')) continue;
+            const dataStr = trimmed.slice(6);
+            if (dataStr === '[DONE]') continue;
+            let chunk: any;
+            try {
+              chunk = JSON.parse(dataStr);
+            } catch {
+              continue;
             }
-            break; // terminate stream on upstream error
-          }
 
-          // ponytail: qwenRawChunks stores text content, not raw SSE JSON
-          // raw SSE is not stored — qwenRawChunks tracks each content delta
-
-          if (chunk['response.created']?.response_id) {
-            if (!targetResponseId) targetResponseId = chunk['response.created'].response_id;
-          } else if (chunk.response_id && !targetResponseId) {
-            targetResponseId = chunk.response_id;
-          }
-
-          if (chunk.usage) {
-            if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
-            if (chunk.usage.input_tokens) promptTokensFromChunks = chunk.usage.input_tokens;
-          }
-
-          // Extract local MCP tool calls — and check for error status
-          const deltaStatus = chunk.choices?.[0]?.delta?.status;
-          const deltaPhase = chunk.choices?.[0]?.delta?.phase;
-          if (deltaStatus === 'error') {
-            const deltaCode = chunk.choices?.[0]?.delta?.code;
-            const deltaMsg = chunk.choices?.[0]?.delta?.message || '';
-            logStore.addError(logId, `Qwen stream delta returned error status: code=${deltaCode} msg=${deltaMsg}`);
-            if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && resolvedEmail) {
-              setAccountDisabled(resolvedEmail, true);
-              logStore.log('warn', 'qwen', `[Anthropic] RateLimited via delta status: disabled ${resolvedEmail} — code=${deltaCode} msg=${deltaMsg}`);
+            // ── RateLimited / upstream error detection ──────────────────
+            if (chunk.error) {
+              const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
+              logStore.addError(logId, `Qwen upstream SSE error: ${errMsg}`);
+              if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && curEmail) {
+                setAccountDisabled(curEmail, true);
+                logStore.log('warn', 'qwen', `[Anthropic] RateLimited via SSE: disabled ${curEmail} — ${errMsg}`);
+                rateLimitedDetected = true;
+              }
+              break;
             }
-            break; // terminate stream on upstream error
-          }
-          if (deltaStatus === 'finished' && deltaPhase === 'local_tool') {
-            const calls = extractLocalMcpToolCalls(chunk);
-            logStore.log('debug', 'chat', `[Anthropic] local_mcp SSE chunk: extracted ${calls.length} tool calls`);
-            for (const c of calls) {
-              logStore.log('debug', 'chat', `[Anthropic] local_mcp tool: name=${c.name} id=${c.id} args=${JSON.stringify(c.arguments)}`);
-              if (!localToolCallsAccum.some((e) => e.id === c.id)) localToolCallsAccum.push(c);
+
+            if (chunk['response.created']?.response_id) {
+              if (!targetResponseId) targetResponseId = chunk['response.created'].response_id;
+            } else if (chunk.response_id && !targetResponseId) {
+              targetResponseId = chunk.response_id;
             }
-          }
 
-          const deltaResult = extractDeltaContent(chunk, targetResponseId, currentThoughtIndex, reasoningBuffer);
-          if (!deltaResult.foundStr || !deltaResult.vStr) continue;
+            if (chunk.usage) {
+              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
+              if (chunk.usage.input_tokens) promptTokensFromChunks = chunk.usage.input_tokens;
+            }
 
-          currentThoughtIndex = deltaResult.currentThoughtIndex;
+            const deltaStatus = chunk.choices?.[0]?.delta?.status;
+            const deltaPhase = chunk.choices?.[0]?.delta?.phase;
+            if (deltaStatus === 'error') {
+              const deltaCode = chunk.choices?.[0]?.delta?.code;
+              const deltaMsg = chunk.choices?.[0]?.delta?.message || '';
+              logStore.addError(logId, `Qwen stream delta returned error status: code=${deltaCode} msg=${deltaMsg}`);
+              if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && curEmail) {
+                setAccountDisabled(curEmail, true);
+                logStore.log('warn', 'qwen', `[Anthropic] RateLimited via delta status: disabled ${curEmail} — code=${deltaCode} msg=${deltaMsg}`);
+                rateLimitedDetected = true;
+              }
+              break;
+            }
+            if (deltaStatus === 'finished' && deltaPhase === 'local_tool') {
+              const calls = extractLocalMcpToolCalls(chunk);
+              logStore.log('debug', 'chat', `[Anthropic] local_mcp SSE chunk: extracted ${calls.length} tool calls`);
+              for (const c of calls) {
+                logStore.log('debug', 'chat', `[Anthropic] local_mcp tool: name=${c.name} id=${c.id} args=${JSON.stringify(c.arguments)}`);
+                if (!localToolCallsAccum.some((e) => e.id === c.id)) localToolCallsAccum.push(c);
+              }
+            }
 
-          // Handle thinking chunks — emit Anthropic thinking blocks
-          if (deltaResult.isThinkingChunk) {
-            if (reasoningBuffer.length < 20000) reasoningBuffer += deltaResult.vStr;
+            const deltaResult = extractDeltaContent(chunk, targetResponseId, currentThoughtIndex, reasoningBuffer);
+            if (!deltaResult.foundStr || !deltaResult.vStr) continue;
 
-            // Emit message_start if not yet done
+            currentThoughtIndex = deltaResult.currentThoughtIndex;
+
+            // Handle thinking chunks
+            if (deltaResult.isThinkingChunk) {
+              if (reasoningBuffer.length < 20000) reasoningBuffer += deltaResult.vStr;
+
+              if (!emittedMessageStart) {
+                const msgId = 'msg_' + crypto.randomUUID();
+                await streamWriter.write(
+                  `event: message_start\ndata: ${JSON.stringify({
+                    type: 'message_start',
+                    message: {
+                      id: msgId,
+                      type: 'message',
+                      role: 'assistant',
+                      content: [],
+                      model: anthropicModel,
+                      stop_reason: null,
+                      stop_sequence: null,
+                      usage: { input_tokens: promptTokenEstimate, output_tokens: 0 },
+                    },
+                  })}\n\n`,
+                );
+                emittedMessageStart = true;
+              }
+
+              if (!emittedThinkingBlock) {
+                await streamWriter.write(
+                  `event: content_block_start\ndata: ${JSON.stringify({
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: { type: 'thinking', thinking: '' },
+                  })}\n\n`,
+                );
+                emittedThinkingBlock = true;
+                textBlockIndex = 1;
+              }
+
+              await streamWriter.write(
+                `event: content_block_delta\ndata: ${JSON.stringify({
+                  type: 'content_block_delta',
+                  index: 0,
+                  delta: { type: 'thinking_delta', thinking: deltaResult.vStr },
+                })}\n\n`,
+              );
+
+              continue;
+            }
+
+            // ── Text/answer chunks ──────────────────────────────────
+
             if (!emittedMessageStart) {
               const msgId = 'msg_' + crypto.randomUUID();
               await streamWriter.write(
@@ -503,241 +571,216 @@ async function handleAnthropicStream(
               emittedMessageStart = true;
             }
 
-            // Emit thinking content_block_start on first thinking delta
-            if (!emittedThinkingBlock) {
+            if (emittedThinkingBlock && !emittedTextBlock) {
+              await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+            }
+
+            if (!emittedTextBlock) {
               await streamWriter.write(
                 `event: content_block_start\ndata: ${JSON.stringify({
                   type: 'content_block_start',
-                  index: 0,
-                  content_block: { type: 'thinking', thinking: '' },
+                  index: textBlockIndex,
+                  content_block: { type: 'text', text: '' },
                 })}\n\n`,
               );
-              emittedThinkingBlock = true;
-              textBlockIndex = 1;
+              emittedTextBlock = true;
             }
 
-            // Emit thinking delta
+            const cleanedText = cleanTextOfXmlArtifacts(deltaResult.vStr).cleanedText || '';
+
             await streamWriter.write(
               `event: content_block_delta\ndata: ${JSON.stringify({
                 type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'thinking_delta', thinking: deltaResult.vStr },
-              })}\n\n`,
-            );
-
-            continue; // skip text block handling below
-          }
-
-          // ── Text/answer chunks ──────────────────────────────────
-
-          // Emit message_start on first text delta if not already emitted (no thinking)
-          if (!emittedMessageStart) {
-            const msgId = 'msg_' + crypto.randomUUID();
-            await streamWriter.write(
-              `event: message_start\ndata: ${JSON.stringify({
-                type: 'message_start',
-                message: {
-                  id: msgId,
-                  type: 'message',
-                  role: 'assistant',
-                  content: [],
-                  model: anthropicModel,
-                  stop_reason: null,
-                  stop_sequence: null,
-                  usage: { input_tokens: promptTokenEstimate, output_tokens: 0 },
-                },
-              })}\n\n`,
-            );
-            emittedMessageStart = true;
-          }
-
-          // Close thinking block if it was started (now transitioning to text)
-          if (emittedThinkingBlock && !emittedTextBlock) {
-            await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-          }
-
-          // Emit text content_block_start on first text delta
-          if (!emittedTextBlock) {
-            await streamWriter.write(
-              `event: content_block_start\ndata: ${JSON.stringify({
-                type: 'content_block_start',
                 index: textBlockIndex,
-                content_block: { type: 'text', text: '' },
+                delta: { type: 'text_delta', text: cleanedText },
               })}\n\n`,
             );
-            emittedTextBlock = true;
+
+            lastFullContent += deltaResult.vStr;
+            logStore.addProcessedOutput(logId, cleanedText);
+            logStore.addRawChunk(logId, deltaResult.vStr);
+            hasEmittedContent = true;
           }
-
-          // Strip XML tool call artifacts from emitted text (Claude Code may
-          // fall back to parsing tool calls from text content, and XML artifacts
-          // can produce spurious tool calls or confuse the client).
-          const cleanedText = cleanTextOfXmlArtifacts(deltaResult.vStr).cleanedText || '';
-
-          // Emit cleaned text delta to Claude Code
-          await streamWriter.write(
-            `event: content_block_delta\ndata: ${JSON.stringify({
-              type: 'content_block_delta',
-              index: textBlockIndex,
-              delta: { type: 'text_delta', text: cleanedText },
-            })}\n\n`,
-          );
-
-          // Accumulate RAW text (with XML) for XML fallback tool call parsing
-          lastFullContent += deltaResult.vStr;
-          logStore.addProcessedOutput(logId, cleanedText);
-          logStore.addRawChunk(logId, deltaResult.vStr);
-          hasEmittedContent = true;
         }
-      }
 
-      // Stream ended — emit close events
-      logStore.log(
-        'debug',
-        'chat',
-        `[Anthropic] Stream ended. lastFullContent length=${lastFullContent.length}, localToolCallsAccum=${localToolCallsAccum.length}`,
-      );
+        // If RateLimited was detected, don't emit close events — retry instead
+        if (rateLimitedDetected) {
+          // Clean up current session
+          try { streamReader?.cancel(); } catch {}
+          try { streamReader?.releaseLock(); } catch {}
+          sessionPool.release(curSession.chatId, curParentId, curHeaders, curEmail, false);
+          streamReleased = true;
 
-      const { toolCalls: xmlToolCalls } = parseXmlToolCalls(lastFullContent);
-      const xmlParsedCalls = xmlToolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
-      logStore.log('debug', 'chat', `[Anthropic] XML parsed from text: ${xmlParsedCalls.length} tool calls`);
-      for (const tc of xmlParsedCalls) {
-        logStore.log('debug', 'chat', `[Anthropic] XML tool: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)}`);
-      }
+          if (attempt < MAX_STREAM_RETRIES && retrySetup) {
+            try {
+              const ns = await retrySetup();
+              curSession = ns.session;
+              curStream = ns.stream;
+              curAbort = ns.qwenAbortController;
+              curEmail = ns.resolvedEmail;
+              curHeaders = ns.sessionHeaders;
+              curParentId = ns.nextParentId;
+              continue;
+            } catch (retryErr: any) {
+              logStore.log('error', 'chat', `[Anthropic] Retry setup failed: ${retryErr.message}`);
+              // Fall through to clean termination
+            }
+          }
+          // Exhausted retries or setup failed — terminate cleanly
+          logStore.finalizeRequest(logId, { finishReason: 'error' });
+          break;
+        }
 
-      const allToolCalls = mergeParsedToolCalls(xmlParsedCalls, localToolCallsAccum);
-      logStore.log(
-        'debug',
-        'chat',
-        `[Anthropic] Merged tool calls: ${allToolCalls.length} total (${xmlParsedCalls.length} XML + ${localToolCallsAccum.length} local_mcp)`,
-      );
-
-      // Log raw tool calls from Qwen before filtering
-      for (const tc of allToolCalls) {
+        // Stream ended normally — emit close events
         logStore.log(
           'debug',
           'chat',
-          `[Anthropic] Raw tool call from Qwen: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)} source=${tc.id.startsWith('call_xml') ? 'xml' : 'local_mcp'}`,
+          `[Anthropic] Stream ended. lastFullContent length=${lastFullContent.length}, localToolCallsAccum=${localToolCallsAccum.length}`,
         );
-      }
 
-      const validToolCalls: ParsedToolCall[] = [];
-      const validArgs: any[] = [];
-      for (const tc of allToolCalls) {
-        const result = prepareToolCallForClaude(tc, reverseToolMap);
-        if (result.valid) {
+        const { toolCalls: xmlToolCalls } = parseXmlToolCalls(lastFullContent);
+        const xmlParsedCalls = xmlToolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
+        logStore.log('debug', 'chat', `[Anthropic] XML parsed from text: ${xmlParsedCalls.length} tool calls`);
+        for (const tc of xmlParsedCalls) {
+          logStore.log('debug', 'chat', `[Anthropic] XML tool: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)}`);
+        }
+
+        const allToolCalls = mergeParsedToolCalls(xmlParsedCalls, localToolCallsAccum);
+        logStore.log(
+          'debug',
+          'chat',
+          `[Anthropic] Merged tool calls: ${allToolCalls.length} total (${xmlParsedCalls.length} XML + ${localToolCallsAccum.length} local_mcp)`,
+        );
+
+        for (const tc of allToolCalls) {
           logStore.log(
             'debug',
             'chat',
-            `[Anthropic] VALID tool call: original_name=${tc.name} normalized_name=${result.name} id=${tc.id} args=${JSON.stringify(result.args)}`,
-          );
-          validToolCalls.push({ ...tc, name: result.name });
-          validArgs.push(result.args);
-        } else {
-          logStore.log(
-            'debug',
-            'chat',
-            `[Anthropic] SKIPPED tool call (invalid): name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)} reason=missing_required_params`,
+            `[Anthropic] Raw tool call from Qwen: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)} source=${tc.id.startsWith('call_xml') ? 'xml' : 'local_mcp'}`,
           );
         }
-      }
 
-      logStore.log(
-        'debug',
-        'chat',
-        `[Anthropic] Tool call summary: ${allToolCalls.length} raw → ${validToolCalls.length} valid → emitting ${validToolCalls.length} tool_use blocks`,
-      );
-      // Close text or thinking block
-      if (emittedTextBlock) {
-        await streamWriter.write(
-          `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: textBlockIndex })}\n\n`,
+        const validToolCalls: ParsedToolCall[] = [];
+        const validArgs: any[] = [];
+        for (const tc of allToolCalls) {
+          const result = prepareToolCallForClaude(tc, reverseToolMap);
+          if (result.valid) {
+            logStore.log(
+              'debug',
+              'chat',
+              `[Anthropic] VALID tool call: original_name=${tc.name} normalized_name=${result.name} id=${tc.id} args=${JSON.stringify(result.args)}`,
+            );
+            validToolCalls.push({ ...tc, name: result.name });
+            validArgs.push(result.args);
+          } else {
+            logStore.log(
+              'debug',
+              'chat',
+              `[Anthropic] SKIPPED tool call (invalid): name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)} reason=missing_required_params`,
+            );
+          }
+        }
+
+        logStore.log(
+          'debug',
+          'chat',
+          `[Anthropic] Tool call summary: ${allToolCalls.length} raw → ${validToolCalls.length} valid → emitting ${validToolCalls.length} tool_use blocks`,
         );
-      } else if (emittedThinkingBlock && !emittedTextBlock) {
-        await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-      }
 
-      // Emit tool_use content blocks using pre-validated calls
-      // ponytail: full args JSON in one delta since we know it upfront (local_mcp/XML)
-      let blockIndex = emittedTextBlock ? textBlockIndex + 1 : emittedThinkingBlock ? 1 : 0;
-      for (let i = 0; i < validToolCalls.length; i++) {
-        const tc = validToolCalls[i];
-        const args = validArgs[i];
-        // content_block_start with empty input per spec
+        // Close text or thinking block
+        if (emittedTextBlock) {
+          await streamWriter.write(
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: textBlockIndex })}\n\n`,
+          );
+        } else if (emittedThinkingBlock && !emittedTextBlock) {
+          await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+        }
+
+        // Emit tool_use content blocks
+        let blockIndex = emittedTextBlock ? textBlockIndex + 1 : emittedThinkingBlock ? 1 : 0;
+        for (let i = 0; i < validToolCalls.length; i++) {
+          const tc = validToolCalls[i];
+          const args = validArgs[i];
+          await streamWriter.write(
+            `event: content_block_start\ndata: ${JSON.stringify({
+              type: 'content_block_start',
+              index: blockIndex,
+              content_block: { type: 'tool_use', id: tc.id, name: tc.name, input: {} },
+            })}\n\n`,
+          );
+          await streamWriter.write(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: blockIndex,
+              delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) },
+            })}\n\n`,
+          );
+          await streamWriter.write(
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: blockIndex })}\n\n`,
+          );
+          blockIndex++;
+        }
+
+        // Emit message_delta
+        const stopReason = validToolCalls.length > 0 ? 'tool_use' : emittedThinkingBlock && !emittedTextBlock ? 'end_turn' : 'end_turn';
         await streamWriter.write(
-          `event: content_block_start\ndata: ${JSON.stringify({
-            type: 'content_block_start',
-            index: blockIndex,
-            content_block: { type: 'tool_use', id: tc.id, name: tc.name, input: {} },
+          `event: message_delta\ndata: ${JSON.stringify({
+            type: 'message_delta',
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: { output_tokens: completionTokens, input_tokens: promptTokensFromChunks || promptTokenEstimate },
           })}\n\n`,
         );
-        // input_json_delta with full args JSON
-        await streamWriter.write(
-          `event: content_block_delta\ndata: ${JSON.stringify({
-            type: 'content_block_delta',
-            index: blockIndex,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) },
-          })}\n\n`,
-        );
-        await streamWriter.write(
-          `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: blockIndex })}\n\n`,
-        );
-        blockIndex++;
-      }
 
-      // Emit message_delta
-      const stopReason = validToolCalls.length > 0 ? 'tool_use' : emittedThinkingBlock && !emittedTextBlock ? 'end_turn' : 'end_turn';
-      await streamWriter.write(
-        `event: message_delta\ndata: ${JSON.stringify({
-          type: 'message_delta',
-          delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: completionTokens, input_tokens: promptTokensFromChunks || promptTokenEstimate },
-        })}\n\n`,
-      );
+        // Emit message_stop
+        await streamWriter.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
 
-      // Emit message_stop
-      await streamWriter.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-
-      // Populate log entry fields before finalizing
-      logStore.updateEntry(logId, (entry) => {
-        entry.reasoningContent = reasoningBuffer || undefined;
-        entry.rawFullContent = lastFullContent || reasoningBuffer;
-        entry.processedApiOutput = lastFullContent || reasoningBuffer;
-        entry.parsedToolCalls = validToolCalls.map((tc) => ({
-          name: tc.name,
-          args: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
-        }));
-        entry.finalResponse = {
-          finishReason: stopReason,
-          toolCallCount: validToolCalls.length,
-          contentPreview: (lastFullContent || reasoningBuffer).substring(0, 500),
-        };
-      });
-
-      streamReleased = true;
-      logStore.finalizeRequest(logId, {
-        latencyMs: undefined, // rely on entry timestamp
-        tokens: {
-          prompt: promptTokensFromChunks || promptTokenEstimate,
-          completion: completionTokens,
-          total: (promptTokensFromChunks || promptTokenEstimate) + completionTokens,
-        },
-        finishReason: stopReason,
-      });
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail);
-    } catch (streamErr: any) {
-      logStore.addError(logId, streamErr.message || String(streamErr));
-    } finally {
-      clearInterval(pingInterval);
-      if (!streamReleased) {
-        logStore.finalizeRequest(logId, {
-          finishReason: 'error',
+        // Populate log entry
+        logStore.updateEntry(logId, (entry) => {
+          entry.reasoningContent = reasoningBuffer || undefined;
+          entry.rawFullContent = lastFullContent || reasoningBuffer;
+          entry.processedApiOutput = lastFullContent || reasoningBuffer;
+          entry.parsedToolCalls = validToolCalls.map((tc) => ({
+            name: tc.name,
+            args: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+          }));
+          entry.finalResponse = {
+            finishReason: stopReason,
+            toolCallCount: validToolCalls.length,
+            contentPreview: (lastFullContent || reasoningBuffer).substring(0, 500),
+          };
         });
-        try {
-          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
-        } catch {
-          /* ignore */
+
+        streamReleased = true;
+        logStore.finalizeRequest(logId, {
+          latencyMs: undefined,
+          tokens: {
+            prompt: promptTokensFromChunks || promptTokenEstimate,
+            completion: completionTokens,
+            total: (promptTokensFromChunks || promptTokenEstimate) + completionTokens,
+          },
+          finishReason: stopReason,
+        });
+        sessionPool.release(curSession.chatId, curParentId, curHeaders, curEmail);
+      } catch (streamErr: any) {
+        logStore.addError(logId, streamErr.message || String(streamErr));
+      } finally {
+        if (!streamReleased) {
+          logStore.finalizeRequest(logId, {
+            finishReason: 'error',
+          });
+          try {
+            sessionPool.release(curSession.chatId, curParentId, curHeaders, curEmail, false);
+          } catch {
+            /* ignore */
+          }
         }
       }
+
+      // If we get here without rateLimitedDetected, the stream completed successfully
+      if (!rateLimitedDetected) break;
     }
+
+    clearInterval(pingInterval);
   });
 }
 
@@ -872,7 +915,6 @@ export async function anthropicMessages(c: Context) {
         400,
       );
     }
-
     const { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupAnthropicSession(
       openaiMessages,
       body,
@@ -881,89 +923,131 @@ export async function anthropicMessages(c: Context) {
       logId,
     );
 
+
+    let curSession = session;
+    let curStream = stream;
+    let curAbort = qwenAbortController;
+    let curEmail = resolvedEmail;
+    let curHeaders = sessionHeaders;
+    let curParentId = nextParentId;
+
     if (!isStream) {
-      // Non-streaming: reuse handleNonStreamingRequest then convert response
-      const retrySignal = { needsRetry: false, failedEmail: '' };
-      const nonStreamingCtx: NonStreamingContext = {
-        c,
-        logId,
-        completionId: 'chatcmpl-' + crypto.randomUUID(),
-        body,
-        session,
-        stream,
-        resolvedEmail,
-        initialParentId: nextParentId,
-        sessionHeaders,
-        toolCalling,
-        cleanOutput,
-        retrySignal,
-      };
-      logStore.log('debug', 'chat', `[Anthropic] Processing non-streaming via handleNonStreamingRequest`);
-      const openAIResponse = await handleNonStreamingRequest(nonStreamingCtx);
-      if (retrySignal.needsRetry) {
-        // RateLimited — retry with new account
-        logStore.log('info', 'chat', `[Anthropic] Non-streaming RateLimited on ${retrySignal.failedEmail}, retrying with next account`);
-        // Re-acquire session with new account
-        const retrySetup = await setupAnthropicSession(
-          openaiMessages, body, contextCheck.availableTokens!, toolCalling, logId,
-        );
-        const retryCtx: NonStreamingContext = {
+      // Non-streaming: retry loop with MAX_RETRIES=3
+      const MAX_NON_STREAM_RETRIES = 3;
+      const completionId = 'chatcmpl-' + crypto.randomUUID();
+      
+      for (let attempt = 0; attempt <= MAX_NON_STREAM_RETRIES; attempt++) {
+        if (attempt > 0) {
+          logStore.log('info', 'chat', `[Anthropic] Non-streaming retry attempt ${attempt}/${MAX_NON_STREAM_RETRIES}`);
+        }
+        
+        const retrySignal = { needsRetry: false, failedEmail: '' };
+        const nonStreamingCtx: NonStreamingContext = {
           c,
           logId,
-          completionId: 'chatcmpl-' + crypto.randomUUID(),
+          completionId,
           body,
-          session: retrySetup.session,
-          stream: retrySetup.stream,
-          resolvedEmail: retrySetup.resolvedEmail,
-          initialParentId: retrySetup.nextParentId,
-          sessionHeaders: retrySetup.sessionHeaders,
+          session: curSession,
+          stream: curStream,
+          resolvedEmail: curEmail,
+          initialParentId: curParentId,
+          sessionHeaders: curHeaders,
           toolCalling,
           cleanOutput,
+          retrySignal,
         };
-        const retryResponse = await handleNonStreamingRequest(retryCtx);
-        const retryBody = await retryResponse.json();
-        if (retryBody.error) {
+        
+        logStore.log('debug', 'chat', `[Anthropic] Processing non-streaming via handleNonStreamingRequest`);
+        const openAIResponse = await handleNonStreamingRequest(nonStreamingCtx);
+        
+        if (!retrySignal.needsRetry) {
+          // Success — convert and return
+          const openAIResp = await openAIResponse.json();
+          logStore.log(
+            'debug',
+            'chat',
+            `[Anthropic] Non-streaming response status=${openAIResponse.status} hasError=${!!openAIResp.error} choices=${openAIResp.choices?.length || 0} contentLen=${openAIResp.choices?.[0]?.message?.content?.length || 0} toolCalls=${openAIResp.choices?.[0]?.message?.tool_calls?.length || 0}`,
+          );
+          if (openAIResp.error) {
+            logStore.log('error', 'chat', `[Anthropic] OpenAI endpoint returned error: ${JSON.stringify(openAIResp.error)}`);
+            cancelWatchdog();
+            return c.json(openAIResp, <any>openAIResponse.status);
+          }
+          const anthropicResp = convertOpenAIResponseToAnthropic(openAIResp, anthropicModel, reverseToolMap);
+          logStore.log(
+            'debug',
+            'chat',
+            `[Anthropic] Response sent: id=${anthropicResp.id} contentBlocks=${anthropicResp.content?.length} stop=${anthropicResp.stop_reason} latency=${Date.now() - _requestStartTime}ms`,
+          );
           cancelWatchdog();
-          return c.json(retryBody, retryResponse.status);
+          if (anthropicVersion) c.header('anthropic-version', anthropicVersion);
+          return c.json(anthropicResp);
         }
-        const anthropicResponse = convertOpenAIResponseToAnthropic(retryBody, anthropicModel, anthropicVersion, anthropicBeta, anthropicModel);
-        cancelWatchdog();
-        return c.json(anthropicResponse, retryResponse.status);
+        
+        // RateLimited — retry with new account if attempts remain
+        if (attempt < MAX_NON_STREAM_RETRIES) {
+          logStore.log('info', 'chat', `[Anthropic] Non-streaming RateLimited on ${retrySignal.failedEmail}, retrying with next account`);
+          try {
+            const retrySetup = await setupAnthropicSession(
+              openaiMessages, body, contextCheck.availableTokens!, toolCalling, logId,
+            );
+            curSession = retrySetup.session;
+            curStream = retrySetup.stream;
+            curAbort = retrySetup.qwenAbortController;
+            curEmail = retrySetup.resolvedEmail;
+            curHeaders = retrySetup.sessionHeaders;
+            curParentId = retrySetup.nextParentId;
+          } catch (retryErr: any) {
+            logStore.log('error', 'chat', `[Anthropic] Retry setup failed: ${retryErr.message}`);
+            cancelWatchdog();
+            const mapped = buildChatUpstreamErrorResponse(retryErr);
+            return c.json(mapped.body, mapped.status as any);
+          }
+        } else {
+          // Exhausted retries
+          cancelWatchdog();
+          const exhaustedErr = new Error('All accounts rate-limited during non-streaming. Please wait and try again later.');
+          (exhaustedErr as any).upstreamStatus = 429;
+          const mapped = buildChatUpstreamErrorResponse(exhaustedErr);
+          return c.json(mapped.body, mapped.status as any);
+        }
       }
-      const openAIResp = await openAIResponse.json();
-      logStore.log(
-        'debug',
-        'chat',
-        `[Anthropic] Non-streaming response status=${openAIResponse.status} hasError=${!!openAIResp.error} choices=${openAIResp.choices?.length || 0} contentLen=${openAIResp.choices?.[0]?.message?.content?.length || 0} toolCalls=${openAIResp.choices?.[0]?.message?.tool_calls?.length || 0}`,
-      );
-      if (openAIResp.error) {
-        logStore.log('error', 'chat', `[Anthropic] OpenAI endpoint returned error: ${JSON.stringify(openAIResp.error)}`);
-        return c.json(openAIResp, <any>openAIResponse.status);
-      }
-      const anthropicResp = convertOpenAIResponseToAnthropic(openAIResp, anthropicModel, reverseToolMap);
-      logStore.log(
-        'debug',
-        'chat',
-        `[Anthropic] Response sent: id=${anthropicResp.id} contentBlocks=${anthropicResp.content?.length} stop=${anthropicResp.stop_reason} latency=${Date.now() - _requestStartTime}ms`,
-      );
-      cancelWatchdog();
-      if (anthropicVersion) c.header('anthropic-version', anthropicVersion);
-      return c.json(anthropicResp);
     }
 
+    // Streaming: retry loop inside handleAnthropicStream
     logStore.log('debug', 'chat', `[Anthropic] Processing streaming response`);
     const result = await handleAnthropicStream(
       c,
       anthropicModel,
       logId,
-      session,
-      stream,
-      qwenAbortController,
-      resolvedEmail,
-      nextParentId,
-      sessionHeaders,
+      curSession,
+      curStream,
+      curAbort,
+      curEmail,
+      curParentId,
+      curHeaders,
       promptTokenEstimate,
       reverseToolMap,
+      async () => {
+        // retrySetup callback for mid-stream RateLimited
+        const retrySetup = await setupAnthropicSession(
+          openaiMessages, body, contextCheck.availableTokens!, toolCalling, logId,
+        );
+        curSession = retrySetup.session;
+        curStream = retrySetup.stream;
+        curAbort = retrySetup.qwenAbortController;
+        curEmail = retrySetup.resolvedEmail;
+        curHeaders = retrySetup.sessionHeaders;
+        curParentId = retrySetup.nextParentId;
+        return {
+          session: curSession,
+          stream: curStream,
+          qwenAbortController: curAbort,
+          resolvedEmail: curEmail,
+          nextParentId: curParentId,
+          sessionHeaders: curHeaders,
+        };
+      },
     );
     logStore.log('debug', 'chat', `[Anthropic] Streaming completed latency=${Date.now() - _requestStartTime}ms`);
     cancelWatchdog();
@@ -977,7 +1061,12 @@ export async function anthropicMessages(c: Context) {
     if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
       logStore.log('error', 'chat', `[Anthropic] Returning 429 rate_limit_error`);
       const mapped = buildChatUpstreamErrorResponse(err);
-      return c.json(mapped.body, mapped.status);
+      return c.json(mapped.body, mapped.status as any);
+    }
+    // Tool-not-found: return 400 so Claude Code feeds the actionable error back to the LLM
+    if (err instanceof QwenToolNotFoundError) {
+      const mapped = buildChatUpstreamErrorResponse(err);
+      return c.json(mapped.body, 400);
     }
     const mapped = buildChatUpstreamErrorResponse(err);
     logStore.log('error', 'chat', `[Anthropic] Returning ${mapped.status}: ${mapped.body.error?.message || err.message}`);

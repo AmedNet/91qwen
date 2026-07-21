@@ -1,4 +1,4 @@
-import { config } from '../services/configService.ts';
+﻿import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
@@ -15,6 +15,11 @@ export interface StreamLoopResult {
   error?: string;
   /** When true, the stream was terminated by mid-stream RateLimited — caller should retry with next account. */
   retryAccount?: boolean;
+}
+
+export interface PostStreamResult {
+  /** When true, post-stream flush detected RateLimited before any content was emitted — caller should retry with next account. */
+  retryAccount: boolean;
 }
 
 export async function runStreamLoop(
@@ -47,11 +52,11 @@ export async function runStreamLoop(
               idleTimedOut = true;
               reject(
                 new Error(
-                  `Upstream stream idle timeout — no data for ${Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60000)) / 1000}s`,
+                  `Upstream stream idle timeout — no data for ${Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 180000)) / 1000}s`,
                 ),
               );
             },
-            Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60000)),
+            Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 180000)),
           );
         }),
       ]);
@@ -129,7 +134,7 @@ export async function handlePostStreamCompletion(
     email: string;
     sessionPool: { release: (chatId: string, parentId: string | null, headers: any, email: string) => void };
   },
-): Promise<void> {
+): Promise<PostStreamResult> {
   const {
     streamWriter,
     completionId,
@@ -146,21 +151,25 @@ export async function handlePostStreamCompletion(
     skipPostStream,
   } = args;
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
+  let skipFinallyCleanup = false;
 
   // When the caller is retrying with a new account after mid-stream RateLimited,
   // skip all post-stream processing — don't emit partial content to the client.
   if (skipPostStream) {
     scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
-    return;
+    return { retryAccount: false };
   }
 
   try {
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
-      // Check for RateLimited — disable account so it won't be reused
       if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
         disableAccount(resolvedEmail);
-        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: disabled ${resolvedEmail} — ${upstreamError.message}`);
+        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: disabled ${resolvedEmail}, signaling retry — ${upstreamError.message}`);
+        // Clean up immediately so caller can acquire a new session without race
+        scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool, false);
+        skipFinallyCleanup = true;
+        return { retryAccount: true };
       }
       try {
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
@@ -174,7 +183,7 @@ export async function handlePostStreamCompletion(
         entry.finalResponse.finishReason = 'upstream_error';
       });
       logStore.finalizeRequest(logId);
-      return;
+      return { retryAccount: false };
     }
 
     // Flush any pending chunk left in the one-chunk buffer
@@ -266,6 +275,7 @@ export async function handlePostStreamCompletion(
     });
 
     logStore.finalizeRequest(logId);
+    return { retryAccount: false };
   } catch (err) {
     console.error('[Chat] handlePostStreamCompletion error:', err);
     logStore.addError(logId, err instanceof Error ? err.message : String(err));
@@ -282,8 +292,11 @@ export async function handlePostStreamCompletion(
     } catch {
       /* stream may already be closed */
     }
+    return { retryAccount: false };
   } finally {
-    // Always release session to prevent pool exhaustion, even if writeEvent fails
-    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
+    // Release session unless the RateLimited path already did it
+    if (!skipFinallyCleanup) {
+      scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
+    }
   }
 }
