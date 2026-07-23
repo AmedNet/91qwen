@@ -73,13 +73,14 @@ describe('buildQwenMessages', () => {
   });
 
   describe('reasoning_content handling', () => {
-    test('does NOT include reasoning_content in assistant replay', () => {
+    test('does NOT include reasoning_content in assistant replay (no echo loop)', () => {
       const messages = [
         { role: 'user', content: 'Question' },
         {
           role: 'assistant',
           content: 'Answer',
           reasoning_content: 'This is my thinking process...',
+          tool_calls: [{ id: 'call_1', function: { name: 'Bash', arguments: '{}' } }],
         },
         { role: 'user', content: 'Follow up' },
       ];
@@ -90,6 +91,7 @@ describe('buildQwenMessages', () => {
 
       expect(content).toContain('Answer');
       expect(content).not.toContain('This is my thinking process');
+      expect(content).not.toContain('[Previous thinking');
       expect(content).not.toContain('<thinking>');
     });
 

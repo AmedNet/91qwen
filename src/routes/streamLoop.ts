@@ -121,8 +121,6 @@ export async function handlePostStreamCompletion(
     buffer: string;
     enableContentFiltering: boolean;
     includeUsage: boolean;
-    /** Callback to disable the current account on RateLimited. */
-    disableAccount: (email: string) => void;
     /** When true, skip post-stream processing — caller is retrying with a new account. */
     skipPostStream?: boolean;
   },
@@ -147,7 +145,6 @@ export async function handlePostStreamCompletion(
     buffer,
     enableContentFiltering,
     includeUsage,
-    disableAccount,
     skipPostStream,
   } = args;
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
@@ -164,8 +161,7 @@ export async function handlePostStreamCompletion(
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
       if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
-        disableAccount(resolvedEmail);
-        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: disabled ${resolvedEmail}, signaling retry — ${upstreamError.message}`);
+        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: switching account — ${upstreamError.message}`);
         // Clean up immediately so caller can acquire a new session without race
         scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool, false);
         skipFinallyCleanup = true;

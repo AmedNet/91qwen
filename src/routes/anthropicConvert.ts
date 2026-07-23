@@ -105,41 +105,36 @@ export function resolveToolName(normalizedName: string, reverseToolMap?: Map<str
   return reverseToolMap.get(normalizedName) || reverseToolMap.get(normalizedName.toLowerCase()) || normalizedName;
 }
 
-/** Map Qwen snake_case / camelCase aliases to Claude Code camelCase for non-file tools. */
+/** Map camelCase aliases to snake_case for Claude Code tool parameters. */
 export function mapParamName(paramName: string): string {
-  const SNAKE_TO_CAMEL: Record<string, string> = {
-    file_path: 'filePath',
-    old_string: 'oldString',
-    new_string: 'newString',
-    tool_call_id: 'toolCallId',
-    replace_all: 'replaceAll',
-    dry_run: 'dryRun',
-    case_insensitive: 'caseInsensitive',
-    output_mode: 'outputMode',
-    head_limit: 'headLimit',
-    max_results: 'maxResults',
-    target_directory: 'targetDirectory',
-    glob_pattern: 'globPattern',
-    notebook_path: 'notebookPath',
+  const CAMEL_TO_SNAKE: Record<string, string> = {
+    filePath: 'file_path',
+    oldString: 'old_string',
+    newString: 'new_string',
+    toolCallId: 'tool_call_id',
+    replaceAll: 'replace_all',
+    dryRun: 'dry_run',
+    caseInsensitive: 'case_insensitive',
+    outputMode: 'output_mode',
+    headLimit: 'head_limit',
+    maxResults: 'max_results',
+    targetDirectory: 'target_directory',
+    globPattern: 'glob_pattern',
+    notebookPath: 'notebook_path',
   };
-  // Direct lookup (already snake_case)
-  const direct = SNAKE_TO_CAMEL[paramName];
+  // Direct lookup (already camelCase)
+  const direct = CAMEL_TO_SNAKE[paramName];
   if (direct) return direct;
-  // camelCase → snake_case → lookup
-  // Only apply if the snaked version has an explicit mapping in our table,
-  // otherwise pass through unchanged to avoid over-fixup of edge cases.
+  // snake_case passes through unchanged
   const snaked = camelToSnake(paramName);
   if (snaked !== paramName.toLowerCase()) {
-    const snakedLookup = SNAKE_TO_CAMEL[snaked];
+    const snakedLookup = CAMEL_TO_SNAKE[snaked];
     if (snakedLookup) return snakedLookup;
   }
   return paramName;
 }
 
-const FILE_TOOL_NAMES = new Set(['Read', 'Edit', 'Write']);
-
-function normalizeToolArgs(name: string, args: Record<string, unknown>): Record<string, unknown> {
-  if (FILE_TOOL_NAMES.has(name)) return { ...args };
+function normalizeToolArgs(args: Record<string, unknown>): Record<string, unknown> {
   return mapToolArgs(args);
 }
 
@@ -153,7 +148,7 @@ export const CLAUDE_CODE_REQUIRED_PARAMS: Record<string, string[]> = {
   Grep: ['pattern'],
   WebFetch: ['url'],
   WebSearch: ['query'],
-  NotebookEdit: ['notebookPath'],
+  NotebookEdit: ['notebook_path'],
   TodoWrite: ['todos'],
 };
 
@@ -405,7 +400,7 @@ export function prepareToolCallForClaude(tc: { name: string; arguments: unknown;
   }
   if (!args || typeof args !== 'object') return { valid: false, name: resolveToolName(normalizeToolName(tc.name), reverseToolMap), args: {} };
   const name = normalizeToolName(tc.name);
-  const mapped = normalizeToolArgs(name, args as Record<string, unknown>);
+  const mapped = normalizeToolArgs(args as Record<string, unknown>);
   return { valid: isValidClaudeCodeToolCall(name, mapped), name: resolveToolName(name, reverseToolMap), args: mapped };
 }
 

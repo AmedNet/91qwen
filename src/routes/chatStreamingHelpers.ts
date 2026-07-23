@@ -1,6 +1,6 @@
 import { logStore } from '../services/logStore.ts';
 import { logQwenSSE } from '../services/qwenLogger.ts';
-import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, CANONICAL_PARAM_NAMES, camelToSnake, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
+import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, alignArgsToSchema, CANONICAL_PARAM_NAMES, camelToSnake, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
 import type { ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
@@ -275,9 +275,9 @@ export interface StreamProcessingCtx {
   qwenAbortController: AbortController;
   qwenLogFile?: string;
   sseEventCount?: number;
-  /** Callback to disable the current account (e.g. on RateLimited). */
-  disableAccount: (email: string) => void;
-  /** Callback to signal that mid-stream RateLimited requires account retry. */
+  /** Client-registered tool schemas; used to align tool-call arg names to the schema's casing. */
+  tools?: any[];
+  /** Callback to signal that mid-stream error requires account retry. */
   retryWithNewAccount: (failedEmail: string) => void;
 }
 
@@ -336,11 +336,10 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
-    // Check for RateLimited in SSE error payload — disable account and signal retry
+    // RateLimited: signal retry to switch accounts (without disabling)
     if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && resolvedEmail) {
-      ctx.disableAccount(resolvedEmail);
       ctx.retryWithNewAccount(resolvedEmail);
-      logStore.log('warn', 'qwen', `[Qwen] RateLimited via SSE: disabled ${resolvedEmail}, signaling retry — ${errMsg}`);
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via SSE: switching account — ${errMsg}`);
       return 'retry_account';
     }
     return 'break_stream';
@@ -352,13 +351,12 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
-    // Check for RateLimit in delta error — extract error details if available
+    // RateLimited: signal retry to switch accounts (without disabling)
     const deltaCode = data.choices?.[0]?.delta?.code;
     const deltaMsg = data.choices?.[0]?.delta?.message || '';
     if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && resolvedEmail) {
-      ctx.disableAccount(resolvedEmail);
       ctx.retryWithNewAccount(resolvedEmail);
-      logStore.log('warn', 'qwen', `[Qwen] RateLimited via delta status: disabled ${resolvedEmail}, signaling retry — code=${deltaCode} msg=${deltaMsg}`);
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via delta status: switching account — code=${deltaCode} msg=${deltaMsg}`);
       return 'retry_account';
     }
     return 'break_stream';
@@ -383,6 +381,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
           }
         });
         for (let i = 0; i < newToolCalls.length; i++) {
+          newToolCalls[i].arguments = alignArgsToSchema(newToolCalls[i].name, newToolCalls[i].arguments, ctx.tools);
           await writeToolCallEvent(streamWriter, completionId, model, newToolCalls[i], ctx.emittedToolCallCount + i);
         }
         ctx.emittedToolCallCount += newToolCalls.length;
@@ -588,6 +587,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
 
     for (const [i, tc] of newToolCalls.entries()) {
       const parsed = xmlToolCallToParsed(tc, ctx.emittedToolCallCount + i);
+      parsed.arguments = alignArgsToSchema(parsed.name, parsed.arguments, ctx.tools);
       await writeToolCallEvent(streamWriter, completionId, model, parsed, ctx.emittedToolCallCount + i);
     }
     ctx.emittedToolCallCount += newToolCalls.length;

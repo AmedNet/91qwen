@@ -1,7 +1,7 @@
 ﻿import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { pickAccount, setAccountDisabled, throttleAccount } from '../services/auth.ts';
+import { pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -262,9 +262,11 @@ async function setupAnthropicSession(
         (err.message || '').includes('timeout') ||
         (err.message || '').includes('ETIMEDOUT') ||
         err.upstreamStatus === 408 ||
-        err.upstreamStatus === 504
+        err.upstreamStatus === 504 ||
+        // Qwen rejected a valid tool call — upstream routing bug, safe to retry on another account
+        err.message?.includes('rejected a valid tool call')
       ) {
-        logStore.log('warn', 'chat', `[Anthropic]   -> timeout, trying next account`);
+        logStore.log('warn', 'chat', `[Anthropic]   -> timeout/tool-rejected, trying next account`);
         lastFailedEmail = resolvedEmail;
         lastError = err;
         continue;
@@ -456,9 +458,7 @@ async function handleAnthropicStream(
             if (chunk.error) {
               const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
               logStore.addError(logId, `Qwen upstream SSE error: ${errMsg}`);
-              if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && curEmail) {
-                setAccountDisabled(curEmail, true);
-                logStore.log('warn', 'qwen', `[Anthropic] RateLimited via SSE: disabled ${curEmail} — ${errMsg}`);
+              if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg)) {
                 rateLimitedDetected = true;
               }
               break;
@@ -481,9 +481,7 @@ async function handleAnthropicStream(
               const deltaCode = chunk.choices?.[0]?.delta?.code;
               const deltaMsg = chunk.choices?.[0]?.delta?.message || '';
               logStore.addError(logId, `Qwen stream delta returned error status: code=${deltaCode} msg=${deltaMsg}`);
-              if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && curEmail) {
-                setAccountDisabled(curEmail, true);
-                logStore.log('warn', 'qwen', `[Anthropic] RateLimited via delta status: disabled ${curEmail} — code=${deltaCode} msg=${deltaMsg}`);
+              if (deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) {
                 rateLimitedDetected = true;
               }
               break;

@@ -211,3 +211,40 @@ export function xmlToolCallToParsed(
     arguments: args,
   };
 }
+
+/** Normalize a key for fuzzy matching: lowercase + strip underscores. */
+function normalizeKey(k: string): string {
+  return k.toLowerCase().replace(/_/g, '');
+}
+
+/**
+ * Align a tool call's argument names to the client-registered tool schema.
+ * The keys in schema `properties` are the authoritative param names for that
+ * tool (camelCase or snake_case, depending on the client). Model output param
+ * names are matched by normalized form (lowercase, underscores stripped) against
+ * the schema keys; a hit rewrites the key to the schema's real casing. Unmatched
+ * keys are preserved as-is (fallback to fixupParamName's snake_case result).
+ *
+ * When `tools` is empty/absent, returns `args` unchanged so no-schema callers
+ * keep their existing behavior.
+ */
+export function alignArgsToSchema(
+  toolName: string,
+  args: Record<string, unknown>,
+  tools?: any[],
+): Record<string, unknown> {
+  if (!tools || !Array.isArray(tools) || tools.length === 0) return args;
+  const tool = tools.find((t: any) => (t.function?.name || t.name) === toolName);
+  const props = tool?.function?.parameters?.properties;
+  if (!props || typeof props !== 'object') return args;
+
+  const schemaEntries = Object.keys(props).map((k) => ({ orig: k, norm: normalizeKey(k) }));
+
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    const norm = normalizeKey(k);
+    const hit = schemaEntries.find((e) => e.norm === norm);
+    out[hit ? hit.orig : k] = v;
+  }
+  return out;
+}

@@ -1,6 +1,6 @@
 ﻿import crypto from 'node:crypto';
 import { Context } from 'hono';
-import { pickAccount, setAccountDisabled, throttleAccount } from '../services/auth.ts';
+import { pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -264,7 +264,9 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         (err.message || '').includes('timeout') ||
         (err.message || '').includes('ETIMEDOUT') ||
         err.upstreamStatus === 408 ||
-        err.upstreamStatus === 504
+        err.upstreamStatus === 504 ||
+        // Qwen rejected a valid tool call — upstream routing bug, safe to retry on another account
+        err.message?.includes('rejected a valid tool call')
       ) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
@@ -468,7 +470,6 @@ export async function chatCompletions(c: Context) {
       sessionHeaders,
       toolCalling,
       cleanOutput,
-      disableAccount: (email: string) => setAccountDisabled(email, true),
       retrySignal,
       retrySetup: async () => {
         const newSetup = await setupSession(messages, body, contextCheck.availableTokens!, toolCalling, logId);

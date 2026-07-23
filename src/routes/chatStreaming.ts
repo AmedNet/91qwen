@@ -23,8 +23,6 @@ export interface StreamingContext {
   toolCalling: boolean;
   cleanOutput: boolean;
   qwenLogFile?: string;
-  /** Callback to disable an account (e.g. on RateLimited detected during streaming). */
-  disableAccount: (email: string) => void;
   /** Mutable signal set by streaming processor when mid-stream RateLimited requires retry. */
   retrySignal?: { needsRetry: boolean; failedEmail: string };
   /** Callback to re-acquire session with a new account for mid-stream retry. */
@@ -52,7 +50,7 @@ function buildPromptString(messages: Message[]): string {
 }
 
 export async function handleStreamingRequest(ctx: StreamingContext): Promise<Response> {
-  const { c, logId, completionId, body, session, stream, qwenAbortController, resolvedEmail, sessionHeaders, cleanOutput, disableAccount, retrySignal, retrySetup } = ctx;
+  const { c, logId, completionId, body, session, stream, qwenAbortController, resolvedEmail, sessionHeaders, cleanOutput, retrySignal, retrySetup } = ctx;
   const finalPrompt = buildPromptString(body.messages);
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
@@ -99,7 +97,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           qwenAbortController: curAbort,
           qwenLogFile: ctx.qwenLogFile,
           emittedToolCallCount: 0,
-          disableAccount,
+          tools: ctx.body.tools,
           retryWithNewAccount: (failedEmail: string) => {
             if (retrySignal) {
               retrySignal.needsRetry = true;
@@ -179,7 +177,6 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             buffer: loopResult.buffer,
             enableContentFiltering,
             includeUsage: !!body.stream_options?.include_usage,
-            disableAccount,
             skipPostStream: attempt > 0, // skip post-stream on retry — content already emitted by first attempt
           },
           {

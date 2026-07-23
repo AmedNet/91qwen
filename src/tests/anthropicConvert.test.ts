@@ -565,11 +565,17 @@ describe('normalizeToolName', () => {
 // ── mapParamName / mapToolArgs ─────────────────────────────────────
 
 describe('mapParamName / mapToolArgs', () => {
-  test('maps snake_case to camelCase', () => {
-    expect(mapParamName('file_path')).toBe('filePath');
-    expect(mapParamName('old_string')).toBe('oldString');
-    expect(mapParamName('new_string')).toBe('newString');
-    expect(mapParamName('tool_call_id')).toBe('toolCallId');
+  test('maps camelCase to snake_case', () => {
+    expect(mapParamName('filePath')).toBe('file_path');
+    expect(mapParamName('oldString')).toBe('old_string');
+    expect(mapParamName('newString')).toBe('new_string');
+    expect(mapParamName('toolCallId')).toBe('tool_call_id');
+  });
+
+  test('passes through snake_case unchanged', () => {
+    expect(mapParamName('file_path')).toBe('file_path');
+    expect(mapParamName('old_string')).toBe('old_string');
+    expect(mapParamName('output_mode')).toBe('output_mode');
   });
 
   test('passes through unmapped names', () => {
@@ -578,9 +584,21 @@ describe('mapParamName / mapToolArgs', () => {
   });
 
   test('mapToolArgs maps all keys', () => {
+    const args = { filePath: '/x', oldString: 'a', command: 'ls' };
+    const mapped = mapToolArgs(args);
+    expect(mapped).toEqual({ file_path: '/x', old_string: 'a', command: 'ls' });
+  });
+
+  test('mapToolArgs preserves snake_case keys', () => {
     const args = { file_path: '/x', old_string: 'a', command: 'ls' };
     const mapped = mapToolArgs(args);
-    expect(mapped).toEqual({ filePath: '/x', oldString: 'a', command: 'ls' });
+    expect(mapped).toEqual({ file_path: '/x', old_string: 'a', command: 'ls' });
+  });
+
+  test('Grep with outputMode gets normalized to output_mode', () => {
+    const args = { pattern: 'TODO', outputMode: 'content', headLimit: 10 };
+    const mapped = mapToolArgs(args);
+    expect(mapped).toEqual({ pattern: 'TODO', output_mode: 'content', head_limit: 10 });
   });
 });
 

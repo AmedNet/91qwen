@@ -367,10 +367,26 @@ export async function createQwenStream(
             ?.map((t: any) => t?.function?.name || t?.name)
             .filter((n: string | undefined): n is string => !!n) || [];
 
+          // If the complained tool name IS in our registered tool list, this
+          // is a Qwen routing bug — NOT an LLM mistake. Don't blame the LLM;
+          // just treat it as a generic upstream error so the retry loop can
+          // switch accounts instead of sending Claude Code into a correction loop.
+          const complainedLower = complainedTool.toLowerCase().replace(/[-_]/g, '');
+          const isActuallyRegistered = availableToolNames.some((n) =>
+            n.toLowerCase().replace(/[-_]/g, '') === complainedLower
+          );
+          if (isActuallyRegistered) {
+            logStore.log('warn', 'qwen', `[Qwen] Tool "${complainedTool}" exists but was rejected by upstream — treating as generic error`);
+            throw new QwenUpstreamError(
+              `Qwen rejected a valid tool call for "${complainedTool}". This may be a Qwen routing issue.`,
+              'tool_rejected_by_qwen',
+              500,
+            );
+          }
+
           // Fuzzy match: find similar available tool names (Levenshtein-like heuristics)
           let suggestion = '';
           if (complainedTool !== 'unknown' && availableToolNames.length > 0) {
-            const complainedLower = complainedTool.toLowerCase().replace(/[-_]/g, '');
             const scored = availableToolNames.map((n) => {
               const clean = n.toLowerCase().replace(/[-_]/g, '');
               // Simple similarity: count common characters in order
