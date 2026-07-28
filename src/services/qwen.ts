@@ -474,6 +474,7 @@ export async function createQwenStream(
       body: bodyStr,
       accountEmail: currentAccountEmail,
       stream: true, // keep session alive for streaming via impers worker
+      signal: streamAbortController.signal,
     });
     logStore.log(
       'debug',

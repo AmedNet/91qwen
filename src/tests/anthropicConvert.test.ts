@@ -456,7 +456,7 @@ describe('convertOpenAIResponseToAnthropic', () => {
     expect(out.content[0].input).toEqual({ file_path: '/x' });
   });
 
-  test('returns end_turn when all tool calls filtered', () => {
+  test('returns end_turn with fallback text when all tool calls filtered', () => {
     const resp = {
       choices: [
         {
@@ -474,7 +474,9 @@ describe('convertOpenAIResponseToAnthropic', () => {
     };
     const out = convertOpenAIResponseToAnthropic(resp, 'claude-sonnet-4-20250514');
     expect(out.stop_reason).toBe('end_turn');
-    expect(out.content.length).toBe(0);
+    expect(out.content.length).toBe(1);
+    expect(out.content[0].type).toBe('text');
+    expect(out.content[0].text).toContain('Tool call validation failed');
   });
 
   test('preserves usage info', () => {

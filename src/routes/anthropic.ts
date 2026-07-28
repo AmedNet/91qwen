@@ -685,6 +685,27 @@ async function handleAnthropicStream(
           `[Anthropic] Tool call summary: ${allToolCalls.length} raw → ${validToolCalls.length} valid → emitting ${validToolCalls.length} tool_use blocks`,
         );
 
+        // Ensure message_start was emitted before any content blocks
+        if (!emittedMessageStart) {
+          const msgId = 'msg_' + crypto.randomUUID();
+          await streamWriter.write(
+            `event: message_start\ndata: ${JSON.stringify({
+              type: 'message_start',
+              message: {
+                id: msgId,
+                type: 'message',
+                role: 'assistant',
+                content: [],
+                model: anthropicModel,
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: promptTokenEstimate, output_tokens: 0 },
+              },
+            })}\n\n`,
+          );
+          emittedMessageStart = true;
+        }
+
         // Close text or thinking block
         if (emittedTextBlock) {
           await streamWriter.write(
@@ -717,6 +738,29 @@ async function handleAnthropicStream(
             `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: blockIndex })}\n\n`,
           );
           blockIndex++;
+        }
+
+        // If no valid tool calls and no text/thinking content, emit a fallback text block
+        // so Claude Code doesn't interpret the empty response as "no tools available"
+        if (validToolCalls.length === 0 && !emittedTextBlock && !emittedThinkingBlock && allToolCalls.length > 0) {
+          const fallbackText = `[Tool call validation failed: ${allToolCalls.length} tool call(s) were returned by the model but none passed validation. The model may have used incorrect parameter names or missing required fields. Please retry.]`;
+          await streamWriter.write(
+            `event: content_block_start\ndata: ${JSON.stringify({
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: '' },
+            })}\n\n`,
+          );
+          await streamWriter.write(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: 0,
+              delta: { type: 'text_delta', text: fallbackText },
+            })}\n\n`,
+          );
+          await streamWriter.write(
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`,
+          );
         }
 
         // Emit message_delta

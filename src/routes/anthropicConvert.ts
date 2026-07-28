@@ -421,6 +421,12 @@ export function convertOpenAIResponseToAnthropic(openAIResp: any, requestModel: 
     content.push({ type: 'text', text: message.content });
   }
 
+  // If tool_calls existed but all failed validation, and no text content, emit fallback
+  if (message.tool_calls && message.tool_calls.length > 0 && content.length === 0) {
+    const fallbackText = `[Tool call validation failed: ${message.tool_calls.length} tool call(s) were returned by the model but none passed validation. The model may have used incorrect parameter names or missing required fields. Please retry.]`;
+    content.push({ type: 'text', text: fallbackText });
+  }
+
   // Anthropic clients (Claude Code) prefer tool_use-only turns when tools are present
   if (content.length > 1 && content.some((c: any) => c.type === 'tool_use')) {
     const toolBlocks = content.filter((c: any) => c.type === 'tool_use');

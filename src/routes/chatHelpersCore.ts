@@ -267,7 +267,7 @@ export function extractDeltaContent(
     chunk.choices &&
     chunk.choices[0] &&
     chunk.choices[0].delta &&
-    (targetResponseId === null || chunk.response_id === targetResponseId || chunk['response.created']?.response_id === targetResponseId)
+    (targetResponseId === null || !chunk.response_id || chunk.response_id === targetResponseId || chunk['response.created']?.response_id === targetResponseId)
   ) {
     const delta = chunk.choices[0].delta;
     if (delta.phase === 'thinking_summary') {
