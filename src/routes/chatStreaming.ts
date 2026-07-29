@@ -6,6 +6,7 @@ import type { Message, OpenAIRequest } from '../types/openai.ts';
 import { type AmplificationGuardState } from './chatHelpers.ts';
 import { type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { cleanupImmediately } from './cleanupHelpers.ts';
+import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
 import { handlePostStreamCompletion, runStreamLoop } from './streamLoop.ts';
 import { buildChunkEvent, makeChoice, writeEvent } from './writeHelpers.ts';
 
@@ -109,7 +110,27 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         const loopResult = await runStreamLoop(c, reader, streamState, streamCtx, ampState, bufferRef);
 
         // Mid-stream RateLimited — retry with new account if possible
+        // UNLESS partial content was already emitted (can't unsend it)
         if (loopResult.retryAccount) {
+          const partialEmitted = ampState.emittedOutputBytes > 0 || ampState.triggered;
+          if (partialEmitted) {
+            logStore.log('warn', 'stream', `[Stream] RateLimited but partial content already emitted (${ampState.emittedOutputBytes} bytes) — skipping retry for ${curEmail}`);
+            // Emit error finish so the client knows the stream ended in error
+            try { await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({}, 'error')])); } catch {}
+            try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
+            logStore.updateEntry(logId, (entry) => {
+              entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+              entry.finalResponse.finishReason = 'error';
+            });
+            logStore.finalizeRequest(ctx.logId);
+            cleanupImmediately(
+              streamReader, heartbeatInterval,
+              curSession.chatId, curParentId, curHeaders, curEmail,
+              sessionPool, false,
+            );
+            streamReleased = true;
+            break;
+          }
           // Clean up current session without emitting content
           cleanupImmediately(
             streamReader, heartbeatInterval,
@@ -152,6 +173,9 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         if (loopResult.error) {
           logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
           logStore.addError(logId, loopResult.error);
+          const cleanErr = cleanTextOfXmlArtifacts(loopResult.error).cleanedText || loopResult.error;
+          await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({ content: cleanErr })]));
+          await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({}, 'error')]));
           await streamWriter.write('data: [DONE]\n\n');
           logStore.updateEntry(logId, (entry) => {
             if (streamState.reasoningBuffer) entry.reasoningContent = streamState.reasoningBuffer;
@@ -190,7 +214,21 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         streamReleased = true;
 
         // Post-stream RateLimited — retry with new account if possible
+        // UNLESS partial content was already emitted in this attempt
         if (postResult.retryAccount) {
+          const partialEmitted = ampState.emittedOutputBytes > 0 || ampState.triggered;
+          if (partialEmitted) {
+            logStore.log('warn', 'stream', `[Stream] RateLimited but partial content already emitted (${ampState.emittedOutputBytes} bytes) — skipping retry for ${curEmail}`);
+            // Emit error finish so the client knows the stream ended in error
+            try { await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({}, 'error')])); } catch {}
+            try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
+            logStore.updateEntry(logId, (entry) => {
+              entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+              entry.finalResponse.finishReason = 'error';
+            });
+            logStore.finalizeRequest(ctx.logId);
+            break;
+          }
           // Session already released by handlePostStreamCompletion (scheduleCleanup called inside)
           heartbeatInterval = undefined;
           streamReader = null;

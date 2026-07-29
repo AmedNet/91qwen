@@ -1,7 +1,7 @@
 ﻿import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { pickAccount, throttleAccount, setAccountDisabled } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -236,6 +236,7 @@ async function setupAnthropicSession(
       logStore.addError(logId, `Stream creation failed for ${resolvedEmail}: ${err.message || String(err)}`);
       if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
         logStore.log('warn', 'chat', `[Anthropic]   -> rate-limited, trying next account`);
+        if (resolvedEmail) setAccountDisabled(resolvedEmail, true);
         lastFailedEmail = resolvedEmail;
         lastError = err;
         continue;
@@ -460,6 +461,7 @@ async function handleAnthropicStream(
               logStore.addError(logId, `Qwen upstream SSE error: ${errMsg}`);
               if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg)) {
                 rateLimitedDetected = true;
+                if (curEmail) setAccountDisabled(curEmail, true);
               }
               break;
             }
@@ -483,6 +485,7 @@ async function handleAnthropicStream(
               logStore.addError(logId, `Qwen stream delta returned error status: code=${deltaCode} msg=${deltaMsg}`);
               if (deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) {
                 rateLimitedDetected = true;
+                if (curEmail) setAccountDisabled(curEmail, true);
               }
               break;
             }
@@ -602,7 +605,13 @@ async function handleAnthropicStream(
         }
 
         // If RateLimited was detected, don't emit close events — retry instead
+        // UNLESS partial content was already sent to the client (can't unsend it)
         if (rateLimitedDetected) {
+          if (hasEmittedContent) {
+            logStore.log('warn', 'chat', `[Anthropic] RateLimited but partial content already emitted — skipping retry for ${curEmail}`);
+            logStore.finalizeRequest(logId, { finishReason: 'error' });
+            break;
+          }
           // Clean up current session
           try { streamReader?.cancel(); } catch {}
           try { streamReader?.releaseLock(); } catch {}

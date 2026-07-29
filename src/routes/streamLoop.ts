@@ -1,5 +1,6 @@
 ﻿import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
+import { setAccountDisabled } from '../services/accountManager.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
 import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
@@ -161,7 +162,8 @@ export async function handlePostStreamCompletion(
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
       if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
-        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: switching account — ${upstreamError.message}`);
+        setAccountDisabled(resolvedEmail, true);
+        logStore.log('warn', 'qwen', `[Qwen] RateLimited via post-stream flush: disabled ${resolvedEmail} and switching account — ${upstreamError.message}`);
         // Clean up immediately so caller can acquire a new session without race
         scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool, false);
         skipFinallyCleanup = true;
@@ -172,7 +174,7 @@ export async function handlePostStreamCompletion(
       } catch (e) {}
       const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
       await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: cleanErrorMessage })]));
-      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'stop')]));
+      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'error')]));
       await streamWriter.write('data: [DONE]\n\n');
       logStore.updateEntry(logId, (entry) => {
         entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
@@ -274,7 +276,8 @@ export async function handlePostStreamCompletion(
     return { retryAccount: false };
   } catch (err) {
     console.error('[Chat] handlePostStreamCompletion error:', err);
-    logStore.addError(logId, err instanceof Error ? err.message : String(err));
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logStore.addError(logId, errMsg);
     // Preserve data that was set before flush (content, reasoning, etc.)
     logStore.updateEntry(logId, (entry) => {
       if (streamState.lastFullContent) entry.remainingText = streamState.lastFullContent;
@@ -282,12 +285,12 @@ export async function handlePostStreamCompletion(
       entry.finalResponse = entry.finalResponse || { finishReason: 'error', toolCallCount: 0, contentPreview: '' };
     });
     logStore.finalizeRequest(logId);
+    // Emit error content to the client before terminating
+    const cleanErr = cleanTextOfXmlArtifacts(errMsg).cleanedText || errMsg;
+    try { await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: cleanErr })])); } catch {}
+    try { await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'error')])); } catch {}
     // Always write [DONE] so the SSE stream terminates cleanly, even on error
-    try {
-      await streamWriter.write('data: [DONE]\n\n');
-    } catch {
-      /* stream may already be closed */
-    }
+    try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
     return { retryAccount: false };
   } finally {
     // Release session unless the RateLimited path already did it

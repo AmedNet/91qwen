@@ -1,4 +1,5 @@
 import { logStore } from '../services/logStore.ts';
+import { setAccountDisabled } from '../services/accountManager.ts';
 import { logQwenSSE } from '../services/qwenLogger.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, alignArgsToSchema, CANONICAL_PARAM_NAMES, camelToSnake, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
 import type { ParsedToolCall } from '../types/openai.ts';
@@ -336,10 +337,11 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
-    // RateLimited: signal retry to switch accounts (without disabling)
+    // RateLimited: permanently disable account, then signal retry to switch accounts
     if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg) && resolvedEmail) {
+      setAccountDisabled(resolvedEmail, true);
       ctx.retryWithNewAccount(resolvedEmail);
-      logStore.log('warn', 'qwen', `[Qwen] RateLimited via SSE: switching account — ${errMsg}`);
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via SSE: disabled ${resolvedEmail} and switching account — ${errMsg}`);
       return 'retry_account';
     }
     return 'break_stream';
@@ -351,12 +353,13 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
-    // RateLimited: signal retry to switch accounts (without disabling)
+    // RateLimited: permanently disable account, then signal retry to switch accounts
     const deltaCode = data.choices?.[0]?.delta?.code;
     const deltaMsg = data.choices?.[0]?.delta?.message || '';
     if ((deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) && resolvedEmail) {
+      setAccountDisabled(resolvedEmail, true);
       ctx.retryWithNewAccount(resolvedEmail);
-      logStore.log('warn', 'qwen', `[Qwen] RateLimited via delta status: switching account — code=${deltaCode} msg=${deltaMsg}`);
+      logStore.log('warn', 'qwen', `[Qwen] RateLimited via delta status: disabled ${resolvedEmail} and switching account — code=${deltaCode} msg=${deltaMsg}`);
       return 'retry_account';
     }
     return 'break_stream';
