@@ -393,9 +393,15 @@ export class RequestLogStore extends SystemLogger {
           /* cleanup is best-effort */
         }
       }
-      writeFile(filePath, JSON.stringify(payload, null, 2)).catch((err) =>
-        console.error('[LogStore] Failed to write request log:', err.message),
-      );
+      // Defer serialization + write off the request completion path. The payload
+      // object is snapshotted synchronously (plain references); only the
+      // expensive stringify and disk I/O run on the next tick. Log content,
+      // timing, and ordering are unchanged — file is still written promptly.
+      setImmediate(() => {
+        writeFile(filePath, JSON.stringify(payload, null, 2)).catch((err) =>
+          console.error('[LogStore] Failed to write request log:', err.message),
+        );
+      });
     } catch {
       /* disk write best-effort */
     }

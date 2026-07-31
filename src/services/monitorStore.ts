@@ -7,6 +7,7 @@
  * Data is stored in .qwen/monitor.json as a bounded rolling buffer.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { writeFile } from 'fs/promises';
 import { projectPath } from '../utils/paths.ts';
 
 // ── Types ──
@@ -332,10 +333,15 @@ class MonitorStore {
   }
 
   private save(): void {
+    // Async write keeps the (potentially multi-MB) serialized monitor buffer off
+    // the event loop. Debounce timing and last-writer-wins semantics unchanged.
     try {
       const dir = projectPath('.qwen');
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(this.storePath, JSON.stringify(this.entries), 'utf-8');
+      const payload = JSON.stringify(this.entries);
+      writeFile(this.storePath, payload, 'utf-8').catch((err: any) => {
+        console.error('[MonitorStore] Failed to save:', err.message);
+      });
     } catch (err: any) {
       console.error('[MonitorStore] Failed to save:', err.message);
     }
