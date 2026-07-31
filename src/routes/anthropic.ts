@@ -394,6 +394,7 @@ async function handleAnthropicStream(
       }
 
       let rateLimitedDetected = false;
+      let streamError: string | null = null;
       let streamReleased = false;
       let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
@@ -431,6 +432,7 @@ async function handleAnthropicStream(
             ]);
           } catch (streamErr: any) {
             logStore.log('warn', 'chat', `[Anthropic] ${streamErr.message || 'Stream read error'} (logId=${logId})`);
+            streamError = streamErr.message || 'Upstream stream idle timeout';
             break;
           } finally {
             if (idleTimer) clearTimeout(idleTimer);
@@ -462,6 +464,8 @@ async function handleAnthropicStream(
               if (/RateLimited|rate.limit|upper limit|daily usage/i.test(errMsg)) {
                 rateLimitedDetected = true;
                 if (curEmail) setAccountDisabled(curEmail, true);
+              } else {
+                streamError = errMsg;
               }
               break;
             }
@@ -486,6 +490,8 @@ async function handleAnthropicStream(
               if (deltaCode === 'RateLimited' || /RateLimit|rate.limit|upper limit|daily usage/i.test(deltaMsg)) {
                 rateLimitedDetected = true;
                 if (curEmail) setAccountDisabled(curEmail, true);
+              } else {
+                streamError = `Qwen stream delta error: code=${deltaCode} msg=${deltaMsg}`;
               }
               break;
             }
@@ -634,6 +640,23 @@ async function handleAnthropicStream(
             }
           }
           // Exhausted retries or setup failed — terminate cleanly
+          logStore.finalizeRequest(logId, { finishReason: 'error' });
+          break;
+        }
+
+        // Non-RateLimited upstream error (quota, idle timeout, etc.) — emit Anthropic
+        // error event so Claude Code treats this as a failed request and retries,
+        // instead of receiving a normal end_turn that looks like success.
+        if (streamError) {
+          logStore.log('warn', 'chat', `[Anthropic] Upstream stream error: ${streamError} (logId=${logId})`);
+          try {
+            await streamWriter.write(
+              `event: error\ndata: ${JSON.stringify({
+                type: 'error',
+                error: { type: 'api_error', message: streamError },
+              })}\n\n`,
+            );
+          } catch {}
           logStore.finalizeRequest(logId, { finishReason: 'error' });
           break;
         }

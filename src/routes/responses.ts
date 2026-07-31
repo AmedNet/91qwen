@@ -136,6 +136,18 @@ async function handleStreamingResponses(
 
             try {
               const chunk = JSON.parse(data);
+              // Upstream SSE error (`data: {"error": {...}}`) — convert to a
+              // Responses error event and terminate so the client retries.
+              if (chunk.error) {
+                const errMsg =
+                  typeof chunk.error === 'string'
+                    ? chunk.error
+                    : chunk.error.message || JSON.stringify(chunk.error);
+                logStore.log('warn', 'http', `[Responses] ${logId} Upstream SSE error: ${errMsg}`);
+                sendEvent({ type: 'error', message: errMsg, code: chunk.error?.code || 'upstream_error' });
+                controller.close();
+                return;
+              }
               const events = converter.processChunk(chunk);
               for (const evt of events) {
                 sendEvent(evt);

@@ -6,9 +6,8 @@ import type { Message, OpenAIRequest } from '../types/openai.ts';
 import { type AmplificationGuardState } from './chatHelpers.ts';
 import { type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { cleanupImmediately } from './cleanupHelpers.ts';
-import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
 import { handlePostStreamCompletion, runStreamLoop } from './streamLoop.ts';
-import { buildChunkEvent, makeChoice, writeEvent } from './writeHelpers.ts';
+import { buildChunkEvent, makeChoice, writeEvent, writeSseErrorEvent } from './writeHelpers.ts';
 
 export interface StreamingContext {
   c: Context;
@@ -115,8 +114,8 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           const partialEmitted = ampState.emittedOutputBytes > 0 || ampState.triggered;
           if (partialEmitted) {
             logStore.log('warn', 'stream', `[Stream] RateLimited but partial content already emitted (${ampState.emittedOutputBytes} bytes) — skipping retry for ${curEmail}`);
-            // Emit error finish so the client knows the stream ended in error
-            try { await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({}, 'error')])); } catch {}
+            // Emit SSE error so the client treats the whole stream as failed and retries
+            try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})`, code: 'rate_limit_exceeded' }); } catch {}
             try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
             logStore.updateEntry(logId, (entry) => {
               entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
@@ -173,9 +172,8 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         if (loopResult.error) {
           logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
           logStore.addError(logId, loopResult.error);
-          const cleanErr = cleanTextOfXmlArtifacts(loopResult.error).cleanedText || loopResult.error;
-          await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({ content: cleanErr })]));
-          await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({}, 'error')]));
+          // Emit SSE error so the client treats the stream as failed and retries
+          await writeSseErrorEvent(streamWriter, { message: loopResult.error, code: 'upstream_idle_timeout' });
           await streamWriter.write('data: [DONE]\n\n');
           logStore.updateEntry(logId, (entry) => {
             if (streamState.reasoningBuffer) entry.reasoningContent = streamState.reasoningBuffer;
@@ -219,8 +217,8 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           const partialEmitted = ampState.emittedOutputBytes > 0 || ampState.triggered;
           if (partialEmitted) {
             logStore.log('warn', 'stream', `[Stream] RateLimited but partial content already emitted (${ampState.emittedOutputBytes} bytes) — skipping retry for ${curEmail}`);
-            // Emit error finish so the client knows the stream ended in error
-            try { await writeEvent(streamWriter, buildChunkEvent(completionId, body.model, [makeChoice({}, 'error')])); } catch {}
+            // Emit SSE error so the client treats the whole stream as failed and retries
+            try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})`, code: 'rate_limit_exceeded' }); } catch {}
             try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
             logStore.updateEntry(logId, (entry) => {
               entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };

@@ -48,6 +48,25 @@ export async function writeReasoningEvent(streamWriter: any, completionId: strin
 }
 
 /**
+ * Write an OpenAI-compatible SSE error event (`data: {"error": {...}}`).
+ * Downstream SDKs (OpenAI / Claude Code / Codex) surface this as an API error
+ * rather than treating it as model output. Callers should then terminate the
+ * stream (typically by writing [DONE]).
+ */
+export async function writeSseErrorEvent(
+  streamWriter: any,
+  err: { message: string; status?: number; code?: string; upstreamCode?: string },
+): Promise<void> {
+  const error: Record<string, any> = {
+    message: err.message || 'Upstream error',
+    type: 'upstream_error',
+  };
+  if (err.code !== undefined) error.code = err.code;
+  if (err.upstreamCode !== undefined) error.upstream_code = err.upstreamCode;
+  await writeEvent(streamWriter, { error });
+}
+
+/**
  * Write a content delta event with amplification guard and log store update.
  * Returns false if the amplification guard suppressed the event.
  */

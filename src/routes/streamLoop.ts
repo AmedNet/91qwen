@@ -1,11 +1,11 @@
 ﻿import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { setAccountDisabled } from '../services/accountManager.ts';
-import { cleanTextOfXmlArtifacts, parseXmlToolCalls } from '../tools/xmlToolParser.ts';
+import { parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
 import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { checkFinalAmplification, scheduleCleanup } from './cleanupHelpers.ts';
-import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent } from './writeHelpers.ts';
+import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent, writeSseErrorEvent } from './writeHelpers.ts';
 
 /** Shared TextDecoder — stateless, safe to reuse across streams */
 export const sharedDecoder = new TextDecoder();
@@ -172,9 +172,12 @@ export async function handlePostStreamCompletion(
       try {
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
       } catch (e) {}
-      const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
-      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: cleanErrorMessage })]));
-      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'error')]));
+      await writeSseErrorEvent(streamWriter, {
+        message: upstreamError.message,
+        code: upstreamError.code,
+        upstreamCode: upstreamError.upstreamCode,
+        status: upstreamError.status,
+      });
       await streamWriter.write('data: [DONE]\n\n');
       logStore.updateEntry(logId, (entry) => {
         entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
@@ -285,10 +288,9 @@ export async function handlePostStreamCompletion(
       entry.finalResponse = entry.finalResponse || { finishReason: 'error', toolCallCount: 0, contentPreview: '' };
     });
     logStore.finalizeRequest(logId);
-    // Emit error content to the client before terminating
-    const cleanErr = cleanTextOfXmlArtifacts(errMsg).cleanedText || errMsg;
-    try { await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: cleanErr })])); } catch {}
-    try { await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'error')])); } catch {}
+    // Emit SSE error event so the client (Claude Code/Codex) treats this as an
+    // API error and retries, rather than showing the error text as model output.
+    try { await writeSseErrorEvent(streamWriter, { message: errMsg }); } catch {}
     // Always write [DONE] so the SSE stream terminates cleanly, even on error
     try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
     return { retryAccount: false };
