@@ -55,11 +55,11 @@ export async function writeReasoningEvent(streamWriter: any, completionId: strin
  */
 export async function writeSseErrorEvent(
   streamWriter: any,
-  err: { message: string; status?: number; code?: string; upstreamCode?: string },
+  err: { message: string; status?: number; type?: string; code?: string; upstreamCode?: string },
 ): Promise<void> {
   const error: Record<string, any> = {
     message: err.message || 'Upstream error',
-    type: 'upstream_error',
+    type: err.type || 'upstream_error',
   };
   if (err.code !== undefined) error.code = err.code;
   if (err.upstreamCode !== undefined) error.upstream_code = err.upstreamCode;

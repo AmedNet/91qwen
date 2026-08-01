@@ -424,3 +424,96 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
   assert.ok(contentEvents.length > 0, 'content should be emitted after buffer overflow force-release');
 });
+
+function buildTestCtx(overrides: Partial<StreamProcessingCtx> = {}): {
+  ctx: StreamProcessingCtx;
+  retriedEmails: string[];
+} {
+  const retriedEmails: string[] = [];
+  const ctx: StreamProcessingCtx = {
+    streamWriter: { write: async () => {} },
+    completionId: 'test-completion-id',
+    model: 'qwen3.7-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: true,
+    logId: 'test-stream-error-log-id',
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+    retryWithNewAccount: (email) => retriedEmails.push(email),
+    ...overrides,
+  };
+  return { ctx, retriedEmails };
+}
+
+function buildTestState(): StreamProcessingState {
+  return {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    chunksSinceLastTagOpen: 0,
+    pendingChunk: '',
+    recentChunks: [],
+    loopStreak: 0,
+  };
+}
+
+test('data.error non-RateLimited sets ctx.streamError and breaks stream', async () => {
+  const { ctx } = buildTestCtx();
+  const state = buildTestState();
+
+  const result = await processStreamData(
+    { error: { code: 'quota_limit', message: 'The service is currently experiencing high demand' } },
+    state,
+    ctx,
+  );
+
+  assert.strictEqual(result, 'break_stream');
+  assert.ok(ctx.streamError, 'streamError should be set for non-RateLimited error');
+  assert.strictEqual(ctx.streamError?.upstreamCode, 'quota_limit');
+  assert.match(ctx.streamError?.message || '', /high demand/);
+});
+
+test('delta.status error non-RateLimited sets ctx.streamError and breaks stream', async () => {
+  const { ctx } = buildTestCtx();
+  const state = buildTestState();
+
+  const result = await processStreamData(
+    { choices: [{ delta: { status: 'error', code: 'boom', message: 'upstream exploded' } }] },
+    state,
+    ctx,
+  );
+
+  assert.strictEqual(result, 'break_stream');
+  assert.ok(ctx.streamError, 'streamError should be set for non-RateLimited delta error');
+  assert.strictEqual(ctx.streamError?.code, 'boom');
+});
+
+test('RateLimited does NOT set streamError and returns retry_account', async () => {
+  const { ctx, retriedEmails } = buildTestCtx();
+  const state = buildTestState();
+
+  const result = await processStreamData(
+    { error: 'RateLimited: daily usage limit reached' },
+    state,
+    ctx,
+  );
+
+  assert.strictEqual(result, 'retry_account');
+  assert.ok(ctx.streamError === undefined, 'streamError must NOT be set on RateLimited path');
+  assert.deepStrictEqual(retriedEmails, ['test@example.com']);
+});

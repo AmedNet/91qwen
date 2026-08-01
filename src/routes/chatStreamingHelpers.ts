@@ -280,6 +280,10 @@ export interface StreamProcessingCtx {
   tools?: any[];
   /** Callback to signal that mid-stream error requires account retry. */
   retryWithNewAccount: (failedEmail: string) => void;
+  /** Set when processStreamData catches a non-RateLimited upstream error mid-stream
+   *  (e.g. quota_limit). handlePostStreamCompletion reads this to emit a real error
+   *  event instead of a clean finish_reason:stop that masks the failure. */
+  streamError?: { message: string; code?: string; upstreamCode?: string };
 }
 
 export type ProcessStreamResult = 'continue' | 'break_stream' | 'retry_account';
@@ -344,6 +348,12 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       logStore.log('warn', 'qwen', `[Qwen] RateLimited via SSE: disabled ${resolvedEmail} and switching account — ${errMsg}`);
       return 'retry_account';
     }
+    // Non-RateLimited upstream error (quota_limit etc.): carry it forward so
+    // handlePostStreamCompletion emits a real error event instead of stop.
+    ctx.streamError = {
+      message: errMsg,
+      upstreamCode: typeof data.error === 'object' ? data.error?.code : undefined,
+    };
     return 'break_stream';
   }
   const deltaStatus = data.choices?.[0]?.delta?.status;
@@ -362,6 +372,12 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       logStore.log('warn', 'qwen', `[Qwen] RateLimited via delta status: disabled ${resolvedEmail} and switching account — code=${deltaCode} msg=${deltaMsg}`);
       return 'retry_account';
     }
+    // Non-RateLimited upstream error: carry it forward for a real error event.
+    ctx.streamError = {
+      message: deltaMsg || 'Qwen stream delta returned error status',
+      code: deltaCode,
+      upstreamCode: deltaCode,
+    };
     return 'break_stream';
   }
   let streamFinished = false;
@@ -384,7 +400,11 @@ export async function processStreamData(data: any, state: StreamProcessingState,
           }
         });
         for (let i = 0; i < newToolCalls.length; i++) {
-          newToolCalls[i].arguments = alignArgsToSchema(newToolCalls[i].name, newToolCalls[i].arguments, ctx.tools);
+          newToolCalls[i].arguments = alignArgsToSchema(
+            newToolCalls[i].name,
+            newToolCalls[i].arguments as Record<string, unknown>,
+            ctx.tools,
+          );
           await writeToolCallEvent(streamWriter, completionId, model, newToolCalls[i], ctx.emittedToolCallCount + i);
         }
         ctx.emittedToolCallCount += newToolCalls.length;

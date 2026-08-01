@@ -115,7 +115,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           if (partialEmitted) {
             logStore.log('warn', 'stream', `[Stream] RateLimited but partial content already emitted (${ampState.emittedOutputBytes} bytes) — skipping retry for ${curEmail}`);
             // Emit SSE error so the client treats the whole stream as failed and retries
-            try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})`, code: 'rate_limit_exceeded' }); } catch {}
+            try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})`, type: 'api_error', code: 'api_error' }); } catch {}
             try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
             logStore.updateEntry(logId, (entry) => {
               entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
@@ -159,7 +159,9 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             }
           }
 
-          // Exhausted retries or setup failed — terminate cleanly
+          // Exhausted retries or setup failed — emit a real error so the client
+          // retries instead of receiving an empty [DONE] that looks like success.
+          try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: all accounts reached their daily usage limit (${curEmail})`, type: 'api_error', code: 'api_error' }); } catch {}
           try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
           logStore.updateEntry(logId, (entry) => {
             entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
@@ -199,6 +201,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             buffer: loopResult.buffer,
             enableContentFiltering,
             includeUsage: !!body.stream_options?.include_usage,
+            streamError: streamCtx.streamError,
             skipPostStream: attempt > 0, // skip post-stream on retry — content already emitted by first attempt
           },
           {
@@ -218,7 +221,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           if (partialEmitted) {
             logStore.log('warn', 'stream', `[Stream] RateLimited but partial content already emitted (${ampState.emittedOutputBytes} bytes) — skipping retry for ${curEmail}`);
             // Emit SSE error so the client treats the whole stream as failed and retries
-            try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})`, code: 'rate_limit_exceeded' }); } catch {}
+            try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})`, type: 'api_error', code: 'api_error' }); } catch {}
             try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
             logStore.updateEntry(logId, (entry) => {
               entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
@@ -248,7 +251,9 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             }
           }
 
-          // Exhausted retries or setup failed — terminate cleanly
+          // Exhausted retries or setup failed — emit a real error so the client
+          // retries instead of receiving an empty [DONE] that looks like success.
+          try { await writeSseErrorEvent(streamWriter, { message: `RateLimited: all accounts reached their daily usage limit (${curEmail})`, type: 'api_error', code: 'api_error' }); } catch {}
           try { await streamWriter.write('data: [DONE]\n\n'); } catch {}
           logStore.updateEntry(logId, (entry) => {
             entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };

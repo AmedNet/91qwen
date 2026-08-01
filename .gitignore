@@ -79,6 +79,7 @@ pics/
 *.bak
 *.tmp
 TODO.md
+qwen-gate-last.zip
 
 # Deepwork progress files
 .slim/

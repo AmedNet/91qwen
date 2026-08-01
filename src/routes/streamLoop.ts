@@ -124,6 +124,10 @@ export async function handlePostStreamCompletion(
     includeUsage: boolean;
     /** When true, skip post-stream processing — caller is retrying with a new account. */
     skipPostStream?: boolean;
+    /** Non-RateLimited upstream error caught mid-stream by processStreamData
+     *  (e.g. quota_limit). The SSE line was consumed, so parseQwenErrorPayload(buffer)
+     *  can't see it — this is the authoritative signal. */
+    streamError?: { message: string; code?: string; upstreamCode?: string };
   },
   cleanup: {
     reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -147,18 +151,43 @@ export async function handlePostStreamCompletion(
     enableContentFiltering,
     includeUsage,
     skipPostStream,
+    streamError,
   } = args;
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
   let skipFinallyCleanup = false;
 
-  // When the caller is retrying with a new account after mid-stream RateLimited,
-  // skip all post-stream processing — don't emit partial content to the client.
-  if (skipPostStream) {
-    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
-    return { retryAccount: false };
-  }
-
   try {
+    // Mid-stream non-RateLimited upstream error (quota_limit etc.) captured by
+    // processStreamData. The SSE line was consumed during the read loop so
+    // parseQwenErrorPayload(buffer) below can't see it — emit a real error event
+    // so downstream treats the stream as failed instead of a clean stop.
+    // Checked BEFORE the skipPostStream short-circuit so a retry attempt that
+    // hits an upstream error still surfaces it to the client.
+    if (streamError) {
+      logStore.log('warn', 'stream', `[Qwen] Upstream stream error: ${streamError.message} (logId=${logId})`);
+      await writeSseErrorEvent(streamWriter, {
+        message: streamError.message,
+        code: streamError.code,
+        upstreamCode: streamError.upstreamCode,
+      });
+      await streamWriter.write('data: [DONE]\n\n');
+      logStore.updateEntry(logId, (entry) => {
+        entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+        entry.finalResponse.finishReason = 'upstream_error';
+      });
+      logStore.finalizeRequest(logId);
+      return { retryAccount: false };
+    }
+
+    // When the caller is retrying with a new account after mid-stream RateLimited,
+    // skip all post-stream processing — don't re-flush content already emitted
+    // per-chunk during this attempt's loop. Cleanup happens in the finally block.
+    // Placed AFTER the streamError check above so a retry attempt that hits a
+    // non-RateLimited upstream error still surfaces it to the client.
+    if (skipPostStream) {
+      return { retryAccount: false };
+    }
+
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
       if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail) {
@@ -249,6 +278,29 @@ export async function handlePostStreamCompletion(
 
     const usage = buildUsage(streamState.promptTokens, streamState.completionTokens, streamState.reasoningBuffer);
     const finalFinishReason = effectiveToolCallCount > 0 ? 'tool_calls' : 'stop';
+
+    // Upstream ended normally ([DONE] / finished) but produced zero answer
+    // content and zero tool calls. This is the "empty stream" pattern: Qwen
+    // returns a 200 + end signal with no answer content for some long
+    // conversations (thinking alone, or nothing at all). Returning it as a clean
+    // `stop` makes Claude Code think the task completed and loop "please produce
+    // output" forever. Surface it as an explicit error so downstream retries.
+    if (
+      finalFinishReason === 'stop' &&
+      !streamState.lastFullContent &&
+      effectiveToolCallCount === 0
+    ) {
+      const emptyMsg = 'Upstream returned an empty stream (no content, no reasoning, no tool calls)';
+      logStore.log('warn', 'stream', `[Qwen] ${emptyMsg} (logId=${logId})`);
+      await writeSseErrorEvent(streamWriter, { message: emptyMsg, code: 'upstream_empty' });
+      await streamWriter.write('data: [DONE]\n\n');
+      logStore.updateEntry(logId, (entry) => {
+        entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+        entry.finalResponse.finishReason = 'upstream_empty';
+      });
+      logStore.finalizeRequest(logId);
+      return { retryAccount: false };
+    }
 
     await writeEvent(
       streamWriter,

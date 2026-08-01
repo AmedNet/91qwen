@@ -202,12 +202,12 @@ test('Chat Completions returns explicit error for non-SSE upstream JSON errors',
     });
 
     const res = await app.fetch(req);
-    assert.strictEqual(res.status, 429);
+    assert.strictEqual(res.status, 502);
 
     const body = await res.json();
     assert.match(body.error.message, /All accounts have reached their daily usage limit/);
-    assert.strictEqual(body.error.type, 'rate_limit_error');
-    assert.strictEqual(body.error.code, 'rate_limit_exceeded');
+    assert.strictEqual(body.error.type, 'api_error');
+    assert.strictEqual(body.error.code, 'api_error');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -401,7 +401,7 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
       // Return a simple stream
       const stream = new ReadableStream({
         start(c) {
-          c.enqueue(new TextEncoder().encode('data: {"choices": [{"delta": {"content": "Image received"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: {"choices": [{"delta": {"phase": "answer", "content": "Image received"}}]}\n\n'));
           c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
           c.close();
         },
@@ -832,6 +832,333 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     const msgDelta = events.find((e) => e.type === 'message_delta');
     assert.ok(msgDelta, 'Should have message_delta');
     assert.strictEqual(msgDelta.delta.stop_reason, 'tool_use');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('OpenAI streaming: quota_limit upstream error is surfaced as error, not masked as stop', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  // Seed a test account
+  accounts.push({
+    email: 'quota-test@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      // Qwen rejects with an in-stream error SSE event (high demand), then closes.
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(
+            new TextEncoder().encode(
+              'data: {"error": {"code": "quota_limit", "message": "The service is currently experiencing high demand. Please try again later."}}\n\n',
+            ),
+          );
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const payload = {
+      model: 'qwen3.8-max-preview',
+      messages: [{ role: 'user', content: 'Do the thing' }],
+      stream: true,
+    };
+
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify(payload),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('Content-Type'), 'text/event-stream');
+
+    const reader = res.body?.getReader();
+    assert.ok(reader, 'Response should have a readable body');
+
+    const decoder = new TextDecoder();
+    let sawErrorEvent = false;
+    let sawFinishStop = false;
+    let sawDone = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value);
+      for (const line of chunk.split('\n')) {
+        if (line.trim() === 'data: [DONE]') {
+          sawDone = true;
+          continue;
+        }
+        if (!line.startsWith('data: ')) continue;
+        const dataStr = line.slice(6);
+        if (dataStr === '[DONE]') continue;
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.error) sawErrorEvent = true;
+          if (data.choices?.[0]?.finish_reason === 'stop') sawFinishStop = true;
+        } catch {
+          /* partial JSON ignored */
+        }
+      }
+    }
+
+    assert.ok(sawErrorEvent, 'Client should receive an SSE error event');
+    assert.ok(sawDone, 'Stream should terminate with [DONE]');
+    assert.strictEqual(
+      sawFinishStop,
+      false,
+      'quota_limit must NOT be masked as a clean finish_reason:stop — downstream would treat the task as completed',
+    );
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('OpenAI non-streaming: quota_limit upstream error returns error response, not empty stop', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  // Seed a test account
+  accounts.push({
+    email: 'quota-ns@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      // Qwen rejects with an in-stream error SSE event (high demand), then closes.
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(
+            new TextEncoder().encode(
+              'data: {"error": {"code": "quota_limit", "message": "The service is currently experiencing high demand. Please try again later."}}\n\n',
+            ),
+          );
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const payload = {
+      model: 'qwen3.8-max-preview',
+      messages: [{ role: 'user', content: 'Do the thing' }],
+      stream: false,
+    };
+
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify(payload),
+    });
+
+    const res = await app.fetch(req);
+    // Must NOT be a 200 with empty stop content — must be a real error response.
+    assert.notStrictEqual(res.status, 200, 'quota_limit must not be masked as a 200 stop with empty content');
+    const body = await res.json();
+    assert.ok(body.error, 'Response should carry an error object');
+    assert.strictEqual(body.error.upstream_code, 'quota_limit');
+    assert.match(body.error.message || '', /high demand/);
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('OpenAI streaming: upstream empty stream surfaces error, not clean stop', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  // Seed a test account
+  accounts.push({
+    email: 'empty-stream@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      // Qwen returns 200 + [DONE] with NO content chunks at all — the "empty
+      // stream" pattern seen with long conversations.
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const payload = {
+      model: 'qwen3.8-max-preview',
+      messages: [{ role: 'user', content: 'Do the thing' }],
+      stream: true,
+    };
+
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify(payload),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('Content-Type'), 'text/event-stream');
+
+    const reader = res.body?.getReader();
+    assert.ok(reader, 'Response should have a readable body');
+
+    const decoder = new TextDecoder();
+    let sawErrorEvent = false;
+    let sawFinishStop = false;
+    let sawDone = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value);
+      for (const line of chunk.split('\n')) {
+        if (line.trim() === 'data: [DONE]') {
+          sawDone = true;
+          continue;
+        }
+        if (!line.startsWith('data: ')) continue;
+        const dataStr = line.slice(6);
+        if (dataStr === '[DONE]') continue;
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.error) sawErrorEvent = true;
+          if (data.choices?.[0]?.finish_reason === 'stop') sawFinishStop = true;
+        } catch {
+          /* partial JSON ignored */
+        }
+      }
+    }
+
+    assert.ok(sawErrorEvent, 'Empty stream should produce an error event, not a clean stop');
+    assert.ok(sawDone, 'Stream should terminate with [DONE]');
+    assert.strictEqual(
+      sawFinishStop,
+      false,
+      'Empty stream must NOT be masked as finish_reason:stop — Claude Code would loop "please produce output"',
+    );
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('OpenAI non-streaming: upstream empty response returns error, not clean stop', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  // Seed a test account
+  accounts.push({
+    email: 'empty-ns@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      // Qwen returns 200 + [DONE] with NO content chunks — the non-streaming
+      // "empty response" pattern (fast ~5s zero-content stops seen in live logs).
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const payload = {
+      model: 'qwen3.8-max-preview',
+      messages: [{ role: 'user', content: 'Do the thing' }],
+      stream: false,
+    };
+
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify(payload),
+    });
+
+    const res = await app.fetch(req);
+    // Must NOT be a 200 with empty stop content — must be a real error response.
+    assert.notStrictEqual(res.status, 200, 'empty response must not be masked as a 200 stop with empty content');
+    const body = await res.json();
+    assert.ok(body.error, 'Response should carry an error object');
+    assert.strictEqual(body.error.code, 'upstream_empty');
   } finally {
     accounts.splice(0, accounts.length, ...originalAccounts);
     globalThis.fetch = originalFetch;
