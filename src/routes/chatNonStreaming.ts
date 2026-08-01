@@ -48,6 +48,15 @@ interface StreamProcessorState {
   completionTokens: number;
   promptTokens: number;
   nextParentId: string | null;
+  /** Non-RateLimited upstream error caught mid-stream (e.g. quota_limit).
+   *  The SSE line was consumed by parseQwenResponse, so parseQwenErrorPayload(buffer)
+   *  can't see it — this is the authoritative signal checked in processContentChunks. */
+  upstreamError?: {
+    message: string;
+    code?: string;
+    upstreamCode?: string;
+    status?: import('hono/utils/http-status').ContentfulStatusCode;
+  };
 }
 
 function buildUpstreamErrorResponse(err: any, fallbackStatus = 500): { body: any; status: number } {
@@ -170,6 +179,13 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
       ctx.retrySignal.failedEmail = ctx.resolvedEmail;
       if (ctx.resolvedEmail) setAccountDisabled(ctx.resolvedEmail, true);
       logStore.log('warn', 'qwen', `[Qwen] RateLimited via mid-stream SSE: disabled ${ctx.resolvedEmail} — ${errMsg}`);
+    } else if (!ctx.retrySignal?.needsRetry) {
+      // Non-RateLimited upstream error — surface it to the client instead of
+      // returning a 200 stop with empty content.
+      state.upstreamError = {
+        message: errMsg,
+        upstreamCode: typeof chunk.error === 'object' ? chunk.error?.code : undefined,
+      };
     }
     return;
   }
@@ -184,6 +200,14 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
       ctx.retrySignal.failedEmail = ctx.resolvedEmail;
       if (ctx.resolvedEmail) setAccountDisabled(ctx.resolvedEmail, true);
       logStore.log('warn', 'qwen', `[Qwen] RateLimited via mid-stream delta: disabled ${ctx.resolvedEmail} — code=${deltaCode} msg=${deltaMsg}`);
+    } else if (!ctx.retrySignal?.needsRetry) {
+      // Non-RateLimited upstream error — surface it to the client instead of
+      // returning a 200 stop with empty content.
+      state.upstreamError = {
+        message: deltaMsg || `Qwen stream delta returned error status (code=${deltaCode})`,
+        code: deltaCode,
+        upstreamCode: deltaCode,
+      };
     }
     return;
   }
@@ -358,6 +382,25 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
 
 async function processContentChunks(state: StreamProcessorState, ctx: NonStreamingContext): Promise<Response> {
   const { c, logId, resolvedEmail, retrySignal } = ctx;
+  // Non-RateLimited upstream error captured mid-stream by parseQwenResponse.
+  // The SSE line was consumed during the read loop so parseQwenErrorPayload(buffer)
+  // can't see it — emit a real error response instead of a 200 stop with empty content.
+  if (state.upstreamError) {
+    const upstreamError = state.upstreamError;
+    logStore.log('warn', 'qwen', `[Qwen] Upstream error in non-streaming response: ${upstreamError.message} (logId=${logId})`);
+    logStore.finalizeRequest(logId);
+    return c.json(
+      {
+        error: {
+          message: cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message,
+          type: 'upstream_error',
+          code: upstreamError.code,
+          upstream_code: upstreamError.upstreamCode,
+        },
+      },
+      upstreamError.status ?? 502,
+    );
+  }
   const upstreamError = parseQwenErrorPayload(state.buffer);
   if (upstreamError) {
     // For RateLimited, signal retry so the caller can switch accounts
@@ -384,6 +427,21 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
     );
   }
   flushAndDetectLoops(state, logId);
+  // Upstream ended normally ([DONE] / finished) but produced zero answer
+  // content and zero tool calls — the non-streaming counterpart of the
+  // streaming "empty stream" guard in streamLoop.ts. Returning it as a clean
+  // `stop` makes the client think the task completed and loop "please produce
+  // output" forever. Surface it as an explicit error so downstream retries.
+  if (!state.lastFullContent && state.toolCallsOut.length === 0) {
+    const emptyMsg = 'Upstream returned an empty response (no content, no tool calls)';
+    logStore.log('warn', 'qwen', `[Qwen] ${emptyMsg} (logId=${logId})`);
+    logStore.updateEntry(logId, (entry) => {
+      entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+      entry.finalResponse.finishReason = 'upstream_empty';
+    });
+    logStore.finalizeRequest(logId);
+    return c.json({ error: { message: emptyMsg, type: 'upstream_error', code: 'upstream_empty' } }, 502);
+  }
   const response = buildResponseFromState(state, ctx);
   logStore.finalizeRequest(logId);
   return response;
@@ -435,19 +493,41 @@ export async function handleNonStreamingRequest(ctx: NonStreamingContext): Promi
 
 export function buildChatUpstreamErrorResponse(err: any): { body: any; status: number } {
   if (err?.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err?.message || '')) {
+    // Accounts auto-disabled + switched internally; when all are exhausted this
+    // surfaces as an api_error (502) so the downstream treats it as a transient
+    // API failure and re-requests, rather than a permanent rate limit it waits on.
     return {
       body: {
         error: {
           message: 'All accounts have reached their daily usage limit. Please try again later.',
-          type: 'rate_limit_error',
-          code: 'rate_limit_exceeded',
+          type: 'api_error',
+          code: 'api_error',
           upstream_message: err?.message,
           upstream_code: err?.upstreamCode,
           upstream_status: err?.upstreamStatus || 429,
         },
       },
-      status: 429,
+      status: 502,
     };
   }
   return buildUpstreamErrorResponse(err, err?.upstreamStatus || 500);
+}
+
+/** Wrap an OpenAI-format error body into Anthropic's error envelope so
+ *  Claude Code (`/v1/messages`) correctly surfaces it as a failed request. */
+export function wrapAsAnthropicError(body: any): any {
+  if (body?.error) {
+    const wrapped: any = {
+      type: 'error',
+      error: {
+        type: body.error.type || 'api_error',
+        message: body.error.message || 'Upstream error',
+        code: body.error.code || null,
+      },
+    };
+    if (body.error.upstream_code !== undefined) wrapped.error.upstream_code = body.error.upstream_code;
+    if (body.error.upstream_status !== undefined) wrapped.error.upstream_status = body.error.upstream_status;
+    return wrapped;
+  }
+  return body;
 }

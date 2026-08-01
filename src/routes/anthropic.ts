@@ -33,7 +33,7 @@ import {
   handleImageModelFallback,
 } from './chatHelpers.ts';
 import type { NonStreamingContext } from './chatNonStreaming.ts';
-import { buildChatUpstreamErrorResponse, handleNonStreamingRequest } from './chatNonStreaming.ts';
+import { buildChatUpstreamErrorResponse, handleNonStreamingRequest, wrapAsAnthropicError } from './chatNonStreaming.ts';
 import { extractLocalMcpToolCalls } from './chatStreamingHelpers.ts';
 
 // Re-export for tests
@@ -608,6 +608,9 @@ async function handleAnthropicStream(
             logStore.addRawChunk(logId, deltaResult.vStr);
             hasEmittedContent = true;
           }
+          // Stop reading after an upstream error/rate-limit was detected —
+          // don't emit any further content after the error signal.
+          if (streamError || rateLimitedDetected) break;
         }
 
         // If RateLimited was detected, don't emit close events — retry instead
@@ -615,6 +618,16 @@ async function handleAnthropicStream(
         if (rateLimitedDetected) {
           if (hasEmittedContent) {
             logStore.log('warn', 'chat', `[Anthropic] RateLimited but partial content already emitted — skipping retry for ${curEmail}`);
+            // Emit an error event so the client treats the stream as failed
+            // (can't retry — content already sent — but it must not look like success).
+            try {
+              await streamWriter.write(
+                `event: error\ndata: ${JSON.stringify({
+                  type: 'error',
+                  error: { type: 'api_error', message: `RateLimited: partial content emitted but upstream hit limit (${curEmail})` },
+                })}\n\n`,
+              );
+            } catch {}
             logStore.finalizeRequest(logId, { finishReason: 'error' });
             break;
           }
@@ -639,7 +652,16 @@ async function handleAnthropicStream(
               // Fall through to clean termination
             }
           }
-          // Exhausted retries or setup failed — terminate cleanly
+          // Exhausted retries or setup failed — terminate with a real error
+          // event so the client retries instead of seeing an empty success.
+          try {
+            await streamWriter.write(
+              `event: error\ndata: ${JSON.stringify({
+                type: 'error',
+                error: { type: 'api_error', message: `RateLimited: all accounts reached their daily usage limit (${curEmail})` },
+              })}\n\n`,
+            );
+          } catch {}
           logStore.finalizeRequest(logId, { finishReason: 'error' });
           break;
         }
@@ -836,7 +858,18 @@ async function handleAnthropicStream(
         });
         sessionPool.release(curSession.chatId, curParentId, curHeaders, curEmail);
       } catch (streamErr: any) {
-        logStore.addError(logId, streamErr.message || String(streamErr));
+        const errMsg = streamErr?.message || String(streamErr);
+        logStore.addError(logId, errMsg);
+        // Emit a real error event so the client treats the stream as failed
+        // (and retries) instead of leaving it hanging with no termination signal.
+        try {
+          await streamWriter.write(
+            `event: error\ndata: ${JSON.stringify({
+              type: 'error',
+              error: { type: 'api_error', message: errMsg },
+            })}\n\n`,
+          );
+        } catch {}
       } finally {
         if (!streamReleased) {
           logStore.finalizeRequest(logId, {
@@ -1045,7 +1078,7 @@ export async function anthropicMessages(c: Context) {
           if (openAIResp.error) {
             logStore.log('error', 'chat', `[Anthropic] OpenAI endpoint returned error: ${JSON.stringify(openAIResp.error)}`);
             cancelWatchdog();
-            return c.json(openAIResp, <any>openAIResponse.status);
+            return c.json(wrapAsAnthropicError(openAIResp), <any>openAIResponse.status);
           }
           const anthropicResp = convertOpenAIResponseToAnthropic(openAIResp, anthropicModel, reverseToolMap);
           logStore.log(
@@ -1075,7 +1108,7 @@ export async function anthropicMessages(c: Context) {
             logStore.log('error', 'chat', `[Anthropic] Retry setup failed: ${retryErr.message}`);
             cancelWatchdog();
             const mapped = buildChatUpstreamErrorResponse(retryErr);
-            return c.json(mapped.body, mapped.status as any);
+            return c.json(wrapAsAnthropicError(mapped.body), mapped.status as any);
           }
         } else {
           // Exhausted retries
@@ -1083,7 +1116,7 @@ export async function anthropicMessages(c: Context) {
           const exhaustedErr = new Error('All accounts rate-limited during non-streaming. Please wait and try again later.');
           (exhaustedErr as any).upstreamStatus = 429;
           const mapped = buildChatUpstreamErrorResponse(exhaustedErr);
-          return c.json(mapped.body, mapped.status as any);
+          return c.json(wrapAsAnthropicError(mapped.body), mapped.status as any);
         }
       }
     }
@@ -1135,17 +1168,17 @@ export async function anthropicMessages(c: Context) {
     if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
       logStore.log('error', 'chat', `[Anthropic] Returning 429 rate_limit_error`);
       const mapped = buildChatUpstreamErrorResponse(err);
-      return c.json(mapped.body, mapped.status as any);
+      return c.json(wrapAsAnthropicError(mapped.body), mapped.status as any);
     }
     // Tool-not-found: return 400 so Claude Code feeds the actionable error back to the LLM
     if (err instanceof QwenToolNotFoundError) {
       const mapped = buildChatUpstreamErrorResponse(err);
-      return c.json(mapped.body, 400);
+      return c.json(wrapAsAnthropicError(mapped.body), 400);
     }
     const mapped = buildChatUpstreamErrorResponse(err);
     logStore.log('error', 'chat', `[Anthropic] Returning ${mapped.status}: ${mapped.body.error?.message || err.message}`);
     cancelWatchdog();
     if (anthropicVersion) c.header('anthropic-version', anthropicVersion);
-    return c.json(mapped.body, <any>mapped.status);
+    return c.json(wrapAsAnthropicError(mapped.body), <any>mapped.status);
   }
 }
