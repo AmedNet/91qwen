@@ -254,7 +254,7 @@ export interface DeltaContentResult {
 
 export function extractDeltaContent(
   chunk: any,
-  targetResponseId: string | null,
+  knownResponseIds: Set<string>,
   currentThoughtIndex: number,
   reasoningBuffer: string,
 ): DeltaContentResult {
@@ -263,11 +263,24 @@ export function extractDeltaContent(
   let isThinkingChunk = false;
   let newThoughtIndex = currentThoughtIndex;
 
+  // Accept a chunk if we haven't seen any response_id yet (set empty), the chunk
+  // carries no response_id, or its id (or its response.created id) is one we've
+  // already seen in THIS stream. Previously this locked to the FIRST id only,
+  // which dropped the entire answer phase whenever Qwen emitted think and answer
+  // under different response_ids (multi-phase / tool-call turns) — the reply was
+  // silently filtered out and the turn ended empty.
+  const createdId = chunk['response.created']?.response_id;
+  const idOk =
+    knownResponseIds.size === 0 ||
+    !chunk.response_id ||
+    knownResponseIds.has(chunk.response_id) ||
+    (createdId != null && knownResponseIds.has(createdId));
+
   if (
     chunk.choices &&
     chunk.choices[0] &&
     chunk.choices[0].delta &&
-    (targetResponseId === null || !chunk.response_id || chunk.response_id === targetResponseId || chunk['response.created']?.response_id === targetResponseId)
+    idOk
   ) {
     const delta = chunk.choices[0].delta;
     if (delta.phase === 'thinking_summary') {

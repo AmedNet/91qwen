@@ -5,7 +5,8 @@ import { parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
 import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { checkFinalAmplification, scheduleCleanup } from './cleanupHelpers.ts';
-import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent, writeSseErrorEvent } from './writeHelpers.ts';
+import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent, writeSseErrorEvent, writeToolCallEvent } from './writeHelpers.ts';
+import { alignArgsToSchema, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 
 /** Shared TextDecoder — stateless, safe to reuse across streams */
 export const sharedDecoder = new TextDecoder();
@@ -122,12 +123,14 @@ export async function handlePostStreamCompletion(
     buffer: string;
     enableContentFiltering: boolean;
     includeUsage: boolean;
+    /** Client-registered tool schemas; used to align flush-time tool-call arg names to the schema's casing. */
+    tools?: any[];
     /** When true, skip post-stream processing — caller is retrying with a new account. */
     skipPostStream?: boolean;
     /** Non-RateLimited upstream error caught mid-stream by processStreamData
      *  (e.g. quota_limit). The SSE line was consumed, so parseQwenErrorPayload(buffer)
      *  can't see it — this is the authoritative signal. */
-    streamError?: { message: string; code?: string; upstreamCode?: string };
+    streamError?: { message: string; type?: string; code?: string; upstreamCode?: string };
   },
   cleanup: {
     reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -167,6 +170,7 @@ export async function handlePostStreamCompletion(
       logStore.log('warn', 'stream', `[Qwen] Upstream stream error: ${streamError.message} (logId=${logId})`);
       await writeSseErrorEvent(streamWriter, {
         message: streamError.message,
+        type: streamError.type,
         code: streamError.code,
         upstreamCode: streamError.upstreamCode,
       });
@@ -236,6 +240,16 @@ export async function handlePostStreamCompletion(
           entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.parameters) });
         });
       }
+      // Emit the tool calls that were only assembled at flush time (e.g. completed
+      // from the pendingChunk buffer) as SSE events. Without this the client sees
+      // finish_reason:"tool_calls" but never receives a tool_calls chunk, so the
+      // turn dead-ends. Mirror the per-chunk path: align args + writeToolCallEvent.
+      const flushToolCalls = parsed.slice(emittedToolCallCount);
+      for (let i = 0; i < flushToolCalls.length; i++) {
+        const parsedCall = xmlToolCallToParsed(flushToolCalls[i], emittedToolCallCount + i);
+        parsedCall.arguments = alignArgsToSchema(parsedCall.name, parsedCall.arguments, args.tools);
+        await writeToolCallEvent(streamWriter, completionId, model, parsedCall, emittedToolCallCount + i);
+      }
     }
 
     const pipelineResult = filterContentPipeline(streamState.lastFullContent, enableContentFiltering);
@@ -281,16 +295,19 @@ export async function handlePostStreamCompletion(
 
     // Upstream ended normally ([DONE] / finished) but produced zero answer
     // content and zero tool calls. This is the "empty stream" pattern: Qwen
-    // returns a 200 + end signal with no answer content for some long
-    // conversations (thinking alone, or nothing at all). Returning it as a clean
-    // `stop` makes Claude Code think the task completed and loop "please produce
-    // output" forever. Surface it as an explicit error so downstream retries.
+    // returns a 200 + end signal with no usable answer for some long
+    // conversations — sometimes thinking-only, sometimes nothing at all.
+    // reasoning_content is internal deliberation, NOT a user-facing answer, so a
+    // thinking-only turn with an empty answer is still a failed turn. Returning
+    // it as a clean `stop` shows the user an empty reply and makes the downstream
+    // agent think the task completed — the "conversation ended for no reason"
+    // symptom. Surface it as an explicit error so downstream retries.
     if (
       finalFinishReason === 'stop' &&
       !streamState.lastFullContent &&
       effectiveToolCallCount === 0
     ) {
-      const emptyMsg = 'Upstream returned an empty stream (no content, no reasoning, no tool calls)';
+      const emptyMsg = 'Upstream returned an empty answer (no content, no tool calls)';
       logStore.log('warn', 'stream', `[Qwen] ${emptyMsg} (logId=${logId})`);
       await writeSseErrorEvent(streamWriter, { message: emptyMsg, code: 'upstream_empty' });
       await streamWriter.write('data: [DONE]\n\n');

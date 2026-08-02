@@ -223,7 +223,7 @@ export function extractLocalMcpToolCalls(sseData: any): ParsedToolCall[] {
 // ── Per-chunk stream processing ────────────────────────────────────
 
 export interface StreamProcessingState {
-  targetResponseId: string | null;
+  knownResponseIds: Set<string>;
   nextParentId: string | null;
   completionTokens: number;
   promptTokens: number;
@@ -283,7 +283,7 @@ export interface StreamProcessingCtx {
   /** Set when processStreamData catches a non-RateLimited upstream error mid-stream
    *  (e.g. quota_limit). handlePostStreamCompletion reads this to emit a real error
    *  event instead of a clean finish_reason:stop that masks the failure. */
-  streamError?: { message: string; code?: string; upstreamCode?: string };
+  streamError?: { message: string; type?: string; code?: string; upstreamCode?: string };
 }
 
 export type ProcessStreamResult = 'continue' | 'break_stream' | 'retry_account';
@@ -427,10 +427,10 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   ctx.sseEventCount = (ctx.sseEventCount || 0) + 1;
 
   if (data['response.created']?.response_id) {
-    if (!state.targetResponseId) state.targetResponseId = data['response.created'].response_id;
+    state.knownResponseIds.add(data['response.created'].response_id);
     state.nextParentId = data['response.created'].response_id;
-  } else if (data.response_id && !state.targetResponseId) {
-    state.targetResponseId = data.response_id;
+  } else if (data.response_id) {
+    state.knownResponseIds.add(data.response_id);
     state.nextParentId = data.response_id;
   }
 
@@ -439,12 +439,17 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     if (data.usage.input_tokens) state.promptTokens = data.usage.input_tokens;
   }
 
-  const deltaResult = extractDeltaContent(data, state.targetResponseId, state.currentThoughtIndex, state.reasoningBuffer);
+  const deltaResult = extractDeltaContent(data, state.knownResponseIds, state.currentThoughtIndex, state.reasoningBuffer);
   const { vStr, foundStr, isThinkingChunk } = deltaResult;
   state.currentThoughtIndex = deltaResult.currentThoughtIndex;
 
-  if (!foundStr || vStr === '') return 'continue';
-  if (vStr === 'FINISHED') return 'continue';
+  // Honor streamFinished even when the finished chunk carries no extractable
+  // content (e.g. a `local_tool` finished chunk, or an empty answer-finished
+  // chunk). Previously these hit the early `return 'continue'` and the finished
+  // signal was silently dropped, leaving the loop to block until the idle
+  // timeout when the upstream didn't immediately follow with [DONE].
+  if (!foundStr || vStr === '') return streamFinished ? 'break_stream' : 'continue';
+  if (vStr === 'FINISHED') return streamFinished ? 'break_stream' : 'continue';
 
   if (isThinkingChunk) {
     if (state.reasoningBuffer.length < 20000) state.reasoningBuffer += vStr;
@@ -461,7 +466,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   }
 
   if (SELF_CLOSING_TAG_PATTERN.test(vStr)) {
-    return 'continue';
+    return streamFinished ? 'break_stream' : 'continue';
   }
 
   logStore.addRawChunk(logId, vStr);
@@ -551,6 +556,15 @@ export async function processStreamData(data: any, state: StreamProcessingState,
           entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
           entry.finalResponse.finishReason = 'loop_detected';
         });
+        // Surface as an api_error so the downstream agent treats the turn as a
+        // transient failure and retries, instead of receiving a clean
+        // finish_reason:stop that masks the truncated output as a normal end.
+        ctx.streamError = {
+          message: 'Model output loop detected — stream terminated to prevent infinite repetition',
+          type: 'api_error',
+          code: 'loop_detected',
+          upstreamCode: 'loop_detected',
+        };
         return 'break_stream';
       }
     } else {

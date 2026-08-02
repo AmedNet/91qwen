@@ -406,7 +406,7 @@ async function handleAnthropicStream(
         let emittedThinkingBlock = false;
         let emittedTextBlock = false;
         let lastFullContent = '';
-        let targetResponseId: string | null = null;
+        const knownResponseIds = new Set<string>();
         let currentThoughtIndex = 0;
         let reasoningBuffer = '';
         let completionTokens = 0;
@@ -471,9 +471,9 @@ async function handleAnthropicStream(
             }
 
             if (chunk['response.created']?.response_id) {
-              if (!targetResponseId) targetResponseId = chunk['response.created'].response_id;
-            } else if (chunk.response_id && !targetResponseId) {
-              targetResponseId = chunk.response_id;
+              knownResponseIds.add(chunk['response.created'].response_id);
+            } else if (chunk.response_id) {
+              knownResponseIds.add(chunk.response_id);
             }
 
             if (chunk.usage) {
@@ -504,7 +504,7 @@ async function handleAnthropicStream(
               }
             }
 
-            const deltaResult = extractDeltaContent(chunk, targetResponseId, currentThoughtIndex, reasoningBuffer);
+            const deltaResult = extractDeltaContent(chunk, knownResponseIds, currentThoughtIndex, reasoningBuffer);
             if (!deltaResult.foundStr || !deltaResult.vStr) continue;
 
             currentThoughtIndex = deltaResult.currentThoughtIndex;

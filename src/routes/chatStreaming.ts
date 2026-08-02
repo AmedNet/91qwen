@@ -201,6 +201,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             buffer: loopResult.buffer,
             enableContentFiltering,
             includeUsage: !!body.stream_options?.include_usage,
+            tools: body.tools,
             streamError: streamCtx.streamError,
             skipPostStream: attempt > 0, // skip post-stream on retry — content already emitted by first attempt
           },
@@ -302,7 +303,7 @@ function createHeartbeat(streamWriter: any): any {
 
 function buildInitialStreamState(finalPrompt: string, initialParentId: string | null): StreamProcessingState {
   return {
-    targetResponseId: null,
+    knownResponseIds: new Set<string>(),
     nextParentId: initialParentId,
     completionTokens: 0,
     promptTokens: Math.ceil(finalPrompt.length / 3.5),

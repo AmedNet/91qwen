@@ -40,7 +40,7 @@ interface StreamProcessorState {
   reasoningBuffer: string;
   lastFullContent: string;
   lastParsedPosition: number;
-  targetResponseId: string | null;
+  knownResponseIds: Set<string>;
   toolCallsOut: any[];
   correctionPrompts: string[];
   toolSpamGuard: ToolSpamGuard;
@@ -95,7 +95,7 @@ function buildQwenRequest(ctx: NonStreamingContext): StreamProcessorState {
     reasoningBuffer: '',
     lastFullContent: '',
     lastParsedPosition: 0,
-    targetResponseId: null,
+    knownResponseIds: new Set<string>(),
     toolCallsOut: [],
     correctionPrompts: [],
     toolSpamGuard: new ToolSpamGuard(),
@@ -213,10 +213,10 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   }
 
   if (chunk['response.created']?.response_id) {
-    if (!state.targetResponseId) state.targetResponseId = chunk['response.created'].response_id;
+    state.knownResponseIds.add(chunk['response.created'].response_id);
     state.nextParentId = chunk['response.created'].response_id;
-  } else if (chunk.response_id && !state.targetResponseId) {
-    state.targetResponseId = chunk.response_id;
+  } else if (chunk.response_id) {
+    state.knownResponseIds.add(chunk.response_id);
     state.nextParentId = chunk.response_id;
   }
 
@@ -227,10 +227,14 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
 
   const delta = chunk.choices?.[0]?.delta;
   if (!delta) return;
+  // Accept chunks from any response_id seen in this stream. Locking to the first
+  // id dropped the answer phase whenever Qwen emitted think and answer under
+  // different response_ids (multi-phase / tool-call turns).
   if (
-    state.targetResponseId !== null &&
-    chunk.response_id !== state.targetResponseId &&
-    chunk['response.created']?.response_id !== state.targetResponseId
+    state.knownResponseIds.size > 0 &&
+    chunk.response_id &&
+    !state.knownResponseIds.has(chunk.response_id) &&
+    !(chunk['response.created']?.response_id && state.knownResponseIds.has(chunk['response.created'].response_id))
   )
     return;
 
@@ -428,10 +432,12 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
   }
   flushAndDetectLoops(state, logId);
   // Upstream ended normally ([DONE] / finished) but produced zero answer
-  // content and zero tool calls — the non-streaming counterpart of the
-  // streaming "empty stream" guard in streamLoop.ts. Returning it as a clean
-  // `stop` makes the client think the task completed and loop "please produce
-  // output" forever. Surface it as an explicit error so downstream retries.
+  // content and zero tool calls — the non-streaming counterpart of the streaming
+  // "empty stream" guard in streamLoop.ts. reasoning_content is internal
+  // deliberation, not a user-facing answer, so a thinking-only turn with an
+  // empty answer is still a failed turn. Returning it as a clean `stop` shows the
+  // user an empty reply and makes the client think the task completed. Surface
+  // it as an explicit error so downstream retries.
   if (!state.lastFullContent && state.toolCallsOut.length === 0) {
     const emptyMsg = 'Upstream returned an empty response (no content, no tool calls)';
     logStore.log('warn', 'qwen', `[Qwen] ${emptyMsg} (logId=${logId})`);

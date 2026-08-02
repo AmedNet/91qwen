@@ -8,7 +8,7 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
   const state: StreamProcessingState = {
-    targetResponseId: null,
+    knownResponseIds: new Set(),
     nextParentId: null,
     completionTokens: 0,
     promptTokens: 0,
@@ -147,7 +147,7 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
   const state: StreamProcessingState = {
-    targetResponseId: null,
+    knownResponseIds: new Set(),
     nextParentId: null,
     completionTokens: 0,
     promptTokens: 0,
@@ -235,7 +235,7 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
   const state: StreamProcessingState = {
-    targetResponseId: null,
+    knownResponseIds: new Set(),
     nextParentId: null,
     completionTokens: 0,
     promptTokens: 0,
@@ -338,7 +338,7 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
   const state: StreamProcessingState = {
-    targetResponseId: null,
+    knownResponseIds: new Set(),
     nextParentId: null,
     completionTokens: 0,
     promptTokens: 0,
@@ -449,7 +449,7 @@ function buildTestCtx(overrides: Partial<StreamProcessingCtx> = {}): {
 
 function buildTestState(): StreamProcessingState {
   return {
-    targetResponseId: null,
+    knownResponseIds: new Set(),
     nextParentId: null,
     completionTokens: 0,
     promptTokens: 0,
