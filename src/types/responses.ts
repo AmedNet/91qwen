@@ -32,12 +32,20 @@ export interface ResponsesRequest {
   truncation?: 'auto' | 'disabled';
 }
 
-export type ResponsesInputItem = ResponsesInputMessage | ResponsesInputFunctionCallOutput;
+export type ResponsesInputItem = ResponsesInputMessage | ResponsesInputFunctionCallOutput | ResponsesInputFunctionCall;
 
 export interface ResponsesInputMessage {
   type?: 'message';
   role: 'system' | 'user' | 'assistant' | 'developer';
   content: string | ResponsesContentPart[];
+}
+
+export interface ResponsesInputFunctionCall {
+  type: 'function_call';
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
 }
 
 export interface ResponsesContentPart {
@@ -104,7 +112,7 @@ export interface ResponsesOutputFunctionCall {
   call_id: string;
   name: string;
   arguments: string;
-  status: 'completed';
+  status: 'in_progress' | 'completed';
 }
 
 export interface ResponsesUsage {

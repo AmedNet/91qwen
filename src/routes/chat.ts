@@ -9,7 +9,7 @@ import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
-import { OpenAIRequest } from '../types/openai.ts';
+import type { Message, OpenAIRequest } from '../types/openai.ts';
 import { checkContextWindow, estimateTokens } from '../utils/tokenEstimator.ts';
 import { validateOpenAIRequest } from '../utils/validation.ts';
 import {
@@ -29,6 +29,104 @@ export {
 } from './chatHelpers.ts';
 
 const MAX_MESSAGE_SIZE = 10_000_000; // 10MB — large payloads are uploaded as files via Qwen's file API
+
+function messageContentText(message: Message): string {
+  return Array.isArray(message.content)
+    ? message.content.map((part: any) => part.text || JSON.stringify(part)).join('\n')
+    : String(message.content ?? '');
+}
+
+function estimateRequestTokens(messages: Message[], tools?: OpenAIRequest['tools']): number {
+  return Math.ceil(
+    estimateTokens(messages.map((message) => messageContentText(message)).join('\n'), { tools: tools as any }) * 1.25,
+  );
+}
+
+/** Keep required instructions and the newest complete conversation/tool turns. */
+export function trimMessagesToContext(
+  messages: Message[],
+  maxContext: number,
+  tools?: OpenAIRequest['tools'],
+  maxOutput = 0,
+): { messages: Message[]; estimatedTokens: number; trimmed: boolean } {
+  const inputBudget = Math.max(0, maxContext - maxOutput);
+  const estimate = (candidate: Message[]) =>
+    estimateRequestTokens(candidate, tools) + candidate.length * 5;
+  const initialEstimate = estimate(messages);
+  if (initialEstimate <= inputBudget) {
+    return { messages, estimatedTokens: initialEstimate, trimmed: false };
+  }
+
+  type Unit = { start: number; messages: Message[]; required?: boolean };
+  const units: Unit[] = [];
+  const skipped = new Set<number>();
+
+  for (let index = 0; index < messages.length;) {
+    if (skipped.has(index)) {
+      index++;
+      continue;
+    }
+    const current = messages[index];
+    if (current.role === 'system' || current.role === 'developer') {
+      units.push({ start: index, messages: [current], required: true });
+      index++;
+      continue;
+    }
+
+    if (current.role === 'assistant' && current.tool_calls?.length) {
+      const callIds = new Set(current.tool_calls.map((call) => call.id));
+      const results: Message[] = [];
+      let next = index + 1;
+      while (next < messages.length && messages[next].role === 'tool') {
+        results.push(messages[next]);
+        next++;
+      }
+      const resultIds = new Set(results.map((message) => message.tool_call_id));
+      const complete = results.length === callIds.size &&
+        [...callIds].every((id) => resultIds.has(id)) &&
+        results.every((message) => !!message.tool_call_id && callIds.has(message.tool_call_id));
+      if (complete) {
+        units.push({ start: index, messages: [current, ...results] });
+        index = next;
+        continue;
+      }
+      // An incomplete tool turn must not leave either its call or orphan results.
+      skipped.add(index);
+      for (let resultIndex = index + 1; resultIndex < next; resultIndex++) skipped.add(resultIndex);
+      index++;
+      continue;
+    }
+
+    // Tool results are meaningful only as part of the assistant tool unit above.
+    if (current.role === 'tool') {
+      index++;
+      continue;
+    }
+    units.push({ start: index, messages: [current] });
+    index++;
+  }
+
+  const candidateMessages = (selected: Set<number>) => units
+    .filter((_, index) => selected.has(index))
+    .sort((a, b) => a.start - b.start)
+    .flatMap((unit) => unit.messages);
+  const selected = new Set<number>(
+    units.flatMap((unit, index) => unit.required ? [index] : []),
+  );
+  const latestUser = [...units].reverse().findIndex((unit) =>
+    unit.messages.some((message) => message.role === 'user'),
+  );
+  if (latestUser >= 0) selected.add(units.length - 1 - latestUser);
+
+  for (let index = units.length - 1; index >= 0; index--) {
+    if (selected.has(index)) continue;
+    selected.add(index);
+    if (estimate(candidateMessages(selected)) > inputBudget) selected.delete(index);
+  }
+
+  const trimmedMessages = candidateMessages(selected);
+  return { messages: trimmedMessages, estimatedTokens: estimate(trimmedMessages), trimmed: true };
+}
 
 async function parseRequestBody(c: Context) {
   const rawBody = await c.req.json();
@@ -70,17 +168,45 @@ async function parseRequestBody(c: Context) {
     role: m.role,
     content: Array.isArray(m.content) ? m.content.map((c: any) => c.text || JSON.stringify(c)).join('\n') : String(m.content ?? ''),
   }));
-  const estimatedTokens = estimateTokens(formattedMessages.map((m) => m.content).join('\n'));
+  // Tool schemas are serialized into the upstream prompt as well. Omitting them
+  // from the preflight estimate lets a request pass locally and then fail at
+  // Qwen with context_window_exceeded.
+  // The estimator is intentionally heuristic (Qwen's tokenizer is not local).
+  // Keep a safety margin so prompts near the limit are rejected here instead
+  // of reaching Qwen and failing after an upstream request has started.
+  const estimatedTokens = Math.ceil(
+    estimateTokens(
+      formattedMessages.map((m) => m.content).join('\n'),
+      { tools: body.tools as any },
+    ) * 1.25,
+  );
   const contextCheck = checkContextWindow(estimatedTokens, maxContext, maxOutput, body.model as string, formattedMessages);
+  const trimmed = trimMessagesToContext(messages, maxContext, body.tools, maxOutput);
+  const effectiveMessages = trimmed.messages;
+  const effectiveFormattedMessages = effectiveMessages.map((m) => ({
+    role: m.role,
+    content: messageContentText(m),
+  }));
+  const effectiveContextCheck = trimmed.trimmed
+    ? checkContextWindow(trimmed.estimatedTokens, maxContext, maxOutput, body.model as string, effectiveFormattedMessages)
+    : contextCheck;
+
+  if (trimmed.trimmed) {
+    logStore.log(
+      'warn',
+      'chat',
+      `[Chat] Context history trimmed: messages ${messages.length} -> ${effectiveMessages.length}, estimated tokens ${estimatedTokens} -> ${trimmed.estimatedTokens}`,
+    );
+  }
 
   return {
     body,
     isStream,
     toolCalling,
     cleanOutput,
-    messages,
-    contextCheck,
-    availableTokens: contextCheck.availableTokens,
+    messages: effectiveMessages,
+    contextCheck: effectiveContextCheck,
+    availableTokens: effectiveContextCheck.availableTokens,
   };
 }
 

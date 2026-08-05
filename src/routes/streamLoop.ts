@@ -1,5 +1,6 @@
 ﻿import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
+import { dumpUpstreamDiagnostics } from '../services/networkDebug.ts';
 import { setAccountDisabled } from '../services/accountManager.ts';
 import { parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
@@ -227,15 +228,32 @@ export async function handlePostStreamCompletion(
     }
 
     // Count tool calls from the final assembled content
-    const finalToolCalls = streamState.lastFullContent ? parseXmlToolCalls(streamState.lastFullContent).toolCalls.length : 0;
-    const effectiveToolCallCount = Math.max(emittedToolCallCount, finalToolCalls);
+    const parsedFinalToolCalls = streamState.lastFullContent
+      ? parseXmlToolCalls(streamState.lastFullContent).toolCalls
+      : [];
+    const canonicalJson = (value: unknown): string => {
+      if (value === null || typeof value !== 'object') return JSON.stringify(value);
+      if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+    };
+    const flushOccurrences = new Map<string, number>();
+    const flushToolCalls = parsedFinalToolCalls.filter((tc) => {
+      const baseKey = `${tc.name}:${canonicalJson(tc.parameters)}`;
+      const occurrence = flushOccurrences.get(baseKey) || 0;
+      flushOccurrences.set(baseKey, occurrence + 1);
+      return !streamState.loggedToolCalls.has(`${baseKey}:${occurrence}`);
+    });
+    const effectiveToolCallCount = emittedToolCallCount + flushToolCalls.length;
 
     // Populate parsedToolCalls from full accumulated content (per-chunk extraction
     // never sees complete blocks since individual SSE deltas are too small).
-    if (streamState.lastFullContent && effectiveToolCallCount > emittedToolCallCount) {
-      const parsed = parseXmlToolCalls(streamState.lastFullContent).toolCalls;
-      // Avoid double-counting: only add tool calls that weren't already emitted
-      for (const tc of parsed.slice(emittedToolCallCount)) {
+    if (parsedFinalToolCalls.length > 0) {
+      // local_mcp and XML calls can be interleaved. Slicing by count assumes
+      // both formats have the same order and drops valid XML calls whenever a
+      // local_mcp call was emitted first. Match by name + canonical arguments.
+      // Avoid double-counting calls already emitted from the per-chunk path.
+      for (const tc of flushToolCalls) {
         logStore.updateEntry(logId, (entry) => {
           entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.parameters) });
         });
@@ -244,7 +262,6 @@ export async function handlePostStreamCompletion(
       // from the pendingChunk buffer) as SSE events. Without this the client sees
       // finish_reason:"tool_calls" but never receives a tool_calls chunk, so the
       // turn dead-ends. Mirror the per-chunk path: align args + writeToolCallEvent.
-      const flushToolCalls = parsed.slice(emittedToolCallCount);
       for (let i = 0; i < flushToolCalls.length; i++) {
         const parsedCall = xmlToolCallToParsed(flushToolCalls[i], emittedToolCallCount + i);
         parsedCall.arguments = alignArgsToSchema(parsedCall.name, parsedCall.arguments, args.tools);
@@ -309,6 +326,16 @@ export async function handlePostStreamCompletion(
     ) {
       const emptyMsg = 'Upstream returned an empty answer (no content, no tool calls)';
       logStore.log('warn', 'stream', `[Qwen] ${emptyMsg} (logId=${logId})`);
+      // Diagnostic: snapshot recent upstream network entries + buffer so a
+      // 200-empty vs mid-stream-drop vs no-connection case can be told apart.
+      dumpUpstreamDiagnostics({
+        logId,
+        accountEmail: resolvedEmail,
+        model,
+        stream: true,
+        trigger: 'stream_empty',
+        bufferSnippet: buffer,
+      });
       await writeSseErrorEvent(streamWriter, { message: emptyMsg, code: 'upstream_empty' });
       await streamWriter.write('data: [DONE]\n\n');
       logStore.updateEntry(logId, (entry) => {

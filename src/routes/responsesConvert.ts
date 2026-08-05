@@ -27,6 +27,38 @@ function generateId(prefix: string): string {
 
 // ── Request Conversion: Responses → Chat Completions ───────────
 
+function convertResponsesToolChoice(choice: ResponsesRequest['tool_choice']): OpenAIRequest['tool_choice'] {
+  if (!choice) return undefined;
+  if (typeof choice === 'string') return choice;
+  return { type: 'function', function: { name: choice.name } };
+}
+
+function convertResponsesInputItem(item: any): Message | null {
+  if (item.type === 'function_call_output') {
+    return { role: 'tool', content: item.output, tool_call_id: item.call_id };
+  }
+  if (item.type === 'function_call') {
+    return {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: item.call_id || item.id || generateId('call'),
+        type: 'function',
+        function: { name: item.name || '', arguments: item.arguments || '{}' },
+      }],
+    };
+  }
+  const msg = item as { role?: string; content?: string | any[] };
+  if (!msg.role) return null;
+  const content = typeof msg.content === 'string'
+    ? msg.content
+    : (msg.content || [])
+        .filter((p: any) => p.type === 'input_text' || p.type === 'output_text')
+        .map((p: any) => p.text || '')
+        .join('\n');
+  return { role: msg.role, content };
+}
+
 export function convertResponsesRequestToChatCompletions(req: ResponsesRequest): OpenAIRequest {
   const messages = convertInputToMessages(req.input, req.instructions);
   const tools = req.tools ? convertResponsesToolsToOpenAI(req.tools) : undefined;
@@ -36,7 +68,7 @@ export function convertResponsesRequestToChatCompletions(req: ResponsesRequest):
     messages,
     stream: req.stream ?? false,
     tools,
-    tool_choice: req.tool_choice as any,
+    tool_choice: convertResponsesToolChoice(req.tool_choice),
     stream_options: req.stream ? { include_usage: true } : undefined,
   };
   return chatReq;
@@ -55,25 +87,8 @@ function convertInputToMessages(input: string | ResponsesInputItem[], instructio
   }
 
   for (const item of input) {
-    if (item.type === 'function_call_output') {
-      messages.push({
-        role: 'tool',
-        content: item.output,
-        tool_call_id: item.call_id,
-      });
-    } else {
-      // Message item
-      const msg = item as { role: string; content: string | any[] };
-      const content = typeof msg.content === 'string'
-        ? msg.content
-        : (msg.content as any[])
-            .filter((p: any) => p.type === 'input_text' || p.type === 'output_text')
-            .map((p: any) => p.text || '')
-            .join('\n');
-      // Map 'developer' → 'system'
-      const role = msg.role === 'developer' ? 'system' : msg.role;
-      messages.push({ role, content });
-    }
+    const message = convertResponsesInputItem(item);
+    if (message) messages.push(message);
   }
   return messages;
 }
@@ -151,10 +166,15 @@ export class ResponsesStreamConverter {
   private model: string;
   private messageId: string;
   private hasStartedMessage = false;
+  private hasStartedResponse = false;
   private hasStartedContent = false;
   private accumulatedContent = '';
-  private toolCallBuffers: Map<number, { id: string; callId: string; name: string; argsBuffer: string }> = new Map();
+  private messageOutputIndex: number | null = null;
+  private nextOutputIndex = 0;
+  private toolCallBuffers: Map<string, { id: string; callId: string; name: string; argsBuffer: string; outputIndex: number }> = new Map();
+  private nextFallbackToolKey = 0;
   private createdAt: number;
+  private finalized = false;
 
   constructor(model: string) {
     this.responseId = generateId('resp');
@@ -168,12 +188,18 @@ export class ResponsesStreamConverter {
   }
 
   processChunk(chunk: any): ResponsesStreamEvent[] {
+    if (this.finalized) return [];
     const events: ResponsesStreamEvent[] = [];
     const choice = chunk.choices?.[0];
     const delta = choice?.delta;
 
-    // First chunk with content: emit response.created + output_item.added
-    if (!this.hasStartedMessage && (delta?.content || delta?.tool_calls)) {
+    const hasText = !!delta?.content;
+    const hasTools = Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0;
+
+    // Start the response once, then create only the output item represented by
+    // this first chunk. A tool-only response must not contain an empty message
+    // item before its function_call items.
+    if (!this.hasStartedResponse && (hasText || hasTools)) {
       events.push({
         type: 'response.created',
         response: {
@@ -186,9 +212,13 @@ export class ResponsesStreamConverter {
           usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
         },
       });
+      this.hasStartedResponse = true;
+    }
+    if (hasText && !this.hasStartedMessage) {
+      this.messageOutputIndex = this.nextOutputIndex++;
       events.push({
         type: 'response.output_item.added',
-        output_index: 0,
+        output_index: this.messageOutputIndex,
         item: {
           type: 'message',
           id: this.messageId,
@@ -206,7 +236,7 @@ export class ResponsesStreamConverter {
         events.push({
           type: 'response.content_part.added',
           item_id: this.messageId,
-          output_index: 0,
+          output_index: this.messageOutputIndex!,
           content_index: 0,
           part: { type: 'output_text', text: '', annotations: [] },
         });
@@ -215,46 +245,52 @@ export class ResponsesStreamConverter {
       events.push({
         type: 'response.content_part.delta',
         item_id: this.messageId,
-        output_index: 0,
+        output_index: this.messageOutputIndex!,
         content_index: 0,
         delta: { type: 'text_delta', text: delta.content },
       });
       this.accumulatedContent += delta.content;
     }
 
-    // Tool calls delta
+    // Tool calls delta. Each output item receives a stable index on first appearance.
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         const idx = tc.index;
-        if (!this.toolCallBuffers.has(idx)) {
+        const toolKey = idx !== undefined && idx !== null
+          ? `index:${idx}`
+          : tc.id
+            ? `id:${tc.id}`
+            : `fallback:${this.nextFallbackToolKey++}`;
+        if (!this.toolCallBuffers.has(toolKey)) {
           const tcId = tc.id || generateId('call');
-          this.toolCallBuffers.set(idx, {
+          this.toolCallBuffers.set(toolKey, {
             id: generateId('fc'),
             callId: tcId,
             name: tc.function?.name || '',
             argsBuffer: '',
+            outputIndex: this.nextOutputIndex++,
           });
           events.push({
             type: 'response.output_item.added',
-            output_index: 1 + idx,
+            output_index: this.toolCallBuffers.get(toolKey)!.outputIndex,
             item: {
               type: 'function_call',
-              id: this.toolCallBuffers.get(idx)!.id,
+              id: this.toolCallBuffers.get(toolKey)!.id,
               call_id: tcId,
               name: tc.function?.name || '',
               arguments: '{}',
-              status: 'completed',
+              status: 'in_progress',
             } as ResponsesOutputFunctionCall,
           });
         }
-        const buf = this.toolCallBuffers.get(idx)!;
+        const buf = this.toolCallBuffers.get(toolKey)!;
         if (tc.function?.name) buf.name = tc.function.name;
         if (tc.function?.arguments) {
           buf.argsBuffer += tc.function.arguments;
           events.push({
             type: 'response.function_call_arguments.delta',
             item_id: buf.id,
-            output_index: 1 + idx,
+            output_index: buf.outputIndex,
             delta: tc.function.arguments,
           });
         }
@@ -269,14 +305,39 @@ export class ResponsesStreamConverter {
     return events;
   }
 
+  finish(usage?: any): ResponsesStreamEvent[] {
+    return this.finalize(usage);
+  }
+
   private finalize(usage?: any): ResponsesStreamEvent[] {
+    if (this.finalized) return [];
+    this.finalized = true;
     const events: ResponsesStreamEvent[] = [];
+
+    // A provider may terminate without sending any content or tool delta. Emit
+    // the lifecycle opening before the terminal event so the Responses stream
+    // remains valid even for an empty response.
+    if (!this.hasStartedResponse) {
+      events.push({
+        type: 'response.created',
+        response: {
+          id: this.responseId,
+          object: 'response',
+          created_at: this.createdAt,
+          status: 'in_progress',
+          model: this.model,
+          output: [],
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        },
+      });
+      this.hasStartedResponse = true;
+    }
 
     if (this.hasStartedContent) {
       events.push({
         type: 'response.content_part.done',
         item_id: this.messageId,
-        output_index: 0,
+        output_index: this.messageOutputIndex!,
         content_index: 0,
         part: { type: 'output_text', text: this.accumulatedContent, annotations: [] },
       });
@@ -285,7 +346,7 @@ export class ResponsesStreamConverter {
     if (this.hasStartedMessage) {
       events.push({
         type: 'response.output_item.done',
-        output_index: 0,
+        output_index: this.messageOutputIndex!,
         item: {
           type: 'message',
           id: this.messageId,
@@ -297,16 +358,16 @@ export class ResponsesStreamConverter {
     }
 
     // Close tool call items
-    for (const [idx, buf] of this.toolCallBuffers) {
+    for (const [, buf] of this.toolCallBuffers) {
       events.push({
         type: 'response.function_call_arguments.done',
         item_id: buf.id,
-        output_index: 1 + idx,
+        output_index: buf.outputIndex,
         arguments: buf.argsBuffer,
       });
       events.push({
         type: 'response.output_item.done',
-        output_index: 1 + idx,
+        output_index: buf.outputIndex,
         item: {
           type: 'function_call',
           id: buf.id,
@@ -318,27 +379,34 @@ export class ResponsesStreamConverter {
       });
     }
 
-    // Build final output for response.completed
-    const output: ResponsesOutputItem[] = [];
+    // Build final output for response.completed in the same order as output indexes.
+    const outputByIndex: Array<{ index: number; item: ResponsesOutputItem }> = [];
     if (this.hasStartedMessage) {
-      output.push({
-        type: 'message',
-        id: this.messageId,
-        role: 'assistant',
-        content: [{ type: 'output_text', text: this.accumulatedContent, annotations: [] }],
-        status: 'completed',
+      outputByIndex.push({
+        index: this.messageOutputIndex!,
+        item: {
+          type: 'message',
+          id: this.messageId,
+          role: 'assistant',
+          content: [{ type: 'output_text', text: this.accumulatedContent, annotations: [] }],
+          status: 'completed',
+        } as ResponsesOutputMessage,
       });
     }
     for (const [, buf] of this.toolCallBuffers) {
-      output.push({
-        type: 'function_call',
-        id: buf.id,
-        call_id: buf.callId,
-        name: buf.name,
-        arguments: buf.argsBuffer,
-        status: 'completed',
+      outputByIndex.push({
+        index: buf.outputIndex,
+        item: {
+          type: 'function_call',
+          id: buf.id,
+          call_id: buf.callId,
+          name: buf.name,
+          arguments: buf.argsBuffer,
+          status: 'completed',
+        } as ResponsesOutputFunctionCall,
       });
     }
+    const output = outputByIndex.sort((a, b) => a.index - b.index).map(({ item }) => item);
 
     const responsesUsage: ResponsesUsage = {
       input_tokens: usage?.prompt_tokens ?? 0,

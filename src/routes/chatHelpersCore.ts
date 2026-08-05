@@ -228,6 +228,19 @@ export function parseQwenErrorPayload(
   if (text === '[DONE]' || text.startsWith(':')) return null;
   try {
     const payload = JSON.parse(text);
+    // Alibaba WAF CAPTCHA punishment — returned as HTTP 200 with an SSE line
+    // shaped {ret:["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::..."], data:{url:...}}.
+    // Previously this fell through to the empty-response guard (502 "empty response"),
+    // hiding the real cause. Surface it as an explicit upstream error instead.
+    if (Array.isArray(payload?.ret) && payload.ret[0] === 'FAIL_SYS_USER_VALIDATE') {
+      const detail = payload.ret[1] || 'RGV587 captcha required';
+      return {
+        message: `Qwen CAPTCHA required (WAF anti-bot): ${detail}`,
+        status: 502,
+        code: 'waf_captcha',
+        upstreamCode: 'FAIL_SYS_USER_VALIDATE',
+      };
+    }
     if (payload && payload.success === false) {
       const code = payload.data?.code || payload.code || 'UpstreamError';
       const details = payload.data?.details || payload.message || 'Qwen returned an error';

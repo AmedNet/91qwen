@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import { mkdirSync, readdirSync, unlinkSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
 export interface NetworkDebugEntry {
   id: string;
@@ -220,6 +222,77 @@ export function getRecentNetworkEntries(count: number = 50): NetworkDebugEntry[]
 
 export function getNetworkEntry(id: string): NetworkDebugEntry | undefined {
   return entryIndex.get(id);
+}
+
+/**
+ * Persist a snapshot of the recent network-debug buffer alongside the request
+ * context that triggered a guard (e.g. the empty-response guard) so the failure
+ * scene survives restarts and the in-memory ring buffer. Diagnostic only — never
+ * called on the success path and never throws into the request flow.
+ */
+export function dumpUpstreamDiagnostics(ctx: {
+  logId: string;
+  accountEmail?: string;
+  model?: string;
+  stream?: boolean;
+  trigger?: string;
+  bufferSnippet?: string;
+}): void {
+  try {
+    const recent = getRecentNetworkEntries(30).map((entry) => ({
+      id: entry.id,
+      timestamp: entry.timestamp,
+      phase: entry.phase,
+      category: entry.category,
+      accountEmail: entry.accountEmail,
+      status: entry.response.status,
+      statusText: entry.response.statusText,
+      ttfb: entry.timing.ttfb,
+      totalDuration: entry.timing.totalDuration,
+      totalChunks: entry.stream.totalChunks,
+      firstChunkAt: entry.stream.firstChunkAt,
+      lastChunkAt: entry.stream.lastChunkAt,
+      errors: entry.errors,
+      chunkPreviews: entry.stream.chunks.slice(0, 5).map((c) => c.slice(0, 300)),
+    }));
+
+    const dir = join(process.cwd(), '.qwen', 'diag');
+    mkdirSync(dir, { recursive: true });
+    const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}_${(ctx.logId || 'unknown').slice(0, 8)}.json`;
+    const filePath = join(dir, fileName);
+    writeFileSync(
+      filePath,
+      JSON.stringify(
+        {
+          dumpedAt: new Date().toISOString(),
+          logId: ctx.logId,
+          account: ctx.accountEmail,
+          model: ctx.model,
+          stream: ctx.stream,
+          trigger: ctx.trigger,
+          bufferSnippet: (ctx.bufferSnippet || '').slice(0, 2000),
+          networkEntries: recent,
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    // Cap diagnostic files — keep the newest 40, drop the rest.
+    try {
+      const files = readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
+      if (files.length > 40) {
+        for (const f of files.slice(0, files.length - 40)) {
+          unlinkSync(join(dir, f));
+        }
+      }
+    } catch {
+      /* cleanup is best-effort */
+    }
+  } catch (err) {
+    console.error('[NetworkDebug] dumpUpstreamDiagnostics failed (ignored):', (err as Error)?.message);
+  }
 }
 
 export function subscribeNetwork(listener: (entry: NetworkDebugEntry) => void): () => void {

@@ -15,6 +15,35 @@ import {
 } from './responsesConvert.ts';
 import { chatCompletions } from './chat.ts';
 
+const RESPONSE_HISTORY_TTL_MS = 30 * 60 * 1000;
+const MAX_RESPONSE_HISTORY = 256;
+const responseHistory = new Map<string, { response: any; expiresAt: number }>();
+
+function saveResponse(response: any): void {
+  responseHistory.set(response.id, { response, expiresAt: Date.now() + RESPONSE_HISTORY_TTL_MS });
+  while (responseHistory.size > MAX_RESPONSE_HISTORY) {
+    const oldest = responseHistory.keys().next().value;
+    if (oldest) responseHistory.delete(oldest);
+  }
+}
+
+function getResponse(id: string): any | null {
+  const entry = responseHistory.get(id);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    responseHistory.delete(id);
+    return null;
+  }
+  return entry.response;
+}
+
+function historyAsInput(response: any): any[] {
+  return (response.output || []).map((item: any) => {
+    if (item.type === 'function_call') return { type: 'function_call', call_id: item.call_id, name: item.name, arguments: item.arguments };
+    if (item.type === 'message') return { type: 'message', role: 'assistant', content: item.content || [] };
+    return item;
+  });
+}
+
 /**
  * POST /v1/responses — main handler.
  * Strategy: convert to Chat Completions, delegate to chatCompletions(), convert response back.
@@ -49,6 +78,13 @@ export async function responsesCreate(c: Context): Promise<Response> {
 
   const originalModel = body.model;
   const resolvedModel = mapCodexModel(body.model);
+  if (body.previous_response_id) {
+    const previous = getResponse(body.previous_response_id);
+    if (!previous) {
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', code: 'invalid_previous_response_id', message: `Unknown or expired previous_response_id: ${body.previous_response_id}`, param: 'previous_response_id' } }, 400);
+    }
+    if (Array.isArray(body.input)) body.input = [...historyAsInput(previous), ...body.input] as any;
+  }
   body.model = resolvedModel;
 
   logStore.log('info', 'http', `[Responses] ${logId} ENTER model=${originalModel}→${resolvedModel} stream=${body.stream ?? false}`);
@@ -120,6 +156,30 @@ async function handleStreamingResponses(
         const reader = chatResponse.body.getReader();
         let buffer = '';
 
+        let sawDone = false;
+        const processLine = (line: string): boolean => {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) return false;
+          const data = trimmed.slice(6);
+          if (data === '[DONE]') {
+            sawDone = true;
+            return true;
+          }
+          try {
+            const chunk = JSON.parse(data);
+            if (chunk.error) {
+              const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
+              logStore.log('warn', 'http', `[Responses] ${logId} Upstream SSE error: ${errMsg}`);
+              sendEvent({ type: 'error', message: errMsg, code: chunk.error?.code || 'upstream_error' });
+              return true;
+            }
+            for (const evt of converter.processChunk(chunk)) sendEvent(evt);
+          } catch {
+            // Skip unparseable chunks
+          }
+          return false;
+        };
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -127,37 +187,18 @@ async function handleStreamingResponses(
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
-
           for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith('data: ')) continue;
-            const data = trimmed.slice(6);
-            if (data === '[DONE]') continue;
-
-            try {
-              const chunk = JSON.parse(data);
-              // Upstream SSE error (`data: {"error": {...}}`) — convert to a
-              // Responses error event and terminate so the client retries.
-              if (chunk.error) {
-                const errMsg =
-                  typeof chunk.error === 'string'
-                    ? chunk.error
-                    : chunk.error.message || JSON.stringify(chunk.error);
-                logStore.log('warn', 'http', `[Responses] ${logId} Upstream SSE error: ${errMsg}`);
-                sendEvent({ type: 'error', message: errMsg, code: chunk.error?.code || 'upstream_error' });
-                controller.close();
-                return;
-              }
-              const events = converter.processChunk(chunk);
-              for (const evt of events) {
-                sendEvent(evt);
-              }
-            } catch {
-              // Skip unparseable chunks
-            }
+            if (processLine(line)) break;
           }
+          if (sawDone) break;
         }
 
+        buffer += decoder.decode();
+        if (!sawDone && buffer.trim()) processLine(buffer);
+        const finalEvents = converter.finish();
+        for (const evt of finalEvents) sendEvent(evt);
+        const completedEvent = finalEvents.find((evt) => evt.type === 'response.completed');
+        if (completedEvent?.type === 'response.completed') saveResponse(completedEvent.response);
         controller.close();
         logStore.log('info', 'http', `[Responses] ${logId} STREAM DONE duration=${Date.now() - startMs}ms`);
       } catch (err: any) {
@@ -216,6 +257,7 @@ async function handleNonStreamingResponses(
     }
 
     const responsesResponse = convertChatCompletionToResponsesResponse(chatBody, originalModel);
+    saveResponse(responsesResponse);
     logStore.log('info', 'http', `[Responses] ${logId} DONE duration=${Date.now() - startMs}ms`);
     return c.json(responsesResponse);
   } catch (err: any) {
@@ -233,15 +275,8 @@ async function handleNonStreamingResponses(
  */
 export async function responsesGet(c: Context): Promise<Response> {
   const id = c.req.param('id');
-  return c.json({
-    id,
-    object: 'response',
-    created_at: Math.floor(Date.now() / 1000),
-    status: 'completed',
-    model: 'unknown',
-    output: [],
-    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-    error: null,
-    incomplete_details: null,
-  });
+  if (!id) return c.json({ type: 'error', error: { type: 'invalid_request_error', code: 'invalid_request_error', message: 'Missing response id', param: null } }, 400);
+  const previous = getResponse(id);
+  if (previous) return c.json(previous);
+  return c.json({ type: 'error', error: { type: 'invalid_request_error', code: 'response_not_found', message: `Response not found or expired: ${id}`, param: null } }, 404);
 }

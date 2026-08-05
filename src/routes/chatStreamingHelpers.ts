@@ -1,5 +1,5 @@
 import { logStore } from '../services/logStore.ts';
-import { setAccountDisabled } from '../services/accountManager.ts';
+import { setAccountDisabled, throttleAccount } from '../services/accountManager.ts';
 import { logQwenSSE } from '../services/qwenLogger.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, alignArgsToSchema, CANONICAL_PARAM_NAMES, camelToSnake, PARAM_NAME_FIXUPS as XML_PARAM_NAME_FIXUPS } from '../tools/xmlToolParser.ts';
 import type { ParsedToolCall } from '../types/openai.ts';
@@ -333,6 +333,29 @@ export function filterContentPipeline(
 export async function processStreamData(data: any, state: StreamProcessingState, ctx: StreamProcessingCtx): Promise<ProcessStreamResult> {
   const { streamWriter, completionId, model, enableContentFiltering, logId, resolvedEmail, ampState } = ctx;
 
+  // Alibaba WAF CAPTCHA punishment — HTTP 200 SSE line shaped
+  // {ret:["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::..."], data:{url:...}}.
+  // Must be checked BEFORE the generic data.error branch (it has no .error).
+  // Surfaces a real error event instead of the empty-stream guard (502).
+  if (Array.isArray(data?.ret) && data.ret[0] === 'FAIL_SYS_USER_VALIDATE') {
+    const detail = data.ret[1] || 'RGV587 captcha required';
+    logStore.addError(logId, `Qwen WAF CAPTCHA (FAIL_SYS_USER_VALIDATE): ${detail}`);
+    logStore.log('warn', 'qwen', `[Qwen] WAF CAPTCHA for ${resolvedEmail || '?'}: ${detail} (logId=${logId})`);
+    // CAPTCHA is transient (WAF anti-bot), not a permanent account failure —
+    // throttle so the account can recover, matching qwen.ts's CAPTCHA handling.
+    if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+    logStore.updateEntry(logId, (entry) => {
+      entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+      entry.finalResponse.finishReason = 'error';
+    });
+    ctx.streamError = {
+      message: `Qwen CAPTCHA required (WAF anti-bot): ${detail}`,
+      code: 'waf_captcha',
+      upstreamCode: 'FAIL_SYS_USER_VALIDATE',
+    };
+    return 'break_stream';
+  }
+
   // Check for upstream Qwen error sent as SSE data chunk
   if (data.error) {
     const errMsg = typeof data.error === 'string' ? data.error : data.error.message || JSON.stringify(data.error);
@@ -607,8 +630,15 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   const newToolCallContent = state.lastFullContent;
   const { toolCalls: xmlToolCalls } = parseXmlToolCalls(newToolCallContent);
   if (xmlToolCalls.length > 0) {
+    const occurrences = new Map<string, number>();
     const newToolCalls = xmlToolCalls.filter((tc) => {
-      const key = `${tc.name}:${canonicalJson(tc.parameters)}`;
+      const baseKey = `${tc.name}:${canonicalJson(tc.parameters)}`;
+      const occurrence = occurrences.get(baseKey) || 0;
+      occurrences.set(baseKey, occurrence + 1);
+      // Include the occurrence number: two identical calls in one response are
+      // distinct model actions, while re-parsing the same cumulative text keeps
+      // the same ordinal and is safely ignored.
+      const key = `${baseKey}:${occurrence}`;
       if (state.loggedToolCalls.has(key)) return false;
       state.loggedToolCalls.add(key);
       return true;

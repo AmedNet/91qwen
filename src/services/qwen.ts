@@ -277,6 +277,9 @@ export async function createQwenStream(
   const retriesEnabled = config.getBool('RETRY_ENABLED', true);
   let currentAccountEmail = accountEmail;
   let lastDebugEntryId: string | null = null;
+  // Most recent attempt's network-debug entry. On a retry, the previous attempt's
+  // entry is closed out as superseded so the buffer doesn't fill with dangling pending entries.
+  let currentDebugEntryId: string | null = null;
   const streamAbortController = new AbortController();
 
   async function handleErrorResponse(response: Response, debugEntryId: string): Promise<never> {
@@ -438,6 +441,29 @@ export async function createQwenStream(
       makeRequestQwenLogFile = logQwenRequest(payload, url);
     }
 
+    // Wire up the network-debug ring buffer (surfaced at /debug/network) so we
+    // can see the upstream HTTP status + chunk stats for any failure, including
+    // empty responses. Diagnostic only — a throw here must not break the request.
+    try {
+      if (currentDebugEntryId) errorEntry(currentDebugEntryId, 'superseded by retry');
+      currentDebugEntryId = createNetworkEntry({
+        url,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie: 'token=<redacted>', // redacted by networkDebug; actual token never needed for diagnosis
+        },
+        body: payload,
+        category: 'chat',
+        accountEmail: currentAccountEmail,
+      }).id;
+      lastDebugEntryId = currentDebugEntryId;
+    } catch (debugErr) {
+      console.error('[Qwen] networkDebug create failed (ignored):', (debugErr as Error)?.message);
+      currentDebugEntryId = null;
+      lastDebugEntryId = null;
+    }
+
     // Browserless path: impers worker for TLS/HTTP2 impersonation, cookie from account manager
     const tokenInfo = currentAccountEmail ? await getTokenWithAccount(currentAccountEmail) : null;
     const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
@@ -479,8 +505,14 @@ export async function createQwenStream(
     logStore.log(
       'debug',
       'qwen',
-      `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'}`,
+      `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'} debugId=${currentDebugEntryId || 'null'}`,
     );
+    try {
+      if (currentDebugEntryId) recordResponse(currentDebugEntryId, response);
+      else logStore.log('warn', 'qwen', `[Qwen] recordResponse skipped — no debug entry (account=${currentAccountEmail || '?'})`);
+    } catch (debugErr) {
+      console.error('[Qwen] networkDebug recordResponse failed (ignored):', (debugErr as Error)?.message);
+    }
     // ponytail: when Qwen returns a non-2xx status code with a JSON error body
     // (rate limits, chat-in-progress, tool-not-found, etc.), parse the error
     // and throw a typed RetryableQwenStreamError so the retry loop can switch

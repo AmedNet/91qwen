@@ -1,7 +1,8 @@
 ﻿import { Context } from 'hono';
 import { logStore } from '../services/logStore.ts';
+import { dumpUpstreamDiagnostics } from '../services/networkDebug.ts';
 import { sessionPool } from '../services/sessionPool.ts';
-import { setAccountDisabled } from '../services/accountManager.ts';
+import { setAccountDisabled, throttleAccount } from '../services/accountManager.ts';
 import { detectParallelToolLoop } from '../tools/guard.ts';
 import type { Message, OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
@@ -167,6 +168,24 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
     chunk = JSON.parse(dataStr);
   } catch (e) {
     console.error('[Chat] Non-streaming: parse error on chunk, ignoring partial:', (e as Error)?.message);
+    return;
+  }
+
+  // Alibaba WAF CAPTCHA punishment — HTTP 200 SSE line shaped
+  // {ret:["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::..."], data:{url:...}}.
+  // Must be checked BEFORE the generic chunk.error branch (it has no .error).
+  if (Array.isArray(chunk?.ret) && chunk.ret[0] === 'FAIL_SYS_USER_VALIDATE') {
+    const detail = chunk.ret[1] || 'RGV587 captcha required';
+    logStore.addError(ctx.logId, `Qwen WAF CAPTCHA (FAIL_SYS_USER_VALIDATE): ${detail}`);
+    logStore.log('warn', 'qwen', `[Qwen] WAF CAPTCHA for ${ctx.resolvedEmail || '?'}: ${detail} (logId=${ctx.logId})`);
+    // CAPTCHA is transient (WAF anti-bot), not a permanent account failure —
+    // throttle so the account can recover, matching qwen.ts's CAPTCHA handling.
+    if (ctx.resolvedEmail) throttleAccount(ctx.resolvedEmail, 5 * 60 * 1000);
+    state.upstreamError = {
+      message: `Qwen CAPTCHA required (WAF anti-bot): ${detail}`,
+      code: 'waf_captcha',
+      upstreamCode: 'FAIL_SYS_USER_VALIDATE',
+    };
     return;
   }
 
@@ -441,6 +460,16 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
   if (!state.lastFullContent && state.toolCallsOut.length === 0) {
     const emptyMsg = 'Upstream returned an empty response (no content, no tool calls)';
     logStore.log('warn', 'qwen', `[Qwen] ${emptyMsg} (logId=${logId})`);
+    // Diagnostic: snapshot the recent upstream network entries + buffer so a
+    // 200-empty vs mid-stream-drop vs no-connection case can be told apart.
+    dumpUpstreamDiagnostics({
+      logId,
+      accountEmail: resolvedEmail,
+      model: ctx.model,
+      stream: false,
+      trigger: 'nonstream_empty',
+      bufferSnippet: state.buffer,
+    });
     logStore.updateEntry(logId, (entry) => {
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'upstream_empty';
