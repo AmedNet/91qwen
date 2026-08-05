@@ -6,6 +6,7 @@
 
 import { spawn, execFileSync, type ChildProcess } from 'child_process';
 import { existsSync, rmSync } from 'fs';
+import { join } from 'path';
 import WebSocket from 'ws';
 import { logStore } from './logStore.ts';
 import { getProfileDir } from './browserProfiles.ts';
@@ -26,6 +27,25 @@ export interface ScreencastSession {
 const sessions = new Map<string, ScreencastSession>();
 
 function findChromeBinary(): string {
+  // Windows: the Linux candidates below depend on `find` and Unix paths and can't
+  // work here. Edge ships with every Windows install and is Chromium-based, so it
+  // supports the same --headless=new / --remote-debugging-port CDP flags. Probe by
+  // path (existsSync) rather than spawning, so we don't pop a GUI window.
+  if (process.platform === 'win32') {
+    const winCandidates = [
+      join(process.env.PROGRAMFILES || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      join(process.env['PROGRAMFILES(X86)'] || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      join(process.env.PROGRAMFILES || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    ];
+    for (const bin of winCandidates) {
+      if (bin && existsSync(bin)) return bin;
+    }
+    // Same final fallback as the Linux path — spawn() will surface the error if
+    // none of the above matched.
+    return 'chromium-browser';
+  }
+
   const home = process.env.HOME || '/home/youssefsrv';
   const candidates = [
     `${home}/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`,
