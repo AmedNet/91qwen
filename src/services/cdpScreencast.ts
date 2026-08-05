@@ -20,6 +20,9 @@ export interface ScreencastSession {
   viewportWidth: number;
   viewportHeight: number;
   pageId: string | null;
+  /** CDP session id from Target.attachToTarget — page-level methods (Page.*, Input.*,
+   *  Runtime.*) must be sent with this sessionId or CDP rejects them. */
+  pageSessionId: string | null;
   closed: boolean;
   loginCheckInterval: ReturnType<typeof setInterval> | null;
 }
@@ -159,6 +162,7 @@ export async function startScreencast(
     viewportWidth: 1280,
     viewportHeight: 800,
     pageId: null,
+    pageSessionId: null,
     closed: false,
     loginCheckInterval: null,
   };
@@ -241,6 +245,7 @@ async function connectCDP(session: ScreencastSession, wsUrl: string): Promise<vo
           reject(new Error('No session ID from attachToTarget'));
           return;
         }
+        session.pageSessionId = pageSessionId;
         logStore.log('info', 'screencast', `Attached to page, sessionId=${pageSessionId}`);
 
         // Enable needed domains (using page session)
@@ -393,7 +398,12 @@ export function handleInputEvent(
   let msgId = 2000;
 
   function send(method: string, params: any) {
-    cdp.send(JSON.stringify({ id: msgId++, method, params }));
+    // Input.* are page-level methods — they must carry the page sessionId
+    // (from Target.attachToTarget) or CDP rejects them with "cannot find
+    // context". Without this, clicks/keys in the embedded view do nothing.
+    const msg: any = { id: msgId++, method, params };
+    if (session.pageSessionId) msg.sessionId = session.pageSessionId;
+    cdp.send(JSON.stringify(msg));
   }
 
   switch (event.type) {
