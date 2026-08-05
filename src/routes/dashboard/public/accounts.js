@@ -215,7 +215,10 @@ function handleRemove(email) {
   };
 }
 
-/* ── Manual Login (Autofill) ── */
+/* ── Manual Login (Embedded Browser) ── */
+var activeScreencastWs = null;
+var activeScreencastEmail = null;
+
 function handleManualLogin(email) {
   var btn = document.querySelector('button[data-email="' + escHtml(email) + '"][data-action="login"]');
   if (btn) {
@@ -223,28 +226,207 @@ function handleManualLogin(email) {
     btn.disabled = true;
   }
   setError(null);
+
+  /* Fetch password then open embedded browser view */
   (async function () {
     try {
-      var res = await fetch('/api/accounts/' + encodeURIComponent(email) + '/autofill', {
+      var pwRes = await fetch('/api/accounts/' + encodeURIComponent(email) + '/password', {
         method: 'GET',
         headers: authHeaders(),
       });
-      var result;
-      try {
-        result = await res.json();
-      } catch {
-        result = null;
+      var pwData;
+      try { pwData = await pwRes.json(); } catch { pwData = null; }
+      if (!pwRes.ok || !pwData || !pwData.password) {
+        throw new Error(pwData && pwData.error && pwData.error.message ? pwData.error.message : 'Could not retrieve password');
       }
-      if (!res.ok) {
-        throw new Error(result && result.error && result.error.message ? result.error.message : '登录失败 (' + res.status + ')');
-      }
-      showToast('已为 ' + email + ' 打开浏览器。请在浏览器中完成登录。', 'info');
-      pollAuth(email, 30);
+      openBrowserView(email, pwData.password);
     } catch (e) {
       setError(e.message);
       showToast(e.message, 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Login';
+      }
     }
   })();
+}
+
+/* ── Screencast (Embedded Browser View) ── */
+function openBrowserView(email, password) {
+  var overlay = document.getElementById('browserOverlay');
+  var canvas = document.getElementById('browserCanvas');
+  var ctx = canvas.getContext('2d');
+  var loading = document.getElementById('browserLoading');
+  var status = document.getElementById('browserStatus');
+  var title = document.getElementById('browserTitle');
+
+  title.textContent = 'Browser Login — ' + email;
+  status.textContent = 'Connecting...';
+  loading.classList.remove('hidden');
+  overlay.classList.add('open');
+
+  /* Close existing connection */
+  if (activeScreencastWs) {
+    activeScreencastWs.send(JSON.stringify({ type: 'close' }));
+    activeScreencastWs.close();
+    activeScreencastWs = null;
+  }
+
+  /* Step 1: POST to get WebSocket token */
+  fetch('/api/screencast/launch', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+    body: JSON.stringify({ email: email, password: password }),
+  })
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      if (data.error) throw new Error(data.error);
+
+      /* Step 2: Connect WebSocket with token */
+      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      var wsUrl = proto + '//' + location.host + data.wsUrl;
+      var ws = new WebSocket(wsUrl);
+      activeScreencastWs = ws;
+      activeScreencastEmail = email;
+
+      ws.onopen = function () {
+        status.textContent = 'Connected — loading browser...';
+      };
+
+      ws.onmessage = function (evt) {
+        var msg;
+        try { msg = JSON.parse(evt.data); } catch { return; }
+
+        if (msg.type === 'frame') {
+          /* Render JPEG frame on canvas */
+          loading.classList.add('hidden');
+          status.textContent = 'Live — ' + (msg.width || 1280) + 'x' + (msg.height || 800);
+          var img = new Image();
+          img.onload = function () {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+          };
+          img.src = 'data:image/jpeg;base64,' + msg.data;
+        } else if (msg.type === 'login_complete') {
+          status.textContent = 'Login complete!';
+          showToast('Login completed for ' + email, 'success');
+          setTimeout(function () { closeBrowserView(); }, 1500);
+          pollAuth(email, 5);
+          loadAccounts();
+        } else if (msg.type === 'browser_closed') {
+          status.textContent = 'Browser closed';
+          setTimeout(closeBrowserView, 1000);
+        } else if (msg.type === 'session_closed') {
+          status.textContent = 'Session ended';
+          setTimeout(closeBrowserView, 1000);
+        } else if (msg.type === 'error') {
+          status.textContent = 'Error: ' + msg.message;
+          showToast(msg.message, 'error');
+        }
+      };
+
+      ws.onerror = function () {
+        status.textContent = 'Connection error';
+        showToast('WebSocket connection failed', 'error');
+      };
+
+      ws.onclose = function () {
+        if (activeScreencastWs === ws) activeScreencastWs = null;
+      };
+
+      /* Step 3: Wire up canvas input events → send to browser */
+      setupCanvasInput(canvas, ws);
+    })
+    .catch(function (e) {
+      status.textContent = 'Error: ' + e.message;
+      showToast(e.message, 'error');
+    });
+}
+
+function setupCanvasInput(canvas, ws) {
+  function getCanvasCoords(e) {
+    var rect = canvas.getBoundingClientRect();
+    var scaleX = canvas.width / rect.width;
+    var scaleY = canvas.height / rect.height;
+    return {
+      x: Math.round((e.clientX - rect.left) * scaleX),
+      y: Math.round((e.clientY - rect.top) * scaleY),
+    };
+  }
+
+  canvas.addEventListener('click', function (e) {
+    var coords = getCanvasCoords(e);
+    ws.send(JSON.stringify({ type: 'input', event: { type: 'click', x: coords.x, y: coords.y, button: e.button } }));
+  });
+
+  canvas.addEventListener('mousemove', function (e) {
+    var coords = getCanvasCoords(e);
+    ws.send(JSON.stringify({ type: 'input', event: { type: 'mousemove', x: coords.x, y: coords.y } }));
+  });
+
+  canvas.addEventListener('mousedown', function (e) {
+    var coords = getCanvasCoords(e);
+    ws.send(JSON.stringify({ type: 'input', event: { type: 'mousedown', x: coords.x, y: coords.y, button: e.button } }));
+  });
+
+  canvas.addEventListener('mouseup', function (e) {
+    var coords = getCanvasCoords(e);
+    ws.send(JSON.stringify({ type: 'input', event: { type: 'mouseup', x: coords.x, y: coords.y, button: e.button } }));
+  });
+
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var coords = getCanvasCoords(e);
+    ws.send(JSON.stringify({ type: 'input', event: { type: 'scroll', x: coords.x, y: coords.y > 0 ? 1 : -1 } }));
+  }, { passive: false });
+
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  /* Keyboard — focus canvas first, then capture keys */
+  canvas.setAttribute('tabindex', '0');
+  canvas.style.outline = 'none';
+  canvas.focus();
+
+  canvas.addEventListener('keydown', function (e) {
+    e.preventDefault();
+    ws.send(JSON.stringify({
+      type: 'input',
+      event: { type: 'keydown', key: e.key, code: e.code, text: e.key.length === 1 ? e.key : '' },
+    }));
+  });
+
+  canvas.addEventListener('keyup', function (e) {
+    e.preventDefault();
+    ws.send(JSON.stringify({
+      type: 'input',
+      event: { type: 'keyup', key: e.key, code: e.code },
+    }));
+  });
+
+  canvas.addEventListener('keypress', function (e) {
+    e.preventDefault();
+    ws.send(JSON.stringify({
+      type: 'input',
+      event: { type: 'keypress', key: e.key, code: e.code, text: e.key },
+    }));
+  });
+}
+
+function closeBrowserView() {
+  var overlay = document.getElementById('browserOverlay');
+  overlay.classList.remove('open');
+  if (activeScreencastWs) {
+    activeScreencastWs.send(JSON.stringify({ type: 'close' }));
+    activeScreencastWs.close();
+    activeScreencastWs = null;
+  }
+  activeScreencastEmail = null;
+  /* Re-enable login buttons */
+  document.querySelectorAll('button[data-action="login"]').forEach(function (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Login';
+  });
 }
 
 /* ── Poll Auth ── */
@@ -341,6 +523,12 @@ function init() {
   /* Close modal on overlay click */
   document.getElementById('confirmOverlay').addEventListener('click', function (e) {
     if (e.target === this) this.classList.remove('open');
+  });
+
+  /* Close browser view */
+  document.getElementById('browserClose').addEventListener('click', closeBrowserView);
+  document.getElementById('browserOverlay').addEventListener('click', function (e) {
+    if (e.target === this) closeBrowserView();
   });
 }
 

@@ -80,6 +80,24 @@ ${sidebarHtml('accounts')}
 <!-- Toast Container -->
 <div class="toast-container" id="toastContainer"></div>
 
+<!-- Browser View Modal -->
+<div class="modal-overlay" id="browserOverlay">
+  <div class="browser-modal">
+    <div class="browser-header">
+      <span class="browser-title" id="browserTitle">Browser Login</span>
+      <button class="browser-close" id="browserClose">&times;</button>
+    </div>
+    <div class="browser-viewport" id="browserViewport">
+      <canvas id="browserCanvas" width="1280" height="800"></canvas>
+      <div class="browser-loading" id="browserLoading">
+        <div class="spinner"></div>
+        <span>Opening browser...</span>
+      </div>
+    </div>
+    <div class="browser-status" id="browserStatus">Connecting...</div>
+  </div>
+</div>
+
 
   <script src="/dashboard/static/shared.js"></script>
   <script src="/dashboard/static/accounts.js"></script>

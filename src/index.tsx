@@ -17,6 +17,7 @@ import { config, updateClaudeCodeSettings } from './services/configService.ts';
 import { logStore } from './services/logStore.ts';
 import { configureAccount, fetchQwenModels } from './services/qwen.ts';
 import { safeCompare } from './utils/auth.ts';
+import { startScreencast, handleInputEvent, closeScreencast } from './services/cdpScreencast.ts';
 import { isBun } from './utils/env.ts';
 import { projectPath } from './utils/paths.ts';
 
@@ -307,15 +308,83 @@ if (import.meta.main) {
 
   async function startServer() {
     // ── Phase 1: Start HTTP server FIRST so dashboard is live immediately ──
+    // Token-based screencast auth: HTTP POST creates token, WS connects with token
+    const screencastTokens = new Map<string, { email: string; password: string }>();
+
     const createServer = async function (p: number, h: string) {
       if (isBun) {
         const bunServer = Bun.serve({
-          fetch: app.fetch,
+          fetch: (req: any, server: any) => {
+            const url = new URL(req.url);
+            // Intercept WebSocket upgrade for screencast
+            if (url.pathname === '/api/screencast/ws' && req.headers.get('upgrade') === 'websocket') {
+              const token = url.searchParams.get('token') as string;
+              const session = token ? screencastTokens.get(token) : null;
+              if (!session) {
+                return new Response('Invalid or expired token', { status: 401 });
+              }
+              screencastTokens.delete(token);
+              return server.upgrade(req, { data: { email: session.email, password: session.password } });
+            }
+            return app.fetch(req, server);
+          },
           port: p,
           hostname: h,
           idleTimeout: 0,
+          websocket: {
+            open(ws) {
+              const { email, password } = (ws.data as any) || {};
+              if (!email || !password) {
+                ws.close(4001, 'Missing credentials');
+                return;
+              }
+              logStore.log('info', 'screencast', `WS client connected for ${email}`);
+              startScreencast(email, password, ws as any).then((result) => {
+                if ('error' in result) {
+                  ws.send(JSON.stringify({ type: 'error', message: result.error }));
+                  ws.close();
+                }
+              });
+            },
+            message(ws, message) {
+              try {
+                const msg = JSON.parse(typeof message === 'string' ? message : message.toString());
+                if (msg.type === 'input') {
+                  handleInputEvent((ws.data as any)?.email || '', msg.event);
+                } else if (msg.type === 'close') {
+                  closeScreencast((ws.data as any)?.email || '');
+                }
+              } catch {}
+            },
+            close(ws) {
+              logStore.log('info', 'screencast', `WS client disconnected for ${(ws.data as any)?.email || '?'}`);
+            },
+          },
         });
         serverStop = () => bunServer.stop(false);
+
+        // Screencast launch endpoint — creates token, client connects WS with token
+        app.post('/api/screencast/launch', async (c) => {
+          try {
+            const apiKey = config.get('API_KEY');
+            if (apiKey) {
+              const auth = c.req.header('Authorization');
+              if (!auth || !auth.startsWith('Bearer ') || !safeCompare(auth.slice(7), apiKey)) {
+                return c.json({ error: 'Unauthorized' }, 401);
+              }
+            }
+            const body = await c.req.json();
+            const { email, password } = body;
+            if (!email || !password) return c.json({ error: 'email and password required' }, 400);
+            const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+            screencastTokens.set(token, { email, password });
+            // Auto-expire token after 30s
+            setTimeout(() => screencastTokens.delete(token), 30_000);
+            return c.json({ token, wsUrl: `/api/screencast/ws?token=${token}` });
+          } catch {
+            return c.json({ error: 'Invalid request' }, 400);
+          }
+        });
       } else {
         const { serve } = await import('@hono/node-server');
         const nodeServer = serve({

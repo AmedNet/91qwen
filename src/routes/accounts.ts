@@ -177,3 +177,20 @@ accountsRouter.get('/:email/autofill', async (c) => {
     return c.json({ error: { message: 'Auto-fill login failed' } }, 500);
   }
 });
+
+/**
+ * GET /api/accounts/:email/password
+ * Returns the stored password for embedded browser login (screencast).
+ * Protected by API key — internal dashboard use only.
+ */
+accountsRouter.get('/:email/password', async (c) => {
+  try {
+    const email = decodeURIComponent(c.req.param('email'));
+    const account = getAccountByEmail(email);
+    if (!account) return c.json({ error: { message: `Account ${email} not found` } }, 404);
+    if (!account.password) return c.json({ error: { message: 'No password stored' } }, 400);
+    return c.json({ email: account.email, password: account.password });
+  } catch (err: any) {
+    return c.json({ error: { message: 'Failed' } }, 500);
+  }
+});
