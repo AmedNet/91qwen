@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { existsSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { Hono } from 'hono';
 import { bearerAuth } from 'hono/bearer-auth';
 import { cors } from 'hono/cors';
@@ -44,6 +44,22 @@ console.error = (...args: any[]) => {
   const msg = args.map((a: any) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
   logStore.log('error', 'system', msg);
 };
+
+/** Trim old files from diagnostic/log directories so they don't grow unbounded. */
+function trimLogDirs(maxFiles: number) {
+  const dirs = ['.qwen/captures', '.qwen/diag', '.qwen/wreq-debug'];
+  for (const dir of dirs) {
+    try {
+      if (!existsSync(dir)) continue;
+      const files = readdirSync(dir)
+        .map((f) => ({ name: f, mtime: statSync(`${dir}/${f}`).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime);
+      for (let i = maxFiles; i < files.length; i++) {
+        try { unlinkSync(`${dir}/${files[i].name}`); } catch {}
+      }
+    } catch {}
+  }
+}
 
 export const app = new Hono();
 
@@ -447,6 +463,8 @@ if (import.meta.main) {
       logStore.log('info', 'server', `Opening dashboard at ${url}`);
     }
     startAutoCleanup();
+    trimLogDirs(50);
+    setInterval(() => trimLogDirs(50), 24 * 60 * 60 * 1000).unref();
 
     logStore.log('info', 'boot', 'Dashboard live — starting background initialization...');
 
