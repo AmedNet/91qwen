@@ -23,6 +23,7 @@ function functionNameFromTag(tag: string): string | null {
 
 export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[]; cleanedText: string } {
   const toolCalls: ParsedXmlToolCall[] = [];
+  const unique = new Set<string>();
   let cleanedText = text;
 
   // Fast path: skip the expensive regex exec loop when there's no tool call content
@@ -38,6 +39,9 @@ export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[
   let match: RegExpExecArray | null;
 
   while ((match = re.exec(text)) !== null) {
+    if (unique.has(match[0])) continue;
+    unique.add(match[0]);
+
     const name = functionNameFromTag(match[0]);
     if (!name) continue;
 

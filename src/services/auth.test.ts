@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 
+// Test isolation: saveCookies below triggers saveAccountsToFile, which would
+// overwrite the real .qwen/accounts.json with the test-only account array.
+// Must be set BEFORE importing accountManager/auth so the guard is active.
+process.env.TEST_MOCK_PLAYWRIGHT = 'true';
+
 import { accounts } from './accountManager.ts';
 import {
   decrementInFlight,

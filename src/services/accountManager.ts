@@ -4,7 +4,7 @@
  * Handles account CRUD, discovery, persistence, and the account file watcher.
  */
 import crypto from 'crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from 'fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { AccountEntry } from '../types/auth.ts';
@@ -222,9 +222,19 @@ export function rebuildEmailIndex(): void {
 }
 
 export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
+  // Test isolation: auth.test.ts's saveCookies test would otherwise overwrite
+  // the real .qwen/accounts.json with the in-memory (test-only) account array,
+  // silently destroying all real accounts. Never persist under the test flag.
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
   const dir = path.dirname(ACCOUNTS_FILE);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
+  }
+  // Safety: keep a rolling backup so a bug that wipes accounts is recoverable.
+  // The backup is written BEFORE the real file so the old data is always preserved.
+  if (existsSync(ACCOUNTS_FILE)) {
+    const backupFile = ACCOUNTS_FILE + '.bak';
+    try { copyFileSync(ACCOUNTS_FILE, backupFile); } catch {}
   }
   const data: PersistedAccountData[] = accounts
     .filter((a) => a.password)
@@ -241,6 +251,8 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
 }
 export function loadAccountsFromFile(): Array<LoadedAccount> {
+  // Test isolation — don't read (or create) the real accounts file under test.
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return [];
   const tryLoad = (filePath: string): Array<LoadedAccount> | null => {
     try {
       if (!existsSync(filePath)) return null;
@@ -679,15 +691,12 @@ export async function getTokenWithAccount(email?: string): Promise<{ token: stri
   }
   acct.lastUsed = Date.now();
   if (picked) decrementInFlight(acct.email);
-  // Build the full request cookie: fresh JWT first, then the baxia/WAF profile cookies
-  // (cna, ssxmod_itna, tfstk, isg, ...) with any stale token= stripped to avoid duplicates.
-  // Sending only token= (the old behavior) makes every API request WAF-cold -> captcha.
-  const profile = acct.profileCookies
-    ? acct.profileCookies
-        .replace(/\btoken=[^;]+;?\s*/g, '')
-        .replace(/;+$/, '')
-        .trim()
-    : '';
-  const cookie = profile ? `token=${acct.state.token}; ${profile}` : `token=${acct.state.token}`;
+  // API (wreq) requests carry ONLY the JWT — matching upstream. The baxia/WAF
+  // tracking cookies (cna, ssxmod_itna, tfstk, isg, ...) encode a real-browser
+  // device fingerprint; sending them over wreq's TLS/HTTP2-impersonated socket
+  // (different fingerprint) makes Alibaba WAF flag the session as hijacked and
+  // answer RGV587 "被挤爆". profileCookies are still used by the browser login
+  // path (getCookies/getBasicHeaders) where the device fingerprint matches.
+  const cookie = `token=${acct.state.token}`;
   return { token: acct.state.token, email: acct.email, cookie };
 }

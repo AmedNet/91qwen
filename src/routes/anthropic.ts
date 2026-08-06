@@ -182,7 +182,12 @@ async function setupAnthropicSession(
         const file = await uploadLargeTextAsFile(accountEmail, parts.join('\n\n'), 'context.txt');
         processedMessages[0] = { ...processedMessages[0], files: [...(processedMessages[0].files || []), file] };
       } catch (err: any) {
-        logStore.log('debug', 'chat', '[Anthropic] Failed to upload context file: ' + (err.message || err));
+        // Matching upstream: never fall back to inline — oversized user
+        // messages get bot-detected. Retry on the next account.
+        lastFailedEmail = accountEmail;
+        lastError = err;
+        logStore.log('warn', 'chat', `[Anthropic] Context file upload failed for ${accountEmail}: ${err.message || err}`);
+        continue;
       }
     }
 

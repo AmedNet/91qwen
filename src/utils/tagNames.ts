@@ -29,5 +29,14 @@ export const THINK_TAG_NAMES = ['think', 'thinking', 'thought'] as const;
 /** Known XML tag names for tool result blocks (legacy format). */
 export const TOOL_RESULT_KEYWORDS = ['tool_result', 'tool-result'] as const;
 
-/** Every known tool-related XML tag name (all Qwen API versions). */
-export const ALL_TOOL_KEYWORDS = [...TOOL_CALL_KEYWORDS, ...TOOL_RESULT_KEYWORDS, 'tool_call', 'tool_use'] as const;
+/**
+ * Known XML tag names that the model may accidentally leak from the system prompt.
+ * These are Anthropic/Claude Code format tags that the model sometimes mimics
+ * despite being instructed to use the Qwen xml_prompt format. These tags should
+ * be STRIPPED during content filtering but NOT matched by the tool call parser
+ * (parseXmlToolCalls only handles Qwen <function=NAME> format).
+ */
+export const LEAKED_TAG_KEYWORDS = ['tool_call', 'tool_use'] as const;
+
+/** Every known tool-related XML tag name (all Qwen API versions + Anthropic leaks). */
+export const ALL_TOOL_KEYWORDS = [...TOOL_CALL_KEYWORDS, ...TOOL_RESULT_KEYWORDS, ...LEAKED_TAG_KEYWORDS] as const;

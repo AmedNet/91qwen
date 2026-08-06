@@ -1,7 +1,6 @@
 ﻿import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
-import { dumpUpstreamDiagnostics } from '../services/networkDebug.ts';
-import { setAccountDisabled } from '../services/accountManager.ts';
+import { setAccountDisabled, throttleAccount } from '../services/accountManager.ts';
 import { parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
 import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
@@ -79,7 +78,28 @@ export async function runStreamLoop(
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
+      if (!trimmed) continue;
+
+      // Qwen WAF returns plain JSON (no SSE prefix) when it intercepts before
+      // streaming begins — e.g. FAIL_SYS_USER_VALIDATE. Detect it here.
+      if (!trimmed.startsWith('data: ')) {
+        let wafChunk: any;
+        try { wafChunk = JSON.parse(trimmed); } catch { continue; }
+        if (Array.isArray(wafChunk?.ret) && wafChunk.ret[0] === 'FAIL_SYS_USER_VALIDATE') {
+          const detail = wafChunk.ret[1] || 'RGV587 captcha required';
+          logStore.addError(streamCtx.logId, `Qwen WAF CAPTCHA (FAIL_SYS_USER_VALIDATE): ${detail}`);
+          logStore.log('warn', 'qwen', `[Qwen] WAF CAPTCHA for ${streamCtx.resolvedEmail || '?'}: ${detail}`);
+          if (streamCtx.resolvedEmail) throttleAccount(streamCtx.resolvedEmail, 5 * 60 * 1000);
+          streamCtx.streamError = {
+            message: `Qwen CAPTCHA required (WAF anti-bot): ${detail}`,
+            code: 'waf_captcha',
+            upstreamCode: 'FAIL_SYS_USER_VALIDATE',
+          };
+          streamDone = true;
+          break;
+        }
+        continue;
+      }
 
       const dataStr = trimmed.slice(6);
       if (dataStr === '[DONE]') {
@@ -228,32 +248,15 @@ export async function handlePostStreamCompletion(
     }
 
     // Count tool calls from the final assembled content
-    const parsedFinalToolCalls = streamState.lastFullContent
-      ? parseXmlToolCalls(streamState.lastFullContent).toolCalls
-      : [];
-    const canonicalJson = (value: unknown): string => {
-      if (value === null || typeof value !== 'object') return JSON.stringify(value);
-      if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-      const record = value as Record<string, unknown>;
-      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
-    };
-    const flushOccurrences = new Map<string, number>();
-    const flushToolCalls = parsedFinalToolCalls.filter((tc) => {
-      const baseKey = `${tc.name}:${canonicalJson(tc.parameters)}`;
-      const occurrence = flushOccurrences.get(baseKey) || 0;
-      flushOccurrences.set(baseKey, occurrence + 1);
-      return !streamState.loggedToolCalls.has(`${baseKey}:${occurrence}`);
-    });
-    const effectiveToolCallCount = emittedToolCallCount + flushToolCalls.length;
+    const finalToolCalls = streamState.lastFullContent ? parseXmlToolCalls(streamState.lastFullContent).toolCalls.length : 0;
+    const effectiveToolCallCount = Math.max(emittedToolCallCount, finalToolCalls);
 
     // Populate parsedToolCalls from full accumulated content (per-chunk extraction
     // never sees complete blocks since individual SSE deltas are too small).
-    if (parsedFinalToolCalls.length > 0) {
-      // local_mcp and XML calls can be interleaved. Slicing by count assumes
-      // both formats have the same order and drops valid XML calls whenever a
-      // local_mcp call was emitted first. Match by name + canonical arguments.
-      // Avoid double-counting calls already emitted from the per-chunk path.
-      for (const tc of flushToolCalls) {
+    if (streamState.lastFullContent && effectiveToolCallCount > emittedToolCallCount) {
+      const parsed = parseXmlToolCalls(streamState.lastFullContent).toolCalls;
+      // Avoid double-counting: only add tool calls that weren't already emitted
+      for (const tc of parsed.slice(emittedToolCallCount)) {
         logStore.updateEntry(logId, (entry) => {
           entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.parameters) });
         });
@@ -262,6 +265,7 @@ export async function handlePostStreamCompletion(
       // from the pendingChunk buffer) as SSE events. Without this the client sees
       // finish_reason:"tool_calls" but never receives a tool_calls chunk, so the
       // turn dead-ends. Mirror the per-chunk path: align args + writeToolCallEvent.
+      const flushToolCalls = parsed.slice(emittedToolCallCount);
       for (let i = 0; i < flushToolCalls.length; i++) {
         const parsedCall = xmlToolCallToParsed(flushToolCalls[i], emittedToolCallCount + i);
         parsedCall.arguments = alignArgsToSchema(parsedCall.name, parsedCall.arguments, args.tools);
@@ -326,16 +330,6 @@ export async function handlePostStreamCompletion(
     ) {
       const emptyMsg = 'Upstream returned an empty answer (no content, no tool calls)';
       logStore.log('warn', 'stream', `[Qwen] ${emptyMsg} (logId=${logId})`);
-      // Diagnostic: snapshot recent upstream network entries + buffer so a
-      // 200-empty vs mid-stream-drop vs no-connection case can be told apart.
-      dumpUpstreamDiagnostics({
-        logId,
-        accountEmail: resolvedEmail,
-        model,
-        stream: true,
-        trigger: 'stream_empty',
-        bufferSnippet: buffer,
-      });
       await writeSseErrorEvent(streamWriter, { message: emptyMsg, code: 'upstream_empty' });
       await streamWriter.write('data: [DONE]\n\n');
       logStore.updateEntry(logId, (entry) => {

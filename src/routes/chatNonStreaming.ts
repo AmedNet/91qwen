@@ -160,7 +160,33 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
 
 function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonStreamingContext): void {
   const trimmed = line.trim();
-  if (!trimmed || !trimmed.startsWith('data: ')) return;
+  if (!trimmed) return;
+
+  // Check for Qwen WAF/CAPTCHA JSON responses — these can arrive WITHOUT the
+  // SSE `data:` prefix when the WAF returns a plain JSON body (e.g. FAIL_SYS_USER_VALIDATE).
+  // Normal SSE responses always have `data: ...` prefix; plain JSON means the upstream
+  // was intercepted by the WAF before SSE streaming could begin.
+  if (!trimmed.startsWith('data: ')) {
+    let wafChunk: any;
+    try {
+      wafChunk = JSON.parse(trimmed);
+    } catch {
+      return; // not JSON, not SSE — skip
+    }
+    if (Array.isArray(wafChunk?.ret) && wafChunk.ret[0] === 'FAIL_SYS_USER_VALIDATE') {
+      const detail = wafChunk.ret[1] || 'RGV587 captcha required';
+      logStore.addError(ctx.logId, `Qwen WAF CAPTCHA (FAIL_SYS_USER_VALIDATE): ${detail}`);
+      logStore.log('warn', 'qwen', `[Qwen] WAF CAPTCHA for ${ctx.resolvedEmail || '?'}: ${detail} (logId=${ctx.logId})`);
+      if (ctx.resolvedEmail) throttleAccount(ctx.resolvedEmail, 5 * 60 * 1000);
+      state.upstreamError = {
+        message: `Qwen CAPTCHA required (WAF anti-bot): ${detail}`,
+        code: 'waf_captcha',
+        upstreamCode: 'FAIL_SYS_USER_VALIDATE',
+      };
+    }
+    return;
+  }
+
   const dataStr = trimmed.slice(6);
   if (dataStr === '[DONE]') return;
   let chunk: any;
@@ -411,6 +437,18 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
   if (state.upstreamError) {
     const upstreamError = state.upstreamError;
     logStore.log('warn', 'qwen', `[Qwen] Upstream error in non-streaming response: ${upstreamError.message} (logId=${logId})`);
+    // WAF/RateLimited: signal retry so the caller can switch accounts
+    if (upstreamError.upstreamCode === 'FAIL_SYS_USER_VALIDATE' && resolvedEmail) {
+      if (retrySignal) {
+        retrySignal.needsRetry = true;
+        retrySignal.failedEmail = resolvedEmail;
+      }
+      throttleAccount(resolvedEmail, 5 * 60 * 1000);
+    }
+    if (upstreamError.upstreamCode === 'RateLimited' && resolvedEmail && retrySignal) {
+      retrySignal.needsRetry = true;
+      retrySignal.failedEmail = resolvedEmail;
+    }
     logStore.finalizeRequest(logId);
     return c.json(
       {
@@ -435,6 +473,15 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
       setAccountDisabled(resolvedEmail, true);
       logStore.log('warn', 'qwen', `[Qwen] RateLimited via non-streaming flush: disabled ${resolvedEmail} and switching account — ${upstreamError.message}`);
     }
+    // FAIL_SYS_USER_VALIDATE (RGV587 WAF) — retryable, switch accounts
+    if (upstreamError.upstreamCode === 'FAIL_SYS_USER_VALIDATE' && resolvedEmail) {
+      if (retrySignal) {
+        retrySignal.needsRetry = true;
+        retrySignal.failedEmail = resolvedEmail;
+      }
+      throttleAccount(resolvedEmail, 5 * 60 * 1000);
+      logStore.log('warn', 'qwen', `[Qwen] WAF CAPTCHA via non-streaming flush: throttled ${resolvedEmail} and switching account — ${upstreamError.message}`);
+    }
     logStore.finalizeRequest(logId);
     return c.json(
       {
@@ -450,6 +497,11 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
     );
   }
   flushAndDetectLoops(state, logId);
+  // WAF diag: dump buffer contents when empty response detected or stream is suspiciously short
+  if (!state.lastFullContent || state.buffer) {
+    logStore.log('debug', 'qwen', `[Qwen] Non-stream buffer: lastContent=${state.lastFullContent?.length || 0} chars, toolCalls=${state.toolCallsOut.length}, bufLen=${state.buffer.length}, buf="${state.buffer.substring(0, 500)}" (logId=${logId})`);
+  }
+
   // Upstream ended normally ([DONE] / finished) but produced zero answer
   // content and zero tool calls — the non-streaming counterpart of the streaming
   // "empty stream" guard in streamLoop.ts. reasoning_content is internal
@@ -490,7 +542,18 @@ export async function handleNonStreamingRequest(ctx: NonStreamingContext): Promi
   try {
     while (true) {
       const { done, value } = await state.reader.read();
-      if (done) break;
+      if (done) {
+        // WAF may return plain JSON in a single chunk with done=true.
+        // Process the final chunk before breaking.
+        if (value) {
+          state.buffer += state.decoder.decode(value, { stream: true });
+          const finalLines = state.buffer.split('\n');
+          for (const line of finalLines) {
+            parseQwenResponse(line, state, ctx);
+          }
+        }
+        break;
+      }
       state.buffer += state.decoder.decode(value, { stream: true });
       const lines = state.buffer.split('\n');
       state.buffer = lines.pop() || '';

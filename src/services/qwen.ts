@@ -179,11 +179,28 @@ function buildRequestHeaders(reqHeaders: Record<string, string>, cId?: string): 
 }
 
 const lastRequestTime = new Map<string, number>();
+let lastGlobalRequestTime = 0;
 async function applyRequestJitter(accountEmail?: string): Promise<void> {
-  if (!accountEmail) return;
+  // Skip pacing in tests — TEST_MOCK_PLAYWRIGHT mocks the whole Qwen HTTP layer
+  // and has no upstream WAF to protect against.
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
+
+  // Global minimum gap between ANY two requests (200-500ms), regardless of
+  // which account they belong to. Without this, 12 accounts can burst
+  // concurrently and trigger the Alibaba WAF RGV587 ("被挤爆") threshold.
+  // Per-account pacing alone cannot prevent cross-account bursts.
   const now = Date.now();
+  const globalElapsed = now - lastGlobalRequestTime;
+  const globalMinGap = 300 + Math.floor(Math.random() * 400); // 300-700ms
+  if (globalElapsed < globalMinGap) {
+    await new Promise((r) => setTimeout(r, globalMinGap - globalElapsed));
+  }
+  lastGlobalRequestTime = Date.now();
+
+  if (!accountEmail) return;
+
   const last = lastRequestTime.get(accountEmail) || 0;
-  const elapsed = now - last;
+  const elapsed = Date.now() - last;
 
   // Minimum gap between requests from the same account (1-3 seconds)
   const minGap = 1000 + Math.random() * 2000;
@@ -261,11 +278,9 @@ export async function createQwenStream(
     parent_id: actualParentId,
     messages: qwenMessages,
     timestamp: timestamp + 1,
-    // Send tools at top level as primary mechanism (reliable).
-    // feature_config.local_mcp is kept as supplementary for Qwen-native routing.
-    // Both are needed: local_mcp alone intermittently fails with "Tool does not exists".
-    ...(tools && (tools as any[]).length > 0 ? { tools } : {}),
-    ...(toolChoice ? { tool_choice: toolChoice } : {}),
+    // Only send tools via feature_config.local_mcp (Qwen native format).
+    // Top-level tools/tool_choice triggers OpenAI compatibility mode which
+    // gets intercepted by the Alibaba WAF (RGV587 bot detection).
   };
 
   const urlObj = new URL(QWEN_CHAT_COMPLETIONS_URL);
@@ -469,6 +484,11 @@ export async function createQwenStream(
 
   let makeRequestQwenLogFile: string | undefined;
   const makeRequest = async (): Promise<{ response: Response; headers: Record<string, string>; qwenLogFile?: string }> => {
+    // Rate-limit per account so 12 accounts on one IP don't burst past Alibaba's
+    // WAF threshold (RGV587 "被挤爆"). The 1-3s gap + occasional 2-5s pause is the
+    // "human" pacing WAF expects; without it every account hammers concurrently.
+    await applyRequestJitter(currentAccountEmail);
+
     const bodyStr = JSON.stringify(payload);
     if (config.get('SAVE_REQUEST_LOGS') === 'true') {
       makeRequestQwenLogFile = logQwenRequest(payload, url);
@@ -576,12 +596,26 @@ export async function createQwenStream(
   const streamDebugEntryId = lastDebugEntryId;
   const textDecoder = new TextDecoder();
   const wreqClose = (result.response as any)._wreqClose as (() => void) | undefined;
+  // WAF diag: dump raw upstream response chunks for diagnosis
+  let _diagDumped = false;
+  const _diagWrite = (chunk: Uint8Array) => {
+    if (_diagDumped) return;
+    _diagDumped = true;
+    try {
+      const fs = require('fs');
+      const dumpDir = '.qwen/wreq-debug';
+      if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
+      const ts = new Date().toISOString().replace(/[:.]+/g, '-');
+      fs.appendFileSync(`${dumpDir}/chat-stream-${ts}.dump`, '[' + chunk.length + ' bytes @ ' + ts + ']\n' + textDecoder.decode(chunk, { stream: true }) + '\n---\n');
+    } catch (e) {}
+  };
   const wrappedStream = result.response.body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
         if (streamDebugEntryId) {
           recordStreamChunk(streamDebugEntryId, textDecoder.decode(chunk, { stream: true }));
         }
+        if (!_diagDumped) _diagWrite(chunk);
         controller.enqueue(chunk);
       },
       flush() {

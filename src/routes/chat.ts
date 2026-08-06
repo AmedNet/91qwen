@@ -304,19 +304,13 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         const file = await uploadLargeTextAsFile(accountEmail, combinedContent, 'context.txt');
         processedMessages[0] = { ...processedMessages[0], files: [...(processedMessages[0].files || []), file] };
       } catch (err: any) {
-        logStore.log('warn', 'chat', '[Chat] Failed to upload context file, falling back to inline: ' + (err.message || err));
-        const inlineContext = `\n<context.txt>\n${combinedContent}\n</context.txt>`;
-        const firstMsg = processedMessages[0];
-        if (typeof firstMsg.content === 'string') {
-          processedMessages[0] = { ...firstMsg, content: firstMsg.content + inlineContext };
-        } else if (Array.isArray(firstMsg.content)) {
-          const textParts = firstMsg.content.filter((c: any) => c.type === 'text');
-          if (textParts.length > 0) {
-            textParts[textParts.length - 1].text = (textParts[textParts.length - 1].text || '') + inlineContext;
-          } else {
-            firstMsg.content.push({ type: 'text', text: inlineContext });
-          }
-        }
+        // Matching upstream: never fall back to sending the payload inline.
+        // Qwen bot-detects oversized user messages and the request hangs/spins.
+        // Retry on the next account; if all exhaust, the loop throws a real error.
+        lastFailedEmail = accountEmail;
+        lastError = err;
+        logStore.log('warn', 'chat', `[Chat] Context file upload failed for ${accountEmail}: ${err.message || err}`);
+        continue;
       }
     }
 

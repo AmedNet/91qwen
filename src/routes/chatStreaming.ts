@@ -203,10 +203,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             includeUsage: !!body.stream_options?.include_usage,
             tools: body.tools,
             streamError: streamCtx.streamError,
-            // Every attempt must flush its own pending tool/content state. A retry
-            // may not duplicate already-emitted deltas, but skipping finalization
-            // leaves the successful attempt without tool_calls/finish/[DONE].
-            skipPostStream: false,
+            skipPostStream: attempt > 0, // skip post-stream on retry — content already emitted by first attempt
           },
           {
             reader, heartbeatInterval,

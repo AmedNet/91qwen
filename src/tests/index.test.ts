@@ -11,6 +11,42 @@ import { accounts } from '../services/accountManager.ts';
 const TEST_API_KEY = 'test-key-for-testing';
 const authHeaders = { Authorization: `Bearer ${TEST_API_KEY}` };
 
+// Shared mock for the Qwen file-upload chain (getstsToken/OSS/parse). The
+// gateway always uploads a context.txt on chat requests, so tests that mock
+// globalThis.fetch must answer these endpoints or upload fails and — since
+// the upload path now retries on the next account instead of inlining — the
+// request errors out before the chat/completions handler is reached.
+function mockUploadEndpoints(url: string): Response | null {
+  if (url.includes('/api/v2/files/getstsToken')) {
+    return new Response(
+      JSON.stringify({
+        data: {
+          access_key_id: 'test-key',
+          access_key_secret: 'test-secret',
+          security_token: 'test-token',
+          bucketname: 'test-bucket',
+          region: 'oss-cn-hangzhou',
+          endpoint: 'oss-cn-hangzhou.aliyuncs.com',
+          file_id: 'test-file-id',
+          file_path: 'test-user/test-file-id_image.png',
+          file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-file-id_image.png',
+        },
+      }),
+      { status: 200 },
+    );
+  }
+  if (url.includes('/api/v2/files/parse/status')) {
+    return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+  }
+  if (url.includes('/api/v2/files/parse')) {
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  }
+  if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+    return new Response(null, { status: 200 });
+  }
+  return null;
+}
+
 test('Health check returns degraded when Playwright not initialized', async () => {
   const req = new Request('http://localhost/health');
   const res = await app.fetch(req);
@@ -861,6 +897,8 @@ test('OpenAI streaming: quota_limit upstream error is surfaced as error, not mas
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
     }
+    const uploadMock = mockUploadEndpoints(url);
+    if (uploadMock) return uploadMock;
     if (url.includes('/api/v2/chat/completions')) {
       // Qwen rejects with an in-stream error SSE event (high demand), then closes.
       const stream = new ReadableStream({
@@ -962,6 +1000,8 @@ test('OpenAI non-streaming: quota_limit upstream error returns error response, n
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
     }
+    const uploadMock = mockUploadEndpoints(url);
+    if (uploadMock) return uploadMock;
     if (url.includes('/api/v2/chat/completions')) {
       // Qwen rejects with an in-stream error SSE event (high demand), then closes.
       const stream = new ReadableStream({
@@ -1029,6 +1069,8 @@ test('OpenAI streaming: upstream empty stream surfaces error, not clean stop', a
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
     }
+    const uploadMock = mockUploadEndpoints(url);
+    if (uploadMock) return uploadMock;
     if (url.includes('/api/v2/chat/completions')) {
       // Qwen returns 200 + [DONE] with NO content chunks at all — the "empty
       // stream" pattern seen with long conversations.
@@ -1126,6 +1168,8 @@ test('OpenAI non-streaming: upstream empty response returns error, not clean sto
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max-preview', owned_by: 'qwen' }] }), { status: 200 });
     }
+    const uploadMock = mockUploadEndpoints(url);
+    if (uploadMock) return uploadMock;
     if (url.includes('/api/v2/chat/completions')) {
       // Qwen returns 200 + [DONE] with NO content chunks — the non-streaming
       // "empty response" pattern (fast ~5s zero-content stops seen in live logs).

@@ -92,20 +92,19 @@ function startAcwTcRefresh(): void {
   }, ACW_TC_REFRESH_MS);
 }
 
-/** Inject acw_tc cookie into headers from a per-account cache key.
- *  A single global acw_tc made every account share one WAF session cookie on
- *  the same IP -> strong bot signal. Keying by email keeps each account's WAF
- *  session distinct; falls back to the shared refreshed value when unknown. */
-async function ensureAcwTcCookie(headers: Record<string, string>, accountEmail?: string): Promise<void> {
+/** Inject acw_tc cookie into headers from the global cache.
+ *  Matches upstream: one shared WAF session cookie for all accounts on this IP,
+ *  refreshed lazily on first use. Per-account keying made every account fetch a
+ *  separate acw_tc at startup — many distinct WAF sessions on one IP+TLS
+ *  fingerprint looked like a bot farm and triggered RGV587 "被挤爆". */
+async function ensureAcwTcCookie(headers: Record<string, string>): Promise<void> {
   startAcwTcRefresh();
 
-  const cacheKey = accountEmail ? `acw_tc:${accountEmail}` : 'acw_tc';
-  let acwTc = tokenCache.get(cacheKey) ?? tokenCache.get('acw_tc') ?? null;
+  let acwTc = tokenCache.get('acw_tc') ?? null;
   if (!acwTc) {
     acwTc = await refreshAcwTcCookie();
   }
   if (acwTc) {
-    if (accountEmail) tokenCache.set(cacheKey, acwTc, ACW_TC_REFRESH_MS * 2);
     const existing = headers['cookie'] || '';
     if (!existing.includes('acw_tc=')) {
       headers['cookie'] = existing ? `${existing}; acw_tc=${acwTc}` : `acw_tc=${acwTc}`;
@@ -175,7 +174,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     }
   }
 
-  await ensureAcwTcCookie(headers, accountEmail);
+  await ensureAcwTcCookie(headers);
 
   const startTime = Date.now();
 

@@ -389,10 +389,24 @@ function setupCanvasInput(canvas, ws) {
   canvas.focus();
 
   canvas.addEventListener('keydown', function (e) {
+    /* Ctrl/Cmd+V — CDP synthesized key events can't read the OS clipboard, so a
+       plain keydown/keyup round-trip pastes nothing. Read the clipboard directly
+       and forward the text for CDP Input.insertText. */
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) {
+      e.preventDefault();
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(function (text) {
+          if (text) {
+            ws.send(JSON.stringify({ type: 'input', event: { type: 'paste', text: text } }));
+          }
+        }).catch(function () { /* clipboard permission denied */ });
+      }
+      return;
+    }
     e.preventDefault();
     ws.send(JSON.stringify({
       type: 'input',
-      event: { type: 'keydown', key: e.key, code: e.code, text: e.key.length === 1 ? e.key : '' },
+      event: { type: 'keydown', key: e.key, code: e.code, text: '' },
     }));
   });
 
@@ -404,12 +418,25 @@ function setupCanvasInput(canvas, ws) {
     }));
   });
 
+  /* keypress → Input.dispatchKeyEvent({type:'char', text}) inserts the
+     character. keydown deliberately sends no `text` so a single character
+     isn't inserted twice (keyDown-with-text + char would double-type every
+     printable key). */
   canvas.addEventListener('keypress', function (e) {
     e.preventDefault();
     ws.send(JSON.stringify({
       type: 'input',
       event: { type: 'keypress', key: e.key, code: e.code, text: e.key },
     }));
+  });
+
+  /* Paste — capture clipboard text and forward it for CDP Input.insertText. */
+  canvas.addEventListener('paste', function (e) {
+    e.preventDefault();
+    var text = (e.clipboardData || window.clipboardData).getData('text');
+    if (text) {
+      ws.send(JSON.stringify({ type: 'input', event: { type: 'paste', text: text } }));
+    }
   });
 }
 

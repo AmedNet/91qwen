@@ -441,6 +441,14 @@ export function handleInputEvent(
     case 'keypress':
       send('Input.dispatchKeyEvent', { type: 'char', text: event.text || '' });
       break;
+    case 'paste':
+      // Synthesized key events can't read the OS clipboard — the frontend reads
+      // the clipboard via the DOM paste event and sends the text here, which we
+      // insert directly into the focused element via CDP.
+      if (event.text) {
+        send('Input.insertText', { text: event.text });
+      }
+      break;
     case 'scroll':
       send('Input.dispatchMouseEvent', {
         type: 'mouseWheel', x: event.x, y: event.y,

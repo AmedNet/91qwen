@@ -5,6 +5,7 @@ import { bearerAuth } from 'hono/bearer-auth';
 import { cors } from 'hono/cors';
 
 import { rateLimitMiddleware, startAutoCleanup, stopAutoCleanup } from './middleware/rateLimit.ts';
+import { captureMiddleware } from './middleware/requestCapture.ts';
 import { accountsRouter } from './routes/accounts.ts';
 import { anthropicMessages } from './routes/anthropic.ts';
 import { chatCompletions } from './routes/chat.ts';
@@ -104,6 +105,9 @@ app.use('*', async (c, next) => {
   logStore.log('debug', 'http', `${method} ${path} UA=${ua.slice(0, 80)}`);
   await next();
 });
+
+// Capture request bodies for replay debugging → .qwen/captures/
+app.use('*', captureMiddleware);
 
 // Health check — reports actual system status
 app.get('/health', (c) => {
