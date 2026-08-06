@@ -106,8 +106,6 @@ export interface QwenPayload {
   parent_id: string | null;
   messages: QwenMessage[];
   timestamp: number;
-  tools?: unknown[];
-  tool_choice?: unknown;
 }
 
 export interface QwenStreamResult {
