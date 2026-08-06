@@ -1,1 +1,4 @@
-Nothing should be ignored since the changes only include TypeScript source files (.ts) which are legitimate source code files that should be tracked in version control.
+```
+node_modules/
+package-lock.json
+```
