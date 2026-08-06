@@ -358,3 +358,7 @@ Uses Bun's built-in test runner. Covers content filtering, tool-call parsing, st
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+*Test update for push verification.*
