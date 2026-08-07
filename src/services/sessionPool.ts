@@ -234,6 +234,20 @@ export class SessionPool {
     }
     if (!json.data?.id) {
       const message = formatQwenEnvelopeError(json);
+      // The envelope formatter only reads code/details, so WAF challenges and
+      // other unexpected shapes collapse to "unknown". Log the raw body so the
+      // actual upstream reason is recoverable.
+      logStore.log('warn', 'session', `Chats/new returned no id (${message}): ${responseText.substring(0, 300)}`);
+
+      // Alibaba's WAF answers with HTTP 200 + JSON `rgv587_flag`, so the
+      // status/content-type based WAF check never sees it. Without throttling,
+      // the caller's retry loop walks every account within seconds — itself the
+      // concurrency burst that provokes the WAF. Park this account instead.
+      if (json?.rgv587_flag) {
+        if (email) throttleAccount(email, config.getInt('WAF_COOLDOWN_MS', 10 * 60 * 1000));
+        throw new Error(`Chats/new blocked by Qwen WAF (rgv587) — account parked`);
+      }
+
       throw new Error(`Chats/new returned no id: ${message}`);
     }
 

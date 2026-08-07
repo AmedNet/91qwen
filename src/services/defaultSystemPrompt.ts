@@ -10,7 +10,7 @@ Your conversation uses tagged message blocks. Each message is wrapped in XML-lik
 
 - \`<user>...</user>\` — User input (may include attached files)
 - \`<assist>...</assist>\` — Your previous responses (with tool calls or plain text)
-- \`<function=NAME>\n<parameter=KEY>VALUE</parameter>\n</function>\` — Tool call invocation in your previous responses
+- \`<tool-call-history>...</tool-call-history>\` — Read-only historical tool calls; never copy this wrapper when calling a tool
 - \`<tool-result tool="NAME">...</tool-result>\` — Tool call results (inline in the conversation)
 - \`<thinking>...</thinking>\` — Your previous reasoning (if enabled)
 

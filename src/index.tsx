@@ -482,14 +482,18 @@ if (import.meta.main) {
       }
 
       // ── Phase 2b: Configure loaded accounts ──
+      // Configure serially: a fire-and-forget loop launched all 12 accounts'
+      // settings POSTs in the same instant at boot. That startup burst is the
+      // same same-IP multi-account concurrency that triggers Alibaba's RGV587
+      // WAF, so a fresh boot would immediately park every account. Serialize
+      // with a small gap between accounts instead.
       logStore.log('info', 'boot', '[2/5] Configuring accounts...');
       try {
         const acctList = getAccounts().filter((a) => a.state?.token);
         for (const acct of acctList) {
           setStartupStatus(acct.email, 'ready');
-          configureAccount(acct.email).catch((err: any) =>
-            logStore.log('warn', 'boot', `[2/5] Account config failed for ${acct.email}: ${err.message}`),
-          );
+          await configureAccount(acct.email);
+          await new Promise((r) => setTimeout(r, 250));
         }
         logStore.log('info', 'boot', `[2/5] Accounts configured: ${acctList.length} ready`);
       } catch (err: any) {

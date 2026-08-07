@@ -53,9 +53,15 @@ const ACW_TC_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
 async function refreshAcwTcCookie(): Promise<string | null> {
   try {
     logEvent('refreshAcwTcCookie', 'fetching acw_tc from root');
+    // The root page returns acw_tc only to a request carrying the full browser
+    // header set. The default bare request (disableDefaultHeaders: true) gets a
+    // clean HTML response with no set-cookie, so acw_tc never appears — and the
+    // caller retries every account without a WAF cookie. Compare: the working
+    // upstream uses the wreq-js default headers for this exact request.
     const resp = await wreqFetch(QWEN_API_BASE, {
       method: 'GET',
       headers: { accept: 'text/html,application/xhtml+xml' },
+      useDefaultHeaders: true,
       debugLogDir: process.env.DEBUG_IMPERS_DIR,
     });
     logFetchCall('refreshAcwTcCookie', QWEN_API_BASE, 'GET', resp.status);
@@ -191,8 +197,22 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     });
     logFetchCall('browserlessFetch', url, method, response.status);
 
+    // The rgv587 challenge arrives as HTTP 200 + JSON, so wafCheck (which only
+    // inspects status and content-type) never saw it and the recovery below never
+    // ran. Peek non-streaming bodies so rgv587 reaches the same recovery path.
+    let rgv587Body: string | null = null;
+    if (!stream && response.status === 200) {
+      const peeked = await response.text().catch(() => '');
+      if (peeked.includes('rgv587_flag')) {
+        rgv587Body = peeked;
+      } else {
+        // Body was consumed by the peek — hand the caller an equivalent Response.
+        response = new Response(peeked, { status: response.status, headers: response.headers });
+      }
+    }
+
     // ─── WAF detection + recovery ─────────────────────────────────────
-    if (wafCheck(response)) {
+    if (rgv587Body || wafCheck(response)) {
       logEvent('browserlessFetch', 'WAF detected', { url: url.split('?')[0], status: response.status });
       logStore.log('warn', 'browserless', `WAF detected on ${url.split('?')[0]} — trying HTTP refresh first...`);
       const currentCookie = headers['cookie'] || '';
@@ -202,10 +222,59 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         headers['cookie'] = currentCookie ? `${currentCookie}; acw_tc=${freshAcwTc}` : `acw_tc=${freshAcwTc}`;
       }
 
-      const responseText = await response.text().catch(() => '');
-      const isStillWaf = !responseText || responseText.includes('aliyun_waf') || responseText.includes('<html');
-      if (!isStillWaf) {
-        // The acw_tc refresh worked — response body is valid
+      // Retry with the fresh acw_tc. The old code inspected the original (already
+      // WAF) response body for markers, which is always true — so the HTTP refresh
+      // path never succeeded and every WAF hit fell through to Playwright, which
+      // then hard-failed when no browser binary is installed. rgv587 arrives as
+      // HTTP 200 JSON, so wafCheck won't flag a clean retry; the caller's JSON
+      // parsing catches rgv587 and throttles the account.
+      let httpRecovered = false;
+      if (freshAcwTc) {
+        logStore.log('debug', 'browserless', `acw_tc refreshed — retrying ${url.split('?')[0]}`);
+        logFetchCall('browserlessFetch.httpRetry', url, method);
+        const retried = await wreqFetch(url, {
+          method,
+          headers,
+          body,
+          signal,
+          stream: !!stream,
+          debugLogDir: process.env.DEBUG_IMPERS_DIR,
+        });
+        logFetchCall('browserlessFetch.httpRetry', url, method, retried.status);
+        // The retry can itself return a fresh rgv587 envelope (HTTP 200 JSON) —
+        // wafCheck won't flag it, so probe non-streaming bodies before declaring
+        // recovery.
+        let retriedIsRgv587 = false;
+        if (!stream && retried.status === 200) {
+          const peeked = await retried.text().catch(() => '');
+          retriedIsRgv587 = peeked.includes('rgv587_flag');
+          if (!retriedIsRgv587) {
+            response = new Response(peeked, { status: retried.status, headers: retried.headers });
+            httpRecovered = true;
+          }
+        } else {
+          response = retried;
+          httpRecovered = !wafCheck(retried);
+        }
+        if (retriedIsRgv587) {
+          logStore.log('warn', 'browserless', `acw_tc refresh did not clear rgv587 on ${url.split('?')[0]}`);
+        }
+      } else {
+        const responseText = rgv587Body ?? (await response.text().catch(() => ''));
+        httpRecovered =
+          !!responseText &&
+          !responseText.includes('aliyun_waf') &&
+          !responseText.includes('<html') &&
+          !responseText.includes('rgv587_flag');
+        if (httpRecovered) {
+          // The acw_tc refresh worked, but the body above was consumed — rebuild it.
+          return new Response(responseText, { status: response.status, headers: response.headers });
+        }
+      }
+
+      if (httpRecovered) {
+        // Fresh acw_tc sufficed — skip Playwright recovery.
+        if (stream) (response as any)._wreqClose = () => {};
         return response;
       }
 

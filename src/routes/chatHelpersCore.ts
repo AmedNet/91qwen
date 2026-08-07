@@ -1,6 +1,6 @@
 ﻿import { logStore } from '../services/logStore.ts';
 import { validateSingleToolCall } from '../tools/guard.ts';
-import { TOOL_CALL_KEYWORDS, TOOL_RESULT_KEYWORDS } from '../utils/tagNames.ts';
+import { LEAKED_TAG_KEYWORDS, TOOL_CALL_KEYWORDS, TOOL_RESULT_KEYWORDS } from '../utils/tagNames.ts';
 import { QWEN_THINK_TAG_PATTERN as THINK_TAG_PATTERN } from '../utils/thinkTagStripper.ts';
 
 // ── String / diff utilities ───────────────────────────────────────
@@ -24,6 +24,39 @@ export function commonSuffixLen(a: string, b: string): number {
   const len = Math.min(a.length, b.length);
   while (i < len && a[a.length - 1 - i] === b[b.length - 1 - i]) i++;
   return i;
+}
+
+export type AnswerChunkMode = 'unknown' | 'incremental' | 'cumulative';
+
+/**
+ * Normalize Qwen answer chunks without dropping repeated incremental tokens.
+ * Cumulative mode is selected only after a substantial previous chunk is
+ * repeated as the exact prefix of a larger snapshot.
+ */
+export function normalizeAnswerChunk(
+  newText: string,
+  previousChunk: string,
+  mode: AnswerChunkMode,
+): { delta: string; previousChunk: string; mode: AnswerChunkMode } {
+  if (!previousChunk) return { delta: newText, previousChunk: newText, mode };
+  if (mode === 'cumulative') {
+    if (newText === previousChunk) return { delta: '', previousChunk: newText, mode };
+    if (newText.startsWith(previousChunk)) {
+      return { delta: newText.slice(previousChunk.length), previousChunk: newText, mode };
+    }
+    return { delta: newText, previousChunk: newText, mode: 'incremental' };
+  }
+  if (previousChunk.length >= 8 && newText.length > previousChunk.length && newText.startsWith(previousChunk)) {
+    return { delta: newText.slice(previousChunk.length), previousChunk: newText, mode: 'cumulative' };
+  }
+  // A substantial chunk repeated verbatim is a cumulative re-send, not repeated
+  // tokens: Qwen re-emits the full answer as a same-length snapshot after the
+  // incremental one. Appending it again duplicates the whole reply. Short chunks
+  // stay incremental so genuinely repeated characters ("<<<") are preserved.
+  if (newText === previousChunk && previousChunk.length >= 8) {
+    return { delta: '', previousChunk: newText, mode: 'cumulative' };
+  }
+  return { delta: newText, previousChunk: newText, mode: mode === 'unknown' ? 'incremental' : mode };
 }
 
 export function detectCumulativeChunk(newText: string, lastText: string): { cumulative: boolean; delta: string } {
@@ -133,6 +166,26 @@ export function cleanThinkTags(t: string): string {
   if (!t.includes('<') && !t.includes('=') && !t.includes('>')) return t;
   let s = t.replace(THINK_TAG_PATTERN, '');
   s = s.replace(TOOL_RESULT_TAG_PATTERN, '');
+  // Strip the gateway's own history wrapper tags that Qwen sometimes echoes back
+  // as literal text (e.g. </assistant>, <assist>, </user>, <user>, <tool-result>).
+  // These only appear in the prompt as gateway formatting; echoing them corrupts
+  // the client's content stream.
+  s = s.replace(/<\/?assistant\b[^>]*>/gi, '');
+  s = s.replace(/<\/?assist\b[^>]*>/gi, '');
+  s = s.replace(/<\/?user\b[^>]*>/gi, '');
+  s = s.replace(/<tool-result\b[^>]*>[\s\S]*?<\/tool-result>/gi, '');
+  s = s.replace(/<tool-result\b[^>]*>/gi, '');
+  // Qwen echoes the gateway's plural <tool-results> wrapper (chat.ts:199) that
+  // wraps tool output in context.txt. Both open and close tags leak back as
+  // literal content — strip them so a "。\n\n</tool-results>" tail can't reach
+  // the client.
+  s = s.replace(/<\/?tool-results\b[^>]*>/gi, '');
+  // Strip leaked tool_call / tool_use tags. Qwen's xml_prompt mode ends a call
+  // with </function> but often appends a stray </tool_call> (a legacy-format
+  // echo) right after — cleanThinkTags strips function/parameter/tool_result
+  // but this one slipped through and leaked as literal content, adding a stray
+  // newline before the answer text in tool-call turns.
+  s = s.replace(new RegExp(`<\\/?(?:${LEAKED_TAG_KEYWORDS.join('|')})\\b[^>]*>`, 'gi'), '');
   // Strip tool call XML tags (complete + partial at chunk boundaries)
   s = s.replace(TOOL_TAG_RE, '');
   // Generic chunk-boundary artifact cleanup: works for ANY XML-like output from any AI,
@@ -148,6 +201,16 @@ export function cleanThinkTags(t: string): string {
   s = s.replace(/^=[^\s>]+>/gm, ''); // =name> continuation
   s = s.replace(/^[a-z]+=[^\s>]+>/gm, ''); // tail=name> continuation (generic, no keyword knowledge needed)
   s = s.replace(/^[a-z]{3,}>/gm, ''); // word> at line start (e.g. `function>` after `</` was stripped)
+  s = s.replace(/^[ \t]*>[ \t]*$/gm, ''); // 孤立 > 行（工具闭合标签被切成 > 单独 chunk，如 `</tool_call>` → `</tool_call` + `>`）
+  // 剥孤立闭合残片。Qwen 工具调用闭合后常回显一串切碎的闭合标签，SSE 把它们
+  // 切成 `/Data\n</` + `tool_call>` 之类的残片。`</` 单独（后跟换行/空白/结尾）或
+  // `</assist`、`</tool` 这类半截闭合（后跟小写字母直到换行/结尾）都必须剥掉，
+  // 否则残片会当正文 emit（用户看到"正文+空行+孤立符号"）。
+  // 注意只匹配后跟空白/换行/小写字母的形态，避免误伤 `x </ y` 这类本意内容。
+  s = s.replace(/<\/(?=\s|$)/g, ''); // </ 后跟空白或结尾
+  s = s.replace(/^<\/[a-z]+\s*$/gm, ''); // 行首 </assist / </tool 等半截闭合（独占一行）
+  s = s.replace(/<\/[a-z]+\n/g, ''); // 闭合残片后跟换行（如 `</tool\n`、`</assist\n`）
+  s = s.replace(/<\/[a-z]+$/g, ''); // 字符串末尾的 </tool / </assist 残片
   s = s.replace(/<\/(?=$)/g, ''); // </ at end of string
   s = s.replace(/<$/g, ''); // < at end of string
   return s;
@@ -276,12 +339,6 @@ export function extractDeltaContent(
   let isThinkingChunk = false;
   let newThoughtIndex = currentThoughtIndex;
 
-  // Accept a chunk if we haven't seen any response_id yet (set empty), the chunk
-  // carries no response_id, or its id (or its response.created id) is one we've
-  // already seen in THIS stream. Previously this locked to the FIRST id only,
-  // which dropped the entire answer phase whenever Qwen emitted think and answer
-  // under different response_ids (multi-phase / tool-call turns) — the reply was
-  // silently filtered out and the turn ended empty.
   const createdId = chunk['response.created']?.response_id;
   const idOk =
     knownResponseIds.size === 0 ||

@@ -92,10 +92,22 @@ async function getBrowser(): Promise<any> {
     return playwrightBrowser;
   }
   const { chromium } = await import('playwright');
-  playwrightBrowser = await chromium.launch({
+  // Prefer the bundled chromium; on hosts where it was never downloaded
+  // (no ms-playwright cache), fall back to the system Edge channel so the
+  // cookie-refresh recovery path still works. Without this the WAF refresh
+  // fails and every session acquire dies with "cannot retry".
+  const base: Record<string, unknown> = {
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-  });
+  };
+  try {
+    playwrightBrowser = await chromium.launch(base);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logStore.log('warn', 'fireyejs', `bundled chromium unavailable (${msg.slice(0, 80)}), trying system Edge...`);
+    base.channel = 'msedge';
+    playwrightBrowser = await chromium.launch(base);
+  }
   return playwrightBrowser;
 }
 
@@ -112,6 +124,12 @@ async function closeBrowser(): Promise<void> {
 
 const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
 
+/** Browser-based refresh must never block the caller (session acquire / account
+ *  config) indefinitely. Chromium launch on a host without the bundled browser
+ *  and the system-Edge fallback can both hang on protocol connect — bound the
+ *  whole attempt. */
+const COOKIE_REFRESH_TIMEOUT_MS = 45_000;
+
 /**
  * Refresh cookies for an account by navigating chat.qwen.ai in a real browser.
  *
@@ -121,7 +139,12 @@ const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
 export async function refreshCookiesViaBrowser(cookieStr: string): Promise<string | null> {
   let page: any = null;
   try {
-    const browser = await getBrowser();
+    const browser = await Promise.race([
+      getBrowser(),
+      new Promise<any>((_, reject) =>
+        setTimeout(() => reject(new Error('browser launch timed out')), COOKIE_REFRESH_TIMEOUT_MS),
+      ),
+    ]);
     page = await browser.newPage();
 
     if (cookieStr) {

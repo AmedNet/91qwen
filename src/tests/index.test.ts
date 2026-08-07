@@ -568,6 +568,99 @@ test('Chat Completions endpoint - Non-streaming (stream: false)', async () => {
   }
 });
 
+test('OpenAI non-streaming nonce envelope commits valid tools and rejects invalid arguments', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'nonce-ns@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.7-max', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    const uploadMock = mockUploadEndpoints(url);
+    if (uploadMock) return uploadMock;
+    if (url.includes('/api/v2/chat/completions')) {
+      const upstreamPayload = JSON.parse(String(init?.body || '{}'));
+      const prompt = String(upstreamPayload.messages?.[0]?.content || '');
+      const nonce = prompt.match(/<<<QG_TOOL_([0-9a-f]{16})>>>/)?.[1];
+      assert.ok(nonce, 'Upstream prompt must contain a request nonce');
+      const command = prompt.includes('invalid nonce call') ? '' : 'git status';
+      const envelope = `<<<QG_TOOL_${nonce}>>>${JSON.stringify({
+        tool_calls: [{ name: 'Bash', arguments: { command } }],
+      })}<<<QG_END_${nonce}>>>`;
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(
+            new TextEncoder().encode(
+              `data: ${JSON.stringify({ choices: [{ delta: { phase: 'answer', content: envelope, status: 'finished' } }] })}\n\n`,
+            ),
+          );
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  const tools = [
+    {
+      type: 'function',
+      function: {
+        name: 'Bash',
+        description: 'Run a command',
+        parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      },
+    },
+  ];
+
+  try {
+    const request = (content: string) =>
+      app.fetch(
+        new Request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+          body: JSON.stringify({ model: 'qwen3.7-max', messages: [{ role: 'user', content }], tools, stream: false }),
+        }),
+      );
+
+    const validRes = await request('make a valid nonce call');
+    assert.strictEqual(validRes.status, 200);
+    const validBody = await validRes.json();
+    assert.strictEqual(validBody.choices[0].finish_reason, 'tool_calls');
+    assert.strictEqual(validBody.choices[0].message.content, null);
+    assert.strictEqual(validBody.choices[0].message.tool_calls[0].function.name, 'Bash');
+    assert.deepStrictEqual(JSON.parse(validBody.choices[0].message.tool_calls[0].function.arguments), { command: 'git status' });
+    assert.doesNotMatch(JSON.stringify(validBody), /<<<QG_(?:TOOL|END)_/);
+
+    const invalidRes = await request('make an invalid nonce call');
+    assert.strictEqual(invalidRes.status, 502);
+    const invalidText = await invalidRes.text();
+    const invalidBody = JSON.parse(invalidText);
+    assert.strictEqual(invalidBody.error.code, 'tool_protocol_error');
+    assert.match(invalidBody.error.message, /command/);
+    assert.doesNotMatch(invalidText, /<<<QG_(?:TOOL|END)_/);
+    assert.doesNotMatch(invalidText, /"command":""/);
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('Anthropic streaming strips XML artifacts from text deltas', async () => {
   const originalFetch = globalThis.fetch;
   const originalAccounts = [...accounts];
@@ -620,19 +713,14 @@ test('Anthropic streaming strips XML artifacts from text deltas', async () => {
     if (url.includes('/api/v2/chat/completions')) {
       const stream = new ReadableStream({
         start(c) {
-          // Text chunk with XML tool call artifact embedded
+          // Legacy XML syntax is ordinary text under the nonce-only protocol.
           c.enqueue(
             new TextEncoder().encode(
               'data: {"choices":[{"delta":{"phase":"answer","content":"I\'ll check the file. <function=Bash><parameter=command>cat /etc/hostname</parameter></function>"}}]}\n\n',
             ),
           );
           c.enqueue(
-            new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":" The hostname is qwen-gate."}}]}\n\n'),
-          );
-          c.enqueue(
-            new TextEncoder().encode(
-              'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★Bash","params":{"command":"cat /etc/hostname"}}]}}}}]}\n\n',
-            ),
+            new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":" The hostname is qwen-gate.","status":"finished"}}]}\n\n'),
           );
           c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
           c.close();
@@ -693,35 +781,20 @@ test('Anthropic streaming strips XML artifacts from text deltas', async () => {
       }
     }
 
-    // Check that NO text_delta contains XML artifacts
+    // Legacy XML is preserved as ordinary text and never becomes tool_use.
     const textDeltas = events.filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'text_delta');
-    for (const td of textDeltas) {
-      assert.doesNotMatch(
-        td.delta.text,
-        /<function=|<\/function>|<parameter=/,
-        `text_delta must not contain XML artifacts. Got: ${JSON.stringify(td.delta.text)}`,
-      );
-    }
-
-    // Verify tool_use block exists (from local_mcp)
+    const text = textDeltas.map((e) => e.delta.text).join('');
+    assert.match(text, /<function=Bash>/);
+    assert.match(text, /The hostname is qwen-gate/);
     const toolStart = events.find((e) => e.type === 'content_block_start' && e.content_block?.type === 'tool_use');
-    assert.ok(toolStart, `Should have tool_use block`);
-    assert.strictEqual(toolStart.content_block.name, 'Bash');
-    // Per Anthropic spec, content_block_start has input: {}
-    assert.deepStrictEqual(toolStart.content_block.input, {}, 'tool_use start must have empty input');
-
-    // Verify input_json_delta carries the actual args
-    const inputDeltas = events.filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'input_json_delta');
-    assert.ok(inputDeltas.length >= 1, 'Should have at least one input_json_delta event');
-    const parsedInput = JSON.parse(inputDeltas[0].delta.partial_json);
-    assert.strictEqual(parsedInput.command, 'cat /etc/hostname', 'input_json_delta must contain command');
+    assert.strictEqual(toolStart, undefined, 'legacy XML must not create tool_use');
   } finally {
     accounts.splice(0, accounts.length, ...originalAccounts);
     globalThis.fetch = originalFetch;
   }
 });
 
-test('Anthropic /v1/messages streaming with local_mcp tool call emits correct tool_use block', async () => {
+test('Anthropic /v1/messages streaming nonce envelope emits correct tool_use block', async () => {
   const originalFetch = globalThis.fetch;
   const originalAccounts = [...accounts];
 
@@ -739,7 +812,7 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     startupStatus: 'ready',
   });
 
-  (globalThis as any).fetch = async (input: any) => {
+  (globalThis as any).fetch = async (input: any, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.url;
     if (url.includes('/api/models')) {
       return new Response(JSON.stringify({ data: [{ id: 'qwen3.7-max', owned_by: 'qwen' }] }), { status: 200 });
@@ -772,12 +845,16 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
       return new Response(JSON.stringify({ success: true }), { status: 200 });
     }
     if (url.includes('/api/v2/chat/completions')) {
+      const upstreamPayload = JSON.parse(String(init?.body || '{}'));
+      const prompt = String(upstreamPayload.messages?.[0]?.content || '');
+      const nonce = prompt.match(/<<<QG_TOOL_([0-9a-f]{16})>>>/)?.[1];
+      assert.ok(nonce, 'Upstream prompt must contain a request nonce');
+      const envelope = `<<<QG_TOOL_${nonce}>>>{"tool_calls":[{"name":"Bash","arguments":{"command":"ls -la /tmp"}}]}<<<QG_END_${nonce}>>>`;
       const stream = new ReadableStream({
         start(c) {
-          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"I\'ll run that for you."}}]}\n\n'));
           c.enqueue(
             new TextEncoder().encode(
-              'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★Bash","params":{"command":"ls -la /tmp"}}]}}}}]}\n\n',
+              `data: ${JSON.stringify({ choices: [{ delta: { phase: 'answer', content: envelope, status: 'finished' } }] })}\n\n`,
             ),
           );
           c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));

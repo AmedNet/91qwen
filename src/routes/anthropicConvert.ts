@@ -387,7 +387,43 @@ export function mergeParsedToolCalls(xmlCalls: ParsedToolCall[], localCalls: Par
   return merged;
 }
 
-export function prepareToolCallForClaude(tc: { name: string; arguments: unknown; id?: string }, reverseToolMap?: Map<string, string>): {
+/** Find the client's declared parameter schema for a tool, by original or normalized name. */
+function findClientToolSchema(name: string, clientTools?: any[]): any | undefined {
+  if (!Array.isArray(clientTools)) return undefined;
+  const target = normalizeToolName(name).toLowerCase();
+  for (const t of clientTools) {
+    const tn = t?.function?.name || t?.name;
+    if (!tn) continue;
+    if (tn === name || normalizeToolName(tn).toLowerCase() === target) {
+      return t?.function?.parameters || t?.parameters || t?.input_schema;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Align argument names to the client's own schema. Claude Code's fixed
+ * camelCase→snake_case table must not rename properties that a custom tool
+ * actually declares.
+ */
+function alignArgsToClientSchema(args: Record<string, unknown>, props: Record<string, any>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (Object.prototype.hasOwnProperty.call(props, k)) {
+      out[k] = v;
+      continue;
+    }
+    const mapped = mapParamName(k);
+    out[Object.prototype.hasOwnProperty.call(props, mapped) ? mapped : k] = v;
+  }
+  return out;
+}
+
+export function prepareToolCallForClaude(
+  tc: { name: string; arguments: unknown; id?: string },
+  reverseToolMap?: Map<string, string>,
+  clientTools?: any[],
+): {
   valid: boolean;
   name: string;
   args: Record<string, unknown>;
@@ -400,18 +436,38 @@ export function prepareToolCallForClaude(tc: { name: string; arguments: unknown;
   }
   if (!args || typeof args !== 'object') return { valid: false, name: resolveToolName(normalizeToolName(tc.name), reverseToolMap), args: {} };
   const name = normalizeToolName(tc.name);
+  const resolved = resolveToolName(name, reverseToolMap);
+
+  // When the client declared a schema, it is authoritative: the envelope parser
+  // already validated against it, so neither the camelCase table nor the
+  // "unknown tools need one argument" heuristic may override it. That heuristic
+  // silently drops legitimate zero-argument tools.
+  const schema = findClientToolSchema(resolved, clientTools);
+  if (schema && typeof schema === 'object') {
+    const props = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+    const aligned = alignArgsToClientSchema(args as Record<string, unknown>, props);
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    const missing = required.filter((p: string) => aligned[p] === undefined || aligned[p] === null || aligned[p] === '');
+    return { valid: missing.length === 0, name: resolved, args: aligned };
+  }
+
   const mapped = normalizeToolArgs(args as Record<string, unknown>);
-  return { valid: isValidClaudeCodeToolCall(name, mapped), name: resolveToolName(name, reverseToolMap), args: mapped };
+  return { valid: isValidClaudeCodeToolCall(name, mapped), name: resolved, args: mapped };
 }
 
-export function convertOpenAIResponseToAnthropic(openAIResp: any, requestModel: string, reverseToolMap?: Map<string, string>): any {
+export function convertOpenAIResponseToAnthropic(
+  openAIResp: any,
+  requestModel: string,
+  reverseToolMap?: Map<string, string>,
+  clientTools?: any[],
+): any {
   const choice = openAIResp.choices?.[0];
   const message = choice?.message || {};
   const content: any[] = [];
 
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
-      const result = prepareToolCallForClaude({ name: tc.function?.name, arguments: tc.function?.arguments, id: tc.id }, reverseToolMap);
+      const result = prepareToolCallForClaude({ name: tc.function?.name, arguments: tc.function?.arguments, id: tc.id }, reverseToolMap, clientTools);
       if (!result.valid) continue;
       content.push({ type: 'tool_use', id: tc.id, name: result.name, input: result.args });
     }

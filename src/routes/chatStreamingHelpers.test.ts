@@ -3,7 +3,7 @@ import test from 'node:test';
 import { logStore } from '../services/logStore.ts';
 import { processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 
-test('reproduces and tests fix for corrupted tool call when split across chunks', async () => {
+test('legacy XML text is preserved and never executed', async () => {
   const logId = 'test-corrupted-tool-call-log-id';
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
@@ -16,18 +16,7 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
     reasoningBuffer: '',
     lastFullContent: '',
     lastRawContent: '',
-    lastFilteredSnapshot: '',
-    lastThinkingSnapshot: '',
     lastVStrRaw: '',
-    lastFilteredFullContent: '',
-    lastDeltaThinkingFull: '',
-    loggedToolCalls: new Set(),
-    lastParsePosition: 0,
-    toolCallDepth: 0,
-    chunksSinceLastTagOpen: 0,
-    pendingChunk: '',
-    recentChunks: [],
-    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -109,40 +98,22 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
     await processStreamData(data, state, ctx);
   }
 
-  // 1. Verify that the tool call was successfully parsed and recorded in the logStore entry
   const logEntry = (logStore as any).entryMap.get(logId);
   assert.ok(logEntry, 'log entry should exist');
-  assert.strictEqual(logEntry.parsedToolCalls.length, 1, 'should have parsed exactly one tool call');
-  assert.strictEqual(logEntry.parsedToolCalls[0].name, '★-edit', 'tool call name should be ★-edit');
+  assert.strictEqual(logEntry.parsedToolCalls.length, 0, 'legacy XML must not create executable tool calls');
+  assert.strictEqual(writtenEvents.filter((e) => e.includes('tool_calls')).length, 0);
 
-  // 2. Verify that the emitted tool call event is sent to the client
-  const toolCallEvents = writtenEvents.filter((e) => e.includes('tool_calls'));
-  assert.strictEqual(toolCallEvents.length, 1, 'should have emitted exactly one tool call event to client');
-  assert.ok(toolCallEvents[0].includes('★-edit') || toolCallEvents[0].includes('edit'), 'emitted tool call should be edit');
-
-  // 3. Verify that the content streamed to the client does NOT contain leaked function tags/parameters
-  // Reconstruct emitted content from content events
-  const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
-  let reconstructedContent = '';
-  for (const event of contentEvents) {
-    // Extract JSON payload from SSE "data: <json>\n\n"
-    const match = event.match(/^data: (\{.*\})\n\n$/);
-    if (match) {
-      const parsed = JSON.parse(match[1]);
-      const content = parsed.choices[0].delta.content;
-      if (content) reconstructedContent += content;
-    }
-  }
-
-  // Ensure that no function/parameter tags or leaked fragments (-edit, filePath, etc.) are present in content
-  assert.ok(!reconstructedContent.includes('<function='), 'should not leak function tag');
-  assert.ok(!reconstructedContent.includes('edit'), 'should not leak tool name edit in content');
-  assert.ok(!reconstructedContent.includes('filePath'), 'should not leak parameter filePath in content');
-  assert.ok(!reconstructedContent.includes('oldString'), 'should not leak parameter oldString in content');
-  assert.ok(!reconstructedContent.includes('newString'), 'should not leak parameter newString in content');
+  const reconstructedContent = writtenEvents
+    .filter((e) => e.includes('"content"'))
+    .map((event) => {
+      const match = event.match(/^data: (\{.*\})\n\n$/);
+      return match ? JSON.parse(match[1]).choices[0].delta.content || '' : '';
+    })
+    .join('');
+  assert.strictEqual(reconstructedContent, chunks.join(''), 'legacy XML/code text must be preserved exactly');
 });
 
-test('one-chunk buffer: delays chunks with < but no > and combines with next chunk', async () => {
+test('ordinary less-than content streams immediately without XML buffering', async () => {
   const logId = 'test-one-chunk-buffer-log-id';
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
@@ -155,18 +126,7 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     reasoningBuffer: '',
     lastFullContent: '',
     lastRawContent: '',
-    lastFilteredSnapshot: '',
-    lastThinkingSnapshot: '',
     lastVStrRaw: '',
-    lastFilteredFullContent: '',
-    lastDeltaThinkingFull: '',
-    loggedToolCalls: new Set(),
-    lastParsePosition: 0,
-    toolCallDepth: 0,
-    chunksSinceLastTagOpen: 0,
-    pendingChunk: '',
-    recentChunks: [],
-    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -195,9 +155,7 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     retryWithNewAccount: () => {},
   };
 
-  // Simulate a tool call tag split across chunks: <function=read>\n...content...
-  // Chunk N: <func (has '<' no '>') → buffered
-  // Chunk N+1: tion=read>\nHello world (completes the tag) → combined → tool call detected
+  // Legacy XML-looking text is ordinary content without the request nonce.
   const chunks = ['<func', 'tion=read>\nHello world\n'];
 
   for (const chunk of chunks) {
@@ -214,23 +172,12 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     await processStreamData(data, state, ctx);
   }
 
-  // After processing:
-  // 1. pendingChunk should be empty (consumed on chunk 2)
-  assert.strictEqual(state.pendingChunk, '', 'pendingChunk should be consumed after second chunk');
-
-  // 2. lastFullContent should contain the combined text
-  assert.ok(state.lastFullContent.includes('<function=read>'), 'lastFullContent should have combined tool call tag');
-  assert.ok(state.lastFullContent.includes('Hello world'), 'lastFullContent should have content text');
-
-  // 3. toolCallDepth should be 1 (inside <function=...>)
-  assert.strictEqual(state.toolCallDepth, 1, 'toolCallDepth should be 1 inside open function tag');
-
-  // 4. No content should have been emitted to client (suppressed by toolCallDepth)
+  assert.strictEqual(state.lastFullContent, chunks.join(''));
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
-  assert.strictEqual(contentEvents.length, 0, 'no content should be emitted while inside tool call block');
+  assert.strictEqual(contentEvents.length, 2, 'both ordinary text chunks should stream immediately');
 });
 
-test('one-chunk buffer: releases non-tool-call < content normally', async () => {
+test('ordinary less-than and greater-than content streams normally', async () => {
   const logId = 'test-non-tool-call-buffer-log-id';
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
@@ -243,18 +190,7 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     reasoningBuffer: '',
     lastFullContent: '',
     lastRawContent: '',
-    lastFilteredSnapshot: '',
-    lastThinkingSnapshot: '',
     lastVStrRaw: '',
-    lastFilteredFullContent: '',
-    lastDeltaThinkingFull: '',
-    loggedToolCalls: new Set(),
-    lastParsePosition: 0,
-    toolCallDepth: 0,
-    chunksSinceLastTagOpen: 0,
-    pendingChunk: '',
-    recentChunks: [],
-    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -283,15 +219,7 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     retryWithNewAccount: () => {},
   };
 
-  // Non-tool-call text with < that might trigger the buffer:
-  // Chunk N: "The value is less than <" (has '<' no '>') → buffered
-  // Chunk N+1: "10 in this example" → combined → has '<' no '>' still, but < 200 chars → buffer again
-  // Chunk N+2: " and it works fine." → combined → still '<' no '>' if no '>' appears
-  // Actually, this doesn't have '>'. Let me use a case where '>' appears.
-  //
-  // Better case: content like "x < 10 and y > 5" split so '<' and '>' are in separate chunks:
-  // Chunk N: "Here x < " → has '<' no '>' → buffered
-  // Chunk N+1: "10 and y > 5" → combined → has '>' now → NOT buffered → emitted
+  // Ordinary comparison text split across chunks must be emitted unchanged.
   const chunks = ['Here x < ', '10 and y > 5.\n'];
 
   for (const chunk of chunks) {
@@ -308,11 +236,6 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     await processStreamData(data, state, ctx);
   }
 
-  // After processing:
-  // 1. pendingChunk should be empty
-  assert.strictEqual(state.pendingChunk, '', 'pendingChunk should be empty after content released');
-
-  // 2. Content should have been emitted to client
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
   assert.ok(contentEvents.length > 0, 'content should be emitted for non-tool-call text');
 
@@ -333,7 +256,7 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
   assert.ok(reconstructedContent.includes('10'), 'emitted content should contain the full text');
 });
 
-test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async () => {
+test('long less-than content streams without a buffer limit', async () => {
   const logId = 'test-buffer-overflow-log-id';
   logStore.createEntry(logId, 'qwen3.7-max', true);
 
@@ -346,18 +269,7 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     reasoningBuffer: '',
     lastFullContent: '',
     lastRawContent: '',
-    lastFilteredSnapshot: '',
-    lastThinkingSnapshot: '',
     lastVStrRaw: '',
-    lastFilteredFullContent: '',
-    lastDeltaThinkingFull: '',
-    loggedToolCalls: new Set(),
-    lastParsePosition: 0,
-    toolCallDepth: 0,
-    chunksSinceLastTagOpen: 0,
-    pendingChunk: '',
-    recentChunks: [],
-    loopStreak: 0,
   };
 
   const writtenEvents: string[] = [];
@@ -386,12 +298,9 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     retryWithNewAccount: () => {},
   };
 
-  // Force-release scenario: a tag-like chunk grows beyond MAX_BUFFER_CHARS.
-  // Use <funct (prefix of "function") so the pre-check allows buffering,
-  // then append long content to exceed 200 chars. The content has no '>'
-  // so the tag never completes, but length exceeds MAX_BUFFER_CHARS.
-  const chunk1 = '<funct' + 'A'.repeat(50);  // ~56 chars, has <funct prefix (looks like function tag)
-  const chunk2 = 'B'.repeat(160);  // combined > 200 → force-release
+  // Long legacy tag-like text must not wait for an XML buffer threshold.
+  const chunk1 = '<funct' + 'A'.repeat(50);
+  const chunk2 = 'B'.repeat(160);
 
   // Process chunk 1
   await processStreamData(
@@ -401,12 +310,6 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     state,
     ctx,
   );
-
-  // After chunk 1: should be buffered (looks like function tag start)
-  assert.strictEqual(state.pendingChunk, chunk1, 'chunk with tag-like < and no > should be buffered');
-  assert.strictEqual(state.lastFullContent, '', 'lastFullContent should NOT accumulate buffered chunk');
-
-  // Process chunk 2: combined length exceeds MAX_BUFFER_CHARS → force-release
   await processStreamData(
     {
       choices: [{ delta: { phase: 'answer', content: chunk2 } }],
@@ -415,14 +318,9 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     ctx,
   );
 
-  // After chunk 2: should be force-released
-  assert.strictEqual(state.pendingChunk, '', 'pendingChunk should be released after overflow');
-  assert.ok(state.lastFullContent.includes(chunk1), 'lastFullContent should contain buffered chunk1 after release');
-  assert.ok(state.lastFullContent.includes(chunk2), 'lastFullContent should contain chunk2 after release');
-
-  // Content should have been emitted (it exceeded the buffer limit, force-released as non-tool-call)
+  assert.strictEqual(state.lastFullContent, chunk1 + chunk2);
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
-  assert.ok(contentEvents.length > 0, 'content should be emitted after buffer overflow force-release');
+  assert.strictEqual(contentEvents.length, 2, 'both chunks should stream without waiting for a threshold');
 });
 
 function buildTestCtx(overrides: Partial<StreamProcessingCtx> = {}): {
@@ -457,18 +355,7 @@ function buildTestState(): StreamProcessingState {
     reasoningBuffer: '',
     lastFullContent: '',
     lastRawContent: '',
-    lastFilteredSnapshot: '',
-    lastThinkingSnapshot: '',
     lastVStrRaw: '',
-    lastFilteredFullContent: '',
-    lastDeltaThinkingFull: '',
-    loggedToolCalls: new Set(),
-    lastParsePosition: 0,
-    toolCallDepth: 0,
-    chunksSinceLastTagOpen: 0,
-    pendingChunk: '',
-    recentChunks: [],
-    loopStreak: 0,
   };
 }
 

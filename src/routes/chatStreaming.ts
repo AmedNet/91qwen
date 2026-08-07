@@ -1,5 +1,6 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
+import { setAccountDisabled } from '../services/accountManager.ts';
 import { logStore } from '../services/logStore.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import type { Message, OpenAIRequest } from '../types/openai.ts';
@@ -7,7 +8,7 @@ import { type AmplificationGuardState } from './chatHelpers.ts';
 import { type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { cleanupImmediately } from './cleanupHelpers.ts';
 import { handlePostStreamCompletion, runStreamLoop } from './streamLoop.ts';
-import { buildChunkEvent, makeChoice, writeEvent } from './writeHelpers.ts';
+import { buildChunkEvent, makeChoice, writeEvent, writeSseErrorEvent } from './writeHelpers.ts';
 
 export interface StreamingContext {
   c: Context;
@@ -23,6 +24,7 @@ export interface StreamingContext {
   toolCalling: boolean;
   cleanOutput: boolean;
   qwenLogFile?: string;
+  toolNonce?: string;
 }
 
 function buildPromptString(messages: Message[]): string {
@@ -74,10 +76,42 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         qwenAbortController,
         qwenLogFile: ctx.qwenLogFile,
         emittedToolCallCount: 0,
+        toolNonce: ctx.toolNonce,
+        clientTools: body.tools,
       };
 
       const bufferRef = { text: '' };
       const loopResult = await runStreamLoop(c, reader, streamState, streamCtx, ampState, bufferRef);
+
+      if (loopResult.retryAccount) {
+        if (resolvedEmail) setAccountDisabled(resolvedEmail, true);
+        const message = 'Upstream account reached its daily usage limit; retry the request on another account.';
+        logStore.addError(logId, message);
+        await writeSseErrorEvent(streamWriter, {
+          message,
+          type: 'upstream_error',
+          code: 'upstream_rate_limited',
+          upstreamCode: 'RateLimited',
+        });
+        await streamWriter.write('data: [DONE]\n\n');
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+          entry.finalResponse.finishReason = 'upstream_error';
+        });
+        logStore.finalizeRequest(logId);
+        cleanupImmediately(
+          streamReader,
+          heartbeatInterval,
+          session.chatId,
+          streamState.nextParentId,
+          sessionHeaders,
+          resolvedEmail,
+          sessionPool,
+          false,
+        );
+        streamReleased = true;
+        return;
+      }
 
       if (loopResult.error) {
         // Upstream went silent — silently terminate stream, log server-side only
@@ -107,7 +141,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         return;
       }
 
-      await handlePostStreamCompletion(
+      const postResult = await handlePostStreamCompletion(
         {
           streamWriter,
           completionId,
@@ -120,6 +154,11 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           buffer: loopResult.buffer,
           enableContentFiltering,
           includeUsage: !!body.stream_options?.include_usage,
+          tools: body.tools,
+          toolNonce: ctx.toolNonce,
+          streamError: streamCtx.streamError || (streamState.toolProtocolError
+            ? { message: streamState.toolProtocolError, type: 'upstream_error', code: 'tool_protocol_error' }
+            : undefined),
         },
         {
           reader,
@@ -130,6 +169,25 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           sessionPool,
         },
       );
+
+      if (postResult.retryAccount) {
+        const message = 'Upstream account reached its daily usage limit; retry the request on another account.';
+        logStore.addError(logId, message);
+        await writeSseErrorEvent(streamWriter, {
+          message,
+          type: 'upstream_error',
+          code: 'upstream_rate_limited',
+          upstreamCode: 'RateLimited',
+        });
+        await streamWriter.write('data: [DONE]\n\n');
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+          entry.finalResponse.finishReason = 'upstream_error';
+        });
+        logStore.finalizeRequest(logId);
+        streamReleased = true;
+        return;
+      }
 
       streamReleased = true;
       logStore.log('debug', 'stream', `[Stream] <<< Streaming completed for ${logId} in ${Date.now() - _streamStartTime}ms`);
@@ -175,7 +233,7 @@ function createHeartbeat(streamWriter: any): any {
 
 function buildInitialStreamState(finalPrompt: string, initialParentId: string | null): StreamProcessingState {
   return {
-    targetResponseId: null,
+    knownResponseIds: new Set<string>(),
     nextParentId: initialParentId,
     completionTokens: 0,
     promptTokens: Math.ceil(finalPrompt.length / 3.5),
@@ -183,14 +241,6 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     reasoningBuffer: '',
     lastFullContent: '',
     lastRawContent: '',
-    lastFilteredSnapshot: '',
-    lastThinkingSnapshot: '',
     lastVStrRaw: '',
-    lastFilteredFullContent: '',
-    lastDeltaThinkingFull: '',
-    loggedToolCalls: new Set(),
-    lastParsePosition: 0,
-    toolCallDepth: 0,
-    pendingChunk: '',
   };
 }

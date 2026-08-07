@@ -119,6 +119,8 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     qwenMessages: processedMessages,
     systemContent,
     toolResultsContent,
+    toolNonce,
+    toolPrompt,
   } = buildQwenMessages(cleanedMessages, body, availableTokens, toolCalling);
 
   // ── Inline content truncation ─────────────────────────────────
@@ -128,16 +130,26 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   let inlineContent = processedMessages[0].content as string;
   let chatHistoryContent = '';
 
-  if (typeof inlineContent === 'string' && inlineContent.length > MAX_INLINE_CHARS) {
+  // The tool protocol preamble carries this request's nonce and tool defs, and
+  // the response parsers rely on it. It is prefixed to the prompt, so it would
+  // otherwise be the first segment evicted — keep it out of truncation entirely.
+  const preamble = toolPrompt && typeof inlineContent === 'string' && inlineContent.startsWith(toolPrompt)
+    ? toolPrompt
+    : '';
+  if (preamble) inlineContent = inlineContent.slice(preamble.length);
+
+  if (typeof inlineContent === 'string' && preamble.length + inlineContent.length > MAX_INLINE_CHARS) {
     // Split on message boundaries: \n\n followed by <user> or <assist>
     const parts = inlineContent.split(/\n\n(?=<user>|<assist>)/);
 
-    // Walk backwards — keep as many recent segments as fit within limit
+    // Walk backwards — keep as many recent segments as fit within limit.
+    // The preamble is always inlined, so it consumes part of the budget.
+    const historyBudget = MAX_INLINE_CHARS - preamble.length;
     let keptLen = 0;
     let splitIdx = parts.length;
     for (let i = parts.length - 1; i >= 0; i--) {
       const addLen = parts[i].length + (keptLen > 0 ? 2 : 0);
-      if (keptLen + addLen <= MAX_INLINE_CHARS) {
+      if (keptLen + addLen <= historyBudget) {
         keptLen += addLen;
         splitIdx = i;
       } else {
@@ -150,8 +162,14 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     if (splitIdx > 0) {
       chatHistoryContent = parts.slice(0, splitIdx).join('\n\n');
       inlineContent = parts.slice(splitIdx).join('\n\n');
-      processedMessages[0] = { ...processedMessages[0], content: inlineContent };
     }
+  }
+
+  // Re-attach the preamble on every path: it was stripped above and must stay inline.
+  if (preamble) {
+    processedMessages[0] = { ...processedMessages[0], content: preamble + inlineContent };
+  } else if (typeof inlineContent === 'string' && inlineContent !== processedMessages[0].content) {
+    processedMessages[0] = { ...processedMessages[0], content: inlineContent };
   }
 
   // File upload happens inside retry loop using the same account as the request
@@ -374,6 +392,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       resolvedEmail,
       stream,
       qwenAbortController,
+      toolNonce,
     };
   }
 
@@ -432,7 +451,7 @@ export async function chatCompletions(c: Context) {
       );
     }
 
-    const { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupSession(
+    const { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController, toolNonce } = await setupSession(
       messages,
       body,
       contextCheck.availableTokens!,
@@ -455,6 +474,7 @@ export async function chatCompletions(c: Context) {
         sessionHeaders,
         toolCalling,
         cleanOutput,
+        toolNonce,
       });
     }
 
@@ -471,6 +491,7 @@ export async function chatCompletions(c: Context) {
       sessionHeaders,
       toolCalling,
       cleanOutput,
+      toolNonce,
     });
   } catch (err: any) {
     console.error(`[Chat] <<< Request failed after ${Date.now() - _requestStartTime}ms: ${err?.message || err}`);

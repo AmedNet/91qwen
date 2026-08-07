@@ -5,18 +5,23 @@ import { sessionPool } from '../services/sessionPool.ts';
 import { setAccountDisabled, throttleAccount } from '../services/accountManager.ts';
 import { detectParallelToolLoop } from '../tools/guard.ts';
 import type { Message, OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
-import { filterContent } from '../utils/contentFilter.ts';
 import {
   commonPrefixLen,
-  detectCumulativeChunk,
+  normalizeAnswerChunk,
+  type AnswerChunkMode,
   parseQwenErrorPayload,
   pendingCorrections,
   processToolCallsThroughGuard,
   ToolSpamGuard,
 } from './chatHelpers.ts';
 const MAX_TOOL_CALLS_PER_TURN = 8;
-import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed, alignArgsToSchema } from '../tools/xmlToolParser.ts';
-import { extractLocalMcpToolCalls } from './chatStreamingHelpers.ts';
+import { cleanTextOfXmlArtifacts, alignArgsToSchema } from '../tools/xmlToolParser.ts';
+import {
+  consumeNonceToolChunk,
+  createNonceToolStreamState,
+  flushNonceToolStream,
+  type NonceToolStreamState,
+} from '../tools/nonceToolStream.ts';
 
 export interface NonStreamingContext {
   c: Context;
@@ -32,6 +37,7 @@ export interface NonStreamingContext {
   cleanOutput: boolean;
   /** Mutable signal set when RateLimited is detected — caller checks after return. */
   retrySignal?: { needsRetry: boolean; failedEmail: string };
+  toolNonce?: string;
 }
 
 interface StreamProcessorState {
@@ -40,7 +46,11 @@ interface StreamProcessorState {
   currentThoughtIndex: number;
   reasoningBuffer: string;
   lastFullContent: string;
-  lastParsedPosition: number;
+  /** Raw answer snapshot used only for cumulative-delta detection. */
+  lastAnswerRaw: string;
+  answerChunkMode: AnswerChunkMode;
+  nonceToolStream?: NonceToolStreamState;
+  toolProtocolError?: string;
   knownResponseIds: Set<string>;
   toolCallsOut: any[];
   correctionPrompts: string[];
@@ -95,7 +105,9 @@ function buildQwenRequest(ctx: NonStreamingContext): StreamProcessorState {
     currentThoughtIndex: 0,
     reasoningBuffer: '',
     lastFullContent: '',
-    lastParsedPosition: 0,
+    lastAnswerRaw: '',
+    answerChunkMode: 'unknown',
+    nonceToolStream: ctx.toolNonce ? createNonceToolStreamState() : undefined,
     knownResponseIds: new Set<string>(),
     toolCallsOut: [],
     correctionPrompts: [],
@@ -133,20 +145,23 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
   const vStr = delta.content || '';
   if (!vStr || vStr === 'FINISHED') return;
   logStore.addRawChunk(ctx.logId, vStr);
-  if (vStr) {
-    if (state.lastFullContent.length > 0) {
-      const detection = detectCumulativeChunk(vStr, state.lastFullContent);
-      state.lastFullContent = detection.cumulative ? vStr : state.lastFullContent + vStr;
-    } else {
-      state.lastFullContent = vStr;
+
+  let rawText = vStr;
+  const normalized = normalizeAnswerChunk(vStr, state.lastAnswerRaw, state.answerChunkMode);
+  rawText = normalized.delta;
+  state.lastAnswerRaw = normalized.previousChunk;
+  state.answerChunkMode = normalized.mode;
+  if (!rawText) return;
+
+  if (ctx.toolNonce && state.nonceToolStream) {
+    const result = consumeNonceToolChunk(state.nonceToolStream, rawText, ctx.toolNonce, ctx.body.tools);
+    if (result.error) {
+      state.toolProtocolError = result.error;
+      return;
     }
-  }
-  const contentToCheck = state.lastFullContent.substring(state.lastParsedPosition);
-  if (contentToCheck.length > 0) {
-    const { toolCalls } = parseXmlToolCalls(contentToCheck);
-    if (toolCalls.length > 0) {
-      const parsed = toolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
-      processToolCallsThroughGuard(parsed, state.toolCallsOut, {
+    state.lastFullContent += result.content;
+    if (result.toolCalls.length > 0) {
+      processToolCallsThroughGuard(result.toolCalls, state.toolCallsOut, {
         logId: ctx.logId,
         toolSpamGuard: state.toolSpamGuard,
         correctionPrompts: state.correctionPrompts,
@@ -154,8 +169,10 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
         logParsed: true,
       });
     }
-    state.lastParsedPosition = state.lastFullContent.length;
+    return;
   }
+
+  state.lastFullContent += rawText;
 }
 
 function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonStreamingContext): void {
@@ -287,47 +304,20 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
     processThinkingDelta(delta, state);
   } else if (delta.phase === 'answer') {
     processAnswerDelta(delta, state, ctx);
-  } else if (delta.phase === 'local_tool') {
-    const localToolCalls = extractLocalMcpToolCalls(chunk);
-    if (localToolCalls.length > 0) {
-      processToolCallsThroughGuard(localToolCalls, state.toolCallsOut, {
+  }
+}
+
+function flushAndDetectLoops(state: StreamProcessorState, ctx: NonStreamingContext): void {
+  if (ctx.toolNonce && state.nonceToolStream) {
+    const result = flushNonceToolStream(state.nonceToolStream);
+    if (result.error) state.toolProtocolError = result.error;
+    state.lastFullContent += result.content;
+    if (result.toolCalls.length > 0) {
+      processToolCallsThroughGuard(result.toolCalls, state.toolCallsOut, {
         logId: ctx.logId,
         toolSpamGuard: state.toolSpamGuard,
         correctionPrompts: state.correctionPrompts,
         maxToolCalls: MAX_TOOL_CALLS_PER_TURN,
-        logParsed: true,
-      });
-    }
-  }
-}
-
-function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
-  const { toolCalls } = parseXmlToolCalls(state.lastFullContent);
-  if (toolCalls.length > 0) {
-    const parsed = toolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
-    const stableArgs = (args: Record<string, unknown>): string => {
-      const keys = Object.keys(args).sort();
-      return '{' + keys.map((k) => `${JSON.stringify(k)}:${JSON.stringify(args[k])}`).join(',') + '}';
-    };
-    const newCalls = parsed.filter((tc) => {
-      const tcArgsStr = stableArgs(tc.arguments as Record<string, unknown>);
-      return !state.toolCallsOut.some((existing) => {
-        let existingArgs: Record<string, unknown> = {};
-        try {
-          existingArgs = JSON.parse(existing.function.arguments);
-        } catch {
-          /* ignore */
-        }
-        return existing.function.name === tc.name && stableArgs(existingArgs) === tcArgsStr;
-      });
-    });
-    if (newCalls.length > 0) {
-      processToolCallsThroughGuard(newCalls, state.toolCallsOut, {
-        logId,
-        toolSpamGuard: state.toolSpamGuard,
-        correctionPrompts: state.correctionPrompts,
-        maxToolCalls: MAX_TOOL_CALLS_PER_TURN,
-        label: 'xml-flush',
         logParsed: true,
       });
     }
@@ -348,7 +338,7 @@ function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
   if (!loopCheck.ok) {
     logStore.log('debug', 'chat', `[🔄 PARALLEL LOOP] ${loopCheck.errors[0]}`);
     state.correctionPrompts.push(loopCheck.correctionPrompt);
-    logStore.addError(logId, `Parallel loop: ${loopCheck.errors[0]}`);
+    logStore.addError(ctx.logId, `Parallel loop: ${loopCheck.errors[0]}`);
     if (loopCheck.valid && loopCheck.valid.length < parsedForLoopCheck.length) {
       const validIds = new Set(loopCheck.valid.map((v) => v.id));
       state.toolCallsOut = state.toolCallsOut.filter((tc) => validIds.has(tc.id));
@@ -357,7 +347,7 @@ function flushAndDetectLoops(state: StreamProcessorState, logId: string): void {
 }
 
 function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingContext): Response {
-  const { c, logId, completionId, body, session, cleanOutput } = ctx;
+  const { c, logId, completionId, body, session } = ctx;
   const reasoningTokensEstimate = state.reasoningBuffer ? Math.ceil(state.reasoningBuffer.length / 4) : 0;
   const usage = {
     prompt_tokens: state.promptTokens,
@@ -366,11 +356,9 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
     completion_tokens_details: { reasoning_tokens: reasoningTokensEstimate },
     prompt_tokens_details: { cached_tokens: 0 },
   };
-  const contentForUser = cleanTextOfXmlArtifacts(state.lastFullContent).cleanedText;
+  const contentForUser = state.lastFullContent;
   state.lastFullContent = contentForUser;
-  const { cleanText: baseFilteredContent, thinking: filteredReasoning } = cleanOutput
-    ? filterContent(state.lastFullContent)
-    : { cleanText: state.lastFullContent, thinking: '' };
+  const { cleanText: baseFilteredContent, thinking: filteredReasoning } = { cleanText: state.lastFullContent, thinking: '' };
   if (filteredReasoning) {
     state.reasoningBuffer = state.reasoningBuffer ? state.reasoningBuffer + '\n' + filteredReasoning : filteredReasoning;
   }
@@ -496,7 +484,17 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
       upstreamError.status,
     );
   }
-  flushAndDetectLoops(state, logId);
+  flushAndDetectLoops(state, ctx);
+  if (state.toolProtocolError) {
+    const message = state.toolProtocolError;
+    logStore.addError(logId, `Tool protocol error: ${message}`);
+    logStore.updateEntry(logId, (entry) => {
+      entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+      entry.finalResponse.finishReason = 'tool_protocol_error';
+    });
+    logStore.finalizeRequest(logId);
+    return c.json({ error: { message, type: 'upstream_error', code: 'tool_protocol_error' } }, 502);
+  }
   // WAF diag: dump buffer contents when empty response detected or stream is suspiciously short
   if (!state.lastFullContent || state.buffer) {
     logStore.log('debug', 'qwen', `[Qwen] Non-stream buffer: lastContent=${state.lastFullContent?.length || 0} chars, toolCalls=${state.toolCallsOut.length}, bufLen=${state.buffer.length}, buf="${state.buffer.substring(0, 500)}" (logId=${logId})`);
@@ -517,7 +515,7 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
     dumpUpstreamDiagnostics({
       logId,
       accountEmail: resolvedEmail,
-      model: ctx.model,
+      model: ctx.body.model,
       stream: false,
       trigger: 'nonstream_empty',
       bufferSnippet: state.buffer,

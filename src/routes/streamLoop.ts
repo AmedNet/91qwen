@@ -1,12 +1,11 @@
 ﻿import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { setAccountDisabled, throttleAccount } from '../services/accountManager.ts';
-import { parseXmlToolCalls } from '../tools/xmlToolParser.ts';
-import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
-import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
+import { type AmplificationGuardState, parseQwenErrorPayload } from './chatHelpers.ts';
+import { processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { checkFinalAmplification, scheduleCleanup } from './cleanupHelpers.ts';
-import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent, writeSseErrorEvent, writeToolCallEvent } from './writeHelpers.ts';
-import { alignArgsToSchema, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
+import { buildChunkEvent, buildUsage, makeChoice, writeContentDelta, writeEvent, writeSseErrorEvent, writeToolCallEvent } from './writeHelpers.ts';
+import { flushNonceToolStream } from '../tools/nonceToolStream.ts';
 
 /** Shared TextDecoder — stateless, safe to reuse across streams */
 export const sharedDecoder = new TextDecoder();
@@ -146,6 +145,8 @@ export async function handlePostStreamCompletion(
     includeUsage: boolean;
     /** Client-registered tool schemas; used to align flush-time tool-call arg names to the schema's casing. */
     tools?: any[];
+    /** Same nonce injected into the upstream prompt; selects nonce protocol flush. */
+    toolNonce?: string;
     /** When true, skip post-stream processing — caller is retrying with a new account. */
     skipPostStream?: boolean;
     /** Non-RateLimited upstream error caught mid-stream by processStreamData
@@ -241,74 +242,52 @@ export async function handlePostStreamCompletion(
       return { retryAccount: false };
     }
 
-    // Flush any pending chunk left in the one-chunk buffer
-    if (streamState.pendingChunk) {
-      streamState.lastFullContent += streamState.pendingChunk;
-      streamState.pendingChunk = '';
-    }
+    let effectiveToolCallCount = emittedToolCallCount;
 
-    // Count tool calls from the final assembled content
-    const finalToolCalls = streamState.lastFullContent ? parseXmlToolCalls(streamState.lastFullContent).toolCalls.length : 0;
-    const effectiveToolCallCount = Math.max(emittedToolCallCount, finalToolCalls);
-
-    // Populate parsedToolCalls from full accumulated content (per-chunk extraction
-    // never sees complete blocks since individual SSE deltas are too small).
-    if (streamState.lastFullContent && effectiveToolCallCount > emittedToolCallCount) {
-      const parsed = parseXmlToolCalls(streamState.lastFullContent).toolCalls;
-      // Avoid double-counting: only add tool calls that weren't already emitted
-      for (const tc of parsed.slice(emittedToolCallCount)) {
-        logStore.updateEntry(logId, (entry) => {
-          entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.parameters) });
+    if (args.toolNonce) {
+      const nonceFlush = streamState.nonceToolStream
+        ? flushNonceToolStream(streamState.nonceToolStream)
+        : { content: '', toolCalls: [] };
+      if (nonceFlush.error) {
+        logStore.addError(logId, `Tool protocol error: ${nonceFlush.error}`);
+        await writeSseErrorEvent(streamWriter, {
+          message: nonceFlush.error,
+          type: 'upstream_error',
+          code: 'tool_protocol_error',
         });
+        await streamWriter.write('data: [DONE]\n\n');
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+          entry.finalResponse.finishReason = 'tool_protocol_error';
+        });
+        logStore.finalizeRequest(logId);
+        return { retryAccount: false };
       }
-      // Emit the tool calls that were only assembled at flush time (e.g. completed
-      // from the pendingChunk buffer) as SSE events. Without this the client sees
-      // finish_reason:"tool_calls" but never receives a tool_calls chunk, so the
-      // turn dead-ends. Mirror the per-chunk path: align args + writeToolCallEvent.
-      const flushToolCalls = parsed.slice(emittedToolCallCount);
-      for (let i = 0; i < flushToolCalls.length; i++) {
-        const parsedCall = xmlToolCallToParsed(flushToolCalls[i], emittedToolCallCount + i);
-        parsedCall.arguments = alignArgsToSchema(parsedCall.name, parsedCall.arguments, args.tools);
-        await writeToolCallEvent(streamWriter, completionId, model, parsedCall, emittedToolCallCount + i);
+      if (nonceFlush.content) {
+        streamState.lastRawContent += nonceFlush.content;
+        streamState.lastFullContent += nonceFlush.content;
+        await writeContentDelta(
+          streamWriter,
+          completionId,
+          model,
+          nonceFlush.content,
+          ampState,
+          logId,
+          resolvedEmail,
+          streamState.lastRawContent,
+          streamState.lastVStrRaw,
+          logStore,
+        );
       }
-    }
-
-    const pipelineResult = filterContentPipeline(streamState.lastFullContent, enableContentFiltering);
-    const flushCleaned = pipelineResult.cleanText;
-    const flushThinking = pipelineResult.thinking;
-
-    if (flushThinking) {
-      const thinkDelta = getSnapshotDelta(flushThinking, streamState.lastThinkingSnapshot);
-      if (thinkDelta) {
-        streamState.lastThinkingSnapshot = flushThinking;
-        await writeReasoningEvent(streamWriter, completionId, model, thinkDelta);
-      }
-    }
-    if (flushCleaned) {
-      const contentDelta = getSnapshotDelta(flushCleaned, streamState.lastFilteredSnapshot);
-      if (contentDelta) {
-        streamState.lastFilteredSnapshot = flushCleaned;
-        if (
-          checkAmplificationGuard(
-            ampState,
-            contentDelta.length,
-            logId,
-            resolvedEmail,
-            model,
-            streamState.lastRawContent,
-            streamState.lastVStrRaw,
-          )
-        ) {
-          // guard triggered — skip content emission
-        } else {
-          const ct = contentDelta.replace(/[\n\s]*$/, '');
-          if (ct) {
-            logStore.addProcessedOutput(logId, ct);
-            ampState.emittedOutputBytes += ct.length;
-            await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: ct })]));
-          }
+      if (nonceFlush.toolCalls.length > 0) {
+        logStore.updateEntry(logId, (entry) => {
+          for (const tc of nonceFlush.toolCalls) entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.arguments) });
+        });
+        for (const [i, tc] of nonceFlush.toolCalls.entries()) {
+          await writeToolCallEvent(streamWriter, completionId, model, tc, emittedToolCallCount + i);
         }
       }
+      effectiveToolCallCount += nonceFlush.toolCalls.length;
     }
 
     const usage = buildUsage(streamState.promptTokens, streamState.completionTokens, streamState.reasoningBuffer);

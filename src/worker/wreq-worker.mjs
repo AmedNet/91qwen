@@ -69,11 +69,15 @@ const server = http.createServer(async (req, res) => {
       });
 
       try {
+        // disableDefaultHeaders (default true) sends a bare request that looks
+        // like an API client. Some endpoints need the full browser header set —
+        // the root page returns acw_tc only to a request carrying real browser
+        // headers — so callers can opt out via useDefaultHeaders: true.
         const opts = {
           method,
           headers,
           body: reqBody,
-          disableDefaultHeaders: true,
+          disableDefaultHeaders: !spec.useDefaultHeaders,
           signal: AbortSignal.timeout(timeout * 1000),
         };
 

@@ -4,9 +4,10 @@ import { fileURLToPath } from 'node:url';
 import { modelRouter } from '../services/modelRouter.ts';
 import { DEFAULT_SYSTEM_PROMPT } from '../services/defaultSystemPrompt.ts';
 import { buildFeatureConfig, createQwenStream } from '../services/qwen.ts';
+import { createToolNonce, toolEnvelopeClose, toolEnvelopeOpen } from '../tools/nonceToolParser.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import type { ModelSpec } from '../types/openai.ts';
-import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
+import { THINK_TAG_NAMES } from '../utils/tagNames.ts';
 import { pendingCorrections } from './chatHelpersCore.ts';
 import { compressToolResult } from './compressToolResult.ts';
 
@@ -63,6 +64,10 @@ export interface BuildQwenMessagesResult {
   qwenMessages: QwenMessage[];
   systemContent?: string;
   toolResultsContent?: string;
+  /** Request-scoped token binding the injected tool protocol to response parsing. */
+  toolNonce?: string;
+  /** Injected protocol preamble, prefixed to the prompt. Must never be truncated away. */
+  toolPrompt?: string;
 }
 
 // ── Business logic ───────────────────────────────────────────────
@@ -177,13 +182,9 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
           } else if (args && typeof args === 'object') {
             parsedArgs = args;
           }
-          const FKW = TOOL_CALL_KEYWORDS[0];
-          const PKW = TOOL_CALL_KEYWORDS[1];
-          const xmlParams = Object.entries(parsedArgs)
-            .map(([k, v]) => `<${PKW}=${k}>${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}</${PKW}>`)
-            .join('\n');
-          const xmlPayload = `<${FKW}=${tc.function?.name}>\n${xmlParams}\n</${FKW}>`;
-          assistantContent = assistantContent ? assistantContent + '\n' + xmlPayload : xmlPayload;
+          const historyCall = JSON.stringify({ name: tc.function?.name, arguments: parsedArgs });
+          const historyPayload = `<tool-call-history>${historyCall}</tool-call-history>`;
+          assistantContent = assistantContent ? assistantContent + '\n' + historyPayload : historyPayload;
         }
       }
 
@@ -256,29 +257,34 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const featureConfig = buildFeatureConfig(!body.model.includes("-no-thinking"));
 
+  let toolNonce: string | undefined;
+  let toolPromptOut: string | undefined;
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
-    const localMcp: Record<string, any> = {};
-    localMcp['★'] = {};
-    for (const t of body.tools) {
+    toolNonce = createToolNonce();
+    const toolDefs = body.tools.map((t: any) => {
       const fn = t.function || {};
-      localMcp['★'][fn.name] = {
+      return {
+        name: fn.name || t.name || '',
         description: fn.description || '',
-        input_schema: fn.parameters || { type: 'object', properties: {} },
+        parameters: fn.parameters || { type: 'object', properties: {} },
       };
-    }
-    featureConfig.local_mcp = localMcp;
-    // ponytail: tool schema in system prompt as textual fallback for models
-    // that don't honor feature_config.local_mcp consistently
-    const toolDescriptions = body.tools
-      .map((t: any) => {
-        const fn = t.function || {};
-        const params = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(', ') : '';
-        return `- ${fn.name}${fn.description ? `: ${fn.description}` : ''}${params ? ` (params: ${params})` : ''}`;
-      })
-      .join('\n');
-    systemParts.push(
-      `You have access to the following tools:\n${toolDescriptions}\n\nTo call a tool, respond with the tool call in the appropriate format.`,
-    );
+    });
+    const opener = toolEnvelopeOpen(toolNonce);
+    const closer = toolEnvelopeClose(toolNonce);
+    const toolPrompt =
+      '\n\n## AVAILABLE TOOLS\n' +
+      'The following JSON contains the only tools available in this environment:\n' +
+      '<tool-defs>\n' + JSON.stringify(toolDefs) + '\n</tool-defs>\n\n' +
+      'Normal answers are ordinary text. When you need to call one or more tools, output exactly one envelope using these exact markers. The JSON payload must have this shape:\n' +
+      `${opener}{"tool_calls":[{"name":"<registered tool name>","arguments":{}}]}${closer}\n\n` +
+      'Rules:\n' +
+      '- Use only an exact tool name from the JSON tool list.\n' +
+      '- The arguments value must be a JSON object and must satisfy that tool schema.\n' +
+      '- Include every required argument with a non-empty value.\n' +
+      '- Do not output XML function tags, parameter tags, or any other tool-call format.\n' +
+      '- After the closing marker, stop immediately and output no other text.';
+    toolPromptOut = toolPrompt;
+    prompt = toolPrompt + (prompt ? '\n' + prompt : '');
   }
 
   // Single message (Qwen API only accepts 1 message per chat)
@@ -310,7 +316,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
     },
   ];
 
-  return { qwenMessages, systemContent, toolResultsContent };
+  return { qwenMessages, systemContent, toolResultsContent, toolNonce, toolPrompt: toolPromptOut };
 }
 
 export function handleImageModelFallback(body: any, messages: any[]): void {

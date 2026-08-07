@@ -103,11 +103,15 @@ export interface WreqFetchOptions {
   impersonate?: string;
   timeout?: number;
   debugLogDir?: string;
+  /** Send the full browser header set instead of a bare request. Required for
+   *  endpoints that only respond to a real-browser header profile (e.g. the
+   *  root page sets acw_tc only for such requests). */
+  useDefaultHeaders?: boolean;
 }
 
 export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Promise<Response> {
   const baseUrl = await ensureWorker();
-  const { method = 'GET', headers = {}, body, stream = false, impersonate = 'chrome_142', timeout = 30 } = options;
+  const { method = 'GET', headers = {}, body, stream = false, impersonate = 'chrome_142', timeout = 30, useDefaultHeaders } = options;
 
   logSessionCreate('wreqFetch.request', { method, url: url.split('?')[0], stream });
 
@@ -123,6 +127,7 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
         stream,
         impersonate,
         timeout,
+        useDefaultHeaders,
         debugLogDir: options.debugLogDir,
       }),
       signal: options.signal,
@@ -139,7 +144,7 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
     response = await fetch(`${baseUrl2}/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ method, url, headers, body: body || undefined, stream, impersonate, timeout }),
+      body: JSON.stringify({ method, url, headers, body: body || undefined, stream, impersonate, timeout, useDefaultHeaders }),
       signal: options.signal,
     });
   }
