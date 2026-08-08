@@ -210,24 +210,5 @@ function compressLongContent(content: string, lines: string[], totalLines: numbe
  * into a form the model can analyze but cannot verbatim-repeat.
  */
 export function compressToolResult(content: string): string {
-  if (!content || content.length < 500) return content;
-
-  const lines = content.split('\n');
-  const totalLines = lines.length;
-  const trimmed = content.trim();
-
-  return (
-    compressGitDiff(content, lines, totalLines) ??
-    compressJson(content, trimmed) ??
-    compressFileListing(content, lines, totalLines) ??
-    compressCargoTest(content, lines, totalLines) ??
-    compressPytest(content, lines, totalLines) ??
-    compressDocker(content, lines, totalLines) ??
-    compressNpm(content, lines, totalLines) ??
-    compressGitLog(content, lines, totalLines) ??
-    compressGitStatus(content, lines, totalLines) ??
-    compressGitPush(content, lines, totalLines) ??
-    compressLongContent(content, lines, totalLines, trimmed) ??
-    truncateToolResult(content)
-  );
+  return content;
 }

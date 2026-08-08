@@ -168,26 +168,31 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const featureConfig = buildFeatureConfig(true);
 
+  const MAX_TOOL_DESC_LENGTH = 300;
+
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const localMcp: Record<string, any> = {};
     localMcp['★'] = {};
     const toolNames: string[] = [];
     for (const t of body.tools) {
       const fn = t.function || {};
+      const rawDesc = fn.description || '';
+      const desc = rawDesc.length > MAX_TOOL_DESC_LENGTH ? rawDesc.substring(0, MAX_TOOL_DESC_LENGTH) + '...' : rawDesc;
       localMcp['★'][fn.name] = {
-        description: fn.description || '',
+        description: desc,
         input_schema: fn.parameters || { type: 'object', properties: {} },
       };
-      toolNames.push(`${fn.name}${fn.description ? ` (${fn.description})` : ''}`);
+      const shortDesc = rawDesc.length > 150 ? rawDesc.substring(0, 150) + '...' : rawDesc;
+      toolNames.push(`${fn.name}${shortDesc ? ` (${shortDesc})` : ''}`);
     }
     featureConfig.local_mcp = localMcp;
-    // ponytail: tool schema in system prompt as textual fallback for models
-    // that don't honor feature_config.local_mcp consistently
     const toolDescriptions = body.tools
       .map((t: any) => {
         const fn = t.function || {};
+        const rawDesc = fn.description || '';
+        const desc = rawDesc.length > 150 ? rawDesc.substring(0, 150) + '...' : rawDesc;
         const params = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(', ') : '';
-        return `- ${fn.name}${fn.description ? `: ${fn.description}` : ''}${params ? ` (params: ${params})` : ''}`;
+        return `- ${fn.name}${desc ? `: ${desc}` : ''}${params ? ` (params: ${params})` : ''}`;
       })
       .join('\n');
     systemParts.push(

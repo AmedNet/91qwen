@@ -14,6 +14,7 @@ import { debugNetworkApp } from './routes/debugNetwork.ts';
 import { getAccountCount, getAccountStats, getAccounts, getAvailableCount, initAuth, setStartupStatus } from './services/auth.ts';
 import { config, updateClaudeCodeSettings } from './services/configService.ts';
 import { logStore } from './services/logStore.ts';
+import { initQwenLogger } from './services/qwenLogger.ts';
 import { configureAccount, fetchQwenModels } from './services/qwen.ts';
 import { safeCompare } from './utils/auth.ts';
 import { startScreencast, handleInputEvent, closeScreencast } from './services/cdpScreencast.ts';
@@ -239,6 +240,9 @@ app.get(
 if (import.meta.main) {
   // Enable per-request file logging
   logStore.enableRequestFileLogging(projectPath('.logs'));
+
+  // Enable Qwen request/response logging
+  initQwenLogger(projectPath('.logs', 'qwen'));
 
   // Auto-configure Claude Code proxy if toggled on
   updateClaudeCodeSettings(config.getAll());

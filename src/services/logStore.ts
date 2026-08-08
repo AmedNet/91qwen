@@ -62,6 +62,7 @@ export interface LogEntry {
     tool_choice: unknown | null;
     lastMessage: string;
     messages: Array<{ role: string; content: string }>;
+    fullBody?: unknown;
   };
   promptToQwen?: {
     systemPromptLength: number;

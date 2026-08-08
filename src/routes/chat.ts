@@ -77,6 +77,7 @@ async function parseRequestBody(c: Context) {
   const contextCheck = checkContextWindow(estimatedTokens, maxContext, maxOutput, body.model as string, formattedMessages);
 
   return {
+    rawBody,
     body,
     isStream,
     toolCalling,
@@ -150,6 +151,10 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     if (splitIdx > 0) {
       chatHistoryContent = parts.slice(0, splitIdx).join('\n\n');
       inlineContent = parts.slice(splitIdx).join('\n\n');
+      if (!inlineContent && chatHistoryContent.length > MAX_INLINE_CHARS) {
+        inlineContent = chatHistoryContent.slice(-MAX_INLINE_CHARS);
+        chatHistoryContent = chatHistoryContent.slice(0, -MAX_INLINE_CHARS);
+      }
       processedMessages[0] = { ...processedMessages[0], content: inlineContent };
     }
   }
@@ -381,7 +386,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   throw lastError || new Error('All accounts are rate-limited. Please wait and try again later.');
 }
 
-function populateLogEntry(logEntry: any, body: OpenAIRequest, messages: any[]): void {
+function populateLogEntry(logEntry: any, body: OpenAIRequest, messages: any[], rawBody?: unknown): void {
   const rawContent = messages.length > 0 ? messages[messages.length - 1].content : '';
   const lastMsg = typeof rawContent === 'string' ? rawContent : rawContent !== undefined ? JSON.stringify(rawContent) : '';
   logEntry.clientRequest = {
@@ -392,6 +397,7 @@ function populateLogEntry(logEntry: any, body: OpenAIRequest, messages: any[]): 
     tool_choice: body.tool_choice ? (typeof body.tool_choice === 'string' ? body.tool_choice : JSON.stringify(body.tool_choice)) : null,
     lastMessage: lastMsg.substring(0, 300),
     messages: messages.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) })),
+    ...(rawBody !== undefined ? { fullBody: rawBody } : {}),
   };
 }
 
@@ -400,7 +406,7 @@ export async function chatCompletions(c: Context) {
   const _requestStartTime = Date.now();
   try {
     const parsed = await parseRequestBody(c);
-    const { body, isStream, toolCalling, cleanOutput, messages, contextCheck } = parsed;
+    const { rawBody, body, isStream, toolCalling, cleanOutput, messages, contextCheck } = parsed;
     logStore.log(
       'debug',
       'chat',
@@ -411,7 +417,7 @@ export async function chatCompletions(c: Context) {
       entry.apiType = 'openai';
     });
     const logEntry = logStore.getEntry(logId);
-    if (logEntry) populateLogEntry(logEntry, body, messages);
+    if (logEntry) populateLogEntry(logEntry, body, messages, rawBody);
 
     if (!contextCheck.ok) {
       logStore.updateEntry(logId, (entry) => {

@@ -330,6 +330,10 @@ async function setupAnthropicSession(
     if (splitIdx > 0) {
       chatHistoryContent = parts.slice(0, splitIdx).join('\n\n');
       inlineContent = parts.slice(splitIdx).join('\n\n');
+      if (!inlineContent && chatHistoryContent.length > MAX_INLINE_CHARS) {
+        inlineContent = chatHistoryContent.slice(-MAX_INLINE_CHARS);
+        chatHistoryContent = chatHistoryContent.slice(0, -MAX_INLINE_CHARS);
+      }
       processedMessages[0] = { ...processedMessages[0], content: inlineContent };
     }
   }
@@ -497,6 +501,32 @@ async function setupAnthropicSession(
       continue;
     }
     clearTimeout(firstChunkTimer);
+
+    if (firstChunk.value && !firstChunk.done) {
+      const firstText = new TextDecoder().decode(firstChunk.value);
+      if (
+        firstText.includes('FAIL_SYS_USER_VALIDATE') ||
+        firstText.includes('CAPTCHA') ||
+        firstText.includes('punish')
+      ) {
+        const err = new RetryableQwenStreamError(
+          `Qwen validation failed: ${firstText.substring(0, 200)}`,
+          3000,
+        );
+        logStore.log(
+          'warn',
+          'chat',
+          `[Anthropic] Qwen validation error on first chunk for ${resolvedEmail}: ${firstText.substring(0, 100)}`,
+        );
+        streamReader.cancel().catch(() => {});
+        qwenAbortController?.abort();
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+        lastFailedEmail = resolvedEmail;
+        lastError = err;
+        continue;
+      }
+    }
 
     stream = new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -1087,6 +1117,7 @@ export async function anthropicMessages(c: Context) {
           role: m.role,
           content: formatContent(m.content).substring(0, 2000),
         })),
+        fullBody: rawBody,
       };
     });
 

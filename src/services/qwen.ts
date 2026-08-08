@@ -6,7 +6,7 @@ import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
 import { completeEntry, errorEntry, recordStreamChunk } from './networkDebug.ts';
-import { logQwenRequest } from './qwenLogger.ts';
+import { logQwenRequest, logQwenResponse, logQwenSSE } from './qwenLogger.ts';
 
 export { configureAccount, deleteAllChats, fetchQwenModels } from './qwenModels.ts';
 
@@ -349,6 +349,11 @@ export async function createQwenStream(
   }
 
   let makeRequestQwenLogFile: string | undefined;
+  let qwenResponseStatus = 0;
+  let qwenResponseStatusText = '';
+  let qwenResponseHeaders: Record<string, string> = {};
+  let qwenResponsePreview = '';
+  let sseEventCount = 0;
   const makeRequest = async (): Promise<{ response: Response; headers: Record<string, string>; qwenLogFile?: string }> => {
     const bodyStr = JSON.stringify(payload);
     if (config.get('SAVE_REQUEST_LOGS') === 'true') {
@@ -397,6 +402,24 @@ export async function createQwenStream(
       'qwen',
       `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'}`,
     );
+
+    if (config.get('SAVE_REQUEST_LOGS') === 'true') {
+      qwenResponseStatus = response.status;
+      qwenResponseStatusText = response.statusText;
+      response.headers.forEach((value, key) => {
+        qwenResponseHeaders[key] = value;
+      });
+
+      try {
+        const clone = response.clone();
+        const text = await clone.text();
+        qwenResponsePreview = text.substring(0, 10000);
+        logQwenResponse(makeRequestQwenLogFile || '', response.status, response.statusText, qwenResponseHeaders, qwenResponsePreview);
+      } catch (err) {
+        logStore.log('warn', 'qwen', `[Qwen] Failed to read response for logging: ${(err as Error).message}`);
+      }
+    }
+
     return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile };
   };
 
@@ -425,11 +448,17 @@ export async function createQwenStream(
         if (streamDebugEntryId) {
           recordStreamChunk(streamDebugEntryId, textDecoder.decode(chunk, { stream: true }));
         }
+        if (config.get('SAVE_REQUEST_LOGS') === 'true') {
+          sseEventCount++;
+        }
         controller.enqueue(chunk);
       },
       flush() {
         if (streamDebugEntryId) {
           completeEntry(streamDebugEntryId);
+        }
+        if (config.get('SAVE_REQUEST_LOGS') === 'true' && makeRequestQwenLogFile) {
+          logQwenSSE(makeRequestQwenLogFile, sseEventCount, 0, []);
         }
         try {
           wreqClose?.();
