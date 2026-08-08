@@ -51,24 +51,39 @@ const MAX_BUFFER_CHARS = 200;
  */
 export function extractLocalMcpToolCalls(sseData: any): ParsedToolCall[] {
   const localMcp = sseData?.choices?.[0]?.delta?.extra?.local_mcp;
-  if (!localMcp) return [];
-
-  const serverTools = localMcp['★'];
-  if (!Array.isArray(serverTools)) return [];
-
-  const toolCalls: ParsedToolCall[] = [];
-  for (const tool of serverTools) {
-    if (tool?.tool_name && tool?.params !== undefined) {
-      const rawName = tool.tool_name;
-      const name = resolveToolName(rawName.startsWith('★-') ? rawName.slice(2) : rawName);
-      toolCalls.push({
-        id: `call_${crypto.randomUUID()}`,
-        name,
-        arguments: tool.params,
-      });
+  if (localMcp) {
+    const serverTools = localMcp['★'];
+    if (Array.isArray(serverTools)) {
+      const toolCalls: ParsedToolCall[] = [];
+      for (const tool of serverTools) {
+        if (tool?.tool_name && tool?.params !== undefined) {
+          const rawName = tool.tool_name;
+          const name = resolveToolName(rawName.startsWith('★-') ? rawName.slice(2) : rawName);
+          toolCalls.push({
+            id: `call_${crypto.randomUUID()}`,
+            name,
+            arguments: tool.params,
+          });
+        }
+      }
+      return toolCalls;
     }
   }
-  return toolCalls;
+
+  const delta = sseData?.choices?.[0]?.delta;
+  if (delta?.phase === 'local_tool' && delta?.tool_name) {
+    const rawName = delta.tool_name;
+    const name = resolveToolName(rawName.startsWith('★-') ? rawName.slice(2) : rawName);
+    return [
+      {
+        id: `call_${crypto.randomUUID()}`,
+        name,
+        arguments: delta.params || {},
+      },
+    ];
+  }
+
+  return [];
 }
 
 // ── Per-chunk stream processing ────────────────────────────────────

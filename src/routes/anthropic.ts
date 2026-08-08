@@ -676,7 +676,7 @@ async function handleAnthropicStream(
           // Extract local MCP tool calls
           const deltaStatus = chunk.choices?.[0]?.delta?.status;
           const deltaPhase = chunk.choices?.[0]?.delta?.phase;
-          if (deltaStatus === 'finished' && deltaPhase === 'local_tool') {
+          if (deltaPhase === 'local_tool') {
             const calls = extractLocalMcpToolCalls(chunk);
             logStore.log('debug', 'chat', `[Anthropic] local_mcp SSE chunk: extracted ${calls.length} tool calls`);
             for (const c of calls) {
