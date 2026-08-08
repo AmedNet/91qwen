@@ -110,6 +110,7 @@ export function logQwenResponse(
     statusText,
     headers,
     responsePreview: responsePreview.substring(0, 50000),
+    responseFull: responsePreview,
   });
 }
 

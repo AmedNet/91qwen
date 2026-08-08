@@ -134,8 +134,10 @@ export async function handlePostStreamCompletion(
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
 
   try {
+    logStore.log('debug', 'stream', `[Stream] Post-stream buffer (${buffer.length} chars): ${buffer.substring(0, 2000)}`);
     const upstreamError = parseQwenErrorPayload(buffer);
-    if (upstreamError) {
+    if (upstreamError && !streamState.lastFullContent) {
+      logStore.log('warn', 'stream', `[Stream] Upstream error with empty content: ${upstreamError.message}`);
       try {
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
       } catch (e) {}
