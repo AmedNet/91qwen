@@ -631,7 +631,24 @@ async function handleAnthropicStream(
             }),
           ]);
         } catch (streamErr: any) {
-          logStore.log('warn', 'chat', `[Anthropic] ${streamErr.message || 'Stream read error'} (logId=${logId})`);
+          const errMsg = streamErr.message || 'Stream read error';
+          logStore.log('warn', 'chat', `[Anthropic] ${errMsg} (logId=${logId})`);
+          if (!streamReleased && streamWriter) {
+            try {
+              await streamWriter.write(
+                `event: error\ndata: ${JSON.stringify({
+                  type: 'error',
+                  error: {
+                    type: 'server_error',
+                    message: errMsg,
+                  },
+                })}\n\n`,
+              );
+              await streamWriter.write('data: [DONE]\n\n');
+            } catch {
+              /* stream may already be closed */
+            }
+          }
           break;
         } finally {
           if (idleTimer) clearTimeout(idleTimer);
@@ -1176,15 +1193,23 @@ export async function anthropicMessages(c: Context) {
       );
       if (openAIResp.error) {
         logStore.log('error', 'chat', `[Anthropic] OpenAI endpoint returned error: ${JSON.stringify(openAIResp.error)}`);
+        const status = openAIResponse.status;
+        const retryable = status === 502 || status === 503 || status === 504 || status === 429;
+        const retryAfterMs =
+          status === 429 ? 3600000 :
+          status === 502 || status === 503 || status === 504 ? 3000 :
+          undefined;
         return c.json(
           {
             error: {
               message: openAIResp.error.message,
               type: openAIResp.error.type || 'server_error',
               code: openAIResp.error.code || undefined,
+              retryable,
+              ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
             },
           },
-          <any>openAIResponse.status,
+          <any>status,
         );
       }
       const anthropicResp = convertOpenAIResponseToAnthropic(openAIResp, anthropicModel);
@@ -1228,6 +1253,8 @@ export async function anthropicMessages(c: Context) {
             message: 'All accounts have reached their daily usage limit. Please try again later.',
             type: 'rate_limit_error',
             code: 'rate_limit_exceeded',
+            retryable: true,
+            retry_after_ms: 3600000,
           },
         },
         429,
@@ -1235,9 +1262,22 @@ export async function anthropicMessages(c: Context) {
     }
     const status = err.upstreamStatus || 500;
     const cleanMessage = cleanTextOfXmlArtifacts(err.message || String(err)).cleanedText || err.message || 'Internal error';
+    const retryable = status === 502 || status === 503 || status === 504 || status === 429;
+    const retryAfterMs =
+      status === 429 ? 3600000 :
+      status === 502 || status === 503 || status === 504 ? 3000 :
+      undefined;
     logStore.log('error', 'chat', `[Anthropic] Returning ${status}: ${cleanMessage}`);
     cancelWatchdog();
     if (anthropicVersion) c.header('anthropic-version', anthropicVersion);
-    return c.json({ error: { message: cleanMessage, type: err.type || 'server_error', code: err.code || undefined } }, <any>status);
+    return c.json({
+      error: {
+        message: cleanMessage,
+        type: err.type || 'server_error',
+        code: err.code || undefined,
+        retryable,
+        ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
+      },
+    }, <any>status);
   }
 }

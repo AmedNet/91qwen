@@ -12,7 +12,7 @@ import {
   getSnapshotDelta,
 } from './chatHelpers.ts';
 
-import { writeContentDelta, writeReasoningEvent, writeToolCallEvent, buildErrorEvent } from './writeHelpers.ts';
+import { writeContentDelta, writeEvent, writeReasoningEvent, writeToolCallEvent, buildErrorEvent } from './writeHelpers.ts';
 
 // ── Constants ──────────────────────────────────────────────────────
 

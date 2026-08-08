@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
-import { decrementInFlight, getTokenWithAccount, pickAccount, throttleAccount } from './auth.ts';
+import { decrementInFlight, getTokenWithAccount, pickAccount, setAccountDisabled, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
@@ -281,17 +281,17 @@ export async function createQwenStream(
           const wait = errorJson.data?.num !== undefined ? ` Wait about ${errorJson.data.num} hour(s) before trying again.` : '';
           if (code === 'RateLimited' && currentAccountEmail) {
             const throttleMs = (errorJson.data?.num || 1) * 3600_000;
-            // Use the full duration from Qwen (e.g. 7 hours) — do NOT cap at 2h.
-            // Capping caused accounts to become "available" while Qwen still rejected them.
             throttleAccount(currentAccountEmail, throttleMs);
+            const detailsLower = (details || '').toLowerCase();
+            if (detailsLower.includes('upper limit for today') || detailsLower.includes('reached the upper limit')) {
+              logStore.log('warn', 'qwen', `[Qwen] DAILY LIMIT: ${currentAccountEmail} reached daily usage upper limit — disabling account`);
+              setAccountDisabled(currentAccountEmail, true);
+            }
             const nextAccount = await pickAccount(currentAccountEmail);
             if (nextAccount) {
               currentAccountEmail = nextAccount.email;
-              // pickAccount incremented inFlight for the new account, but we're about to throw
-              // so decrement it — the caller will retry with a fresh pickAccount
               decrementInFlight(nextAccount.email);
             } else if (!nextAccount) {
-              // All accounts are throttled — include wait time in error for the user
               throw new QwenUpstreamError(`All accounts rate-limited. ${details}.${wait}`, code, 429);
             }
           }

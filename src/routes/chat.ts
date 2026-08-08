@@ -496,6 +496,8 @@ export async function chatCompletions(c: Context) {
             message: 'All accounts have reached their daily usage limit. Please try again later.',
             type: 'rate_limit_error',
             code: 'rate_limit_exceeded',
+            retryable: true,
+            retry_after_ms: 3600000,
           },
         },
         429,
@@ -504,12 +506,19 @@ export async function chatCompletions(c: Context) {
 
     const status = err.upstreamStatus || 500;
     const cleanMessage = cleanTextOfXmlArtifacts(err.message || String(err)).cleanedText || err.message || 'Internal error';
+    const retryable = status === 502 || status === 503 || status === 504 || status === 429;
+    const retryAfterMs =
+      status === 429 ? 3600000 :
+      status === 502 || status === 503 || status === 504 ? 3000 :
+      undefined;
     return c.json(
       {
         error: {
           message: cleanMessage,
           type: err.type || 'server_error',
           code: err.code || undefined,
+          retryable,
+          ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
         },
       },
       status,
