@@ -9,8 +9,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Cookie } from 'playwright';
 import { projectPath } from '../utils/paths.ts';
-import { logStore } from './logStore.ts';
 import { getProxyArg } from '../utils/systemProxy.ts';
+import { logStore } from './logStore.ts';
 
 export function getProfileDir(email: string): string {
   const safe = email

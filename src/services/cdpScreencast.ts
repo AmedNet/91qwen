@@ -4,11 +4,11 @@
  * streams viewport frames over WebSocket, relays input events back.
  */
 
-import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import { type ChildProcess, execFileSync, spawn } from 'child_process';
 import { existsSync, rmSync } from 'fs';
 import WebSocket from 'ws';
-import { logStore } from './logStore.ts';
 import { getProfileDir } from './browserProfiles.ts';
+import { logStore } from './logStore.ts';
 
 export interface ScreencastSession {
   email: string;
@@ -83,26 +83,30 @@ export async function startScreencast(
 
   logStore.log('info', 'screencast', `Starting Chrome for ${email} on debug port ${debugPort} (bin: ${chromeBin})`);
 
-  const chromeProcess = spawn(chromeBin, [
-    `--remote-debugging-port=${debugPort}`,
-    `--user-data-dir=${profileDir}`,
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-gpu',
-    '--headless=new',
-    '--disable-dev-shm-usage',
-    '--no-first-run',
-    '--disable-background-networking',
-    '--disable-sync',
-    '--use-gl=angle',
-    '--use-angle=swiftshader',
-    '--window-size=1280,800',
-    '--ozone-platform-hint=auto',
-    'about:blank',
-  ], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' },
-  });
+  const chromeProcess = spawn(
+    chromeBin,
+    [
+      `--remote-debugging-port=${debugPort}`,
+      `--user-data-dir=${profileDir}`,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--headless=new',
+      '--disable-dev-shm-usage',
+      '--no-first-run',
+      '--disable-background-networking',
+      '--disable-sync',
+      '--use-gl=angle',
+      '--use-angle=swiftshader',
+      '--window-size=1280,800',
+      '--ozone-platform-hint=auto',
+      'about:blank',
+    ],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' },
+    },
+  );
 
   chromeProcess.stderr?.on('data', (data: Buffer) => {
     const msg = data.toString();
@@ -197,9 +201,7 @@ async function connectCDP(session: ScreencastSession, wsUrl: string): Promise<vo
       try {
         // Get targets to find the page
         const targets = await send('Target.getTargets');
-        const page = targets.targetInfos?.find(
-          (t: any) => t.type === 'page' && t.url.includes('chat.qwen.ai'),
-        );
+        const page = targets.targetInfos?.find((t: any) => t.type === 'page' && t.url.includes('chat.qwen.ai'));
         if (!page) {
           const anyPage = targets.targetInfos?.find((t: any) => t.type === 'page');
           if (anyPage) {
@@ -379,12 +381,18 @@ export function handleInputEvent(
   switch (event.type) {
     case 'click':
       send('Input.dispatchMouseEvent', {
-        type: 'mousePressed', x: event.x, y: event.y,
-        button: event.button === 2 ? 'right' : 'left', clickCount: 1,
+        type: 'mousePressed',
+        x: event.x,
+        y: event.y,
+        button: event.button === 2 ? 'right' : 'left',
+        clickCount: 1,
       });
       send('Input.dispatchMouseEvent', {
-        type: 'mouseReleased', x: event.x, y: event.y,
-        button: event.button === 2 ? 'right' : 'left', clickCount: 1,
+        type: 'mouseReleased',
+        x: event.x,
+        y: event.y,
+        button: event.button === 2 ? 'right' : 'left',
+        clickCount: 1,
       });
       break;
     case 'mousemove':
@@ -392,14 +400,20 @@ export function handleInputEvent(
       break;
     case 'mousedown':
       send('Input.dispatchMouseEvent', {
-        type: 'mousePressed', x: event.x, y: event.y,
-        button: event.button === 2 ? 'right' : 'left', clickCount: 1,
+        type: 'mousePressed',
+        x: event.x,
+        y: event.y,
+        button: event.button === 2 ? 'right' : 'left',
+        clickCount: 1,
       });
       break;
     case 'mouseup':
       send('Input.dispatchMouseEvent', {
-        type: 'mouseReleased', x: event.x, y: event.y,
-        button: event.button === 2 ? 'right' : 'left', clickCount: 1,
+        type: 'mouseReleased',
+        x: event.x,
+        y: event.y,
+        button: event.button === 2 ? 'right' : 'left',
+        clickCount: 1,
       });
       break;
     case 'keydown':
@@ -413,8 +427,11 @@ export function handleInputEvent(
       break;
     case 'scroll':
       send('Input.dispatchMouseEvent', {
-        type: 'mouseWheel', x: event.x, y: event.y,
-        deltaX: 0, deltaY: event.y > 0 ? -100 : 100,
+        type: 'mouseWheel',
+        x: event.x,
+        y: event.y,
+        deltaX: 0,
+        deltaY: event.y > 0 ? -100 : 100,
       });
       break;
   }
@@ -436,7 +453,9 @@ function cleanupSession(email: string): void {
   if (session.loginCheckInterval) clearInterval(session.loginCheckInterval);
 
   if (session.cdpWs) {
-    try { session.cdpWs.close(); } catch {}
+    try {
+      session.cdpWs.close();
+    } catch {}
   }
 
   if (session.chromeProcess && !session.chromeProcess.killed) {

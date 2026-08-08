@@ -83,13 +83,16 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
         logStore.addError(logId, loopResult.error);
         try {
-          await writeEvent(streamWriter, buildErrorEvent(completionId, body.model, {
-            message: loopResult.error,
-            type: 'server_error',
-            code: 'stream_idle_timeout',
-            retryable: true,
-            retryAfterMs: 3000,
-          }));
+          await writeEvent(
+            streamWriter,
+            buildErrorEvent(completionId, body.model, {
+              message: loopResult.error,
+              type: 'server_error',
+              code: 'stream_idle_timeout',
+              retryable: true,
+              retryAfterMs: 3000,
+            }),
+          );
         } catch {
           /* stream may already be closed */
         }

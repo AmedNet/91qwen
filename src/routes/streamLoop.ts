@@ -140,13 +140,16 @@ export async function handlePostStreamCompletion(
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
       } catch (e) {}
       const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
-      await writeEvent(streamWriter, buildErrorEvent(completionId, model, {
-        message: cleanErrorMessage,
-        type: 'server_error',
-        code: upstreamError.status === 429 ? 'rate_limit_error' : 'upstream_error',
-        retryable: upstreamError.status === 502 || upstreamError.status === 429,
-        retryAfterMs: upstreamError.status === 429 ? 3000 : 2000,
-      }));
+      await writeEvent(
+        streamWriter,
+        buildErrorEvent(completionId, model, {
+          message: cleanErrorMessage,
+          type: 'server_error',
+          code: upstreamError.status === 429 ? 'rate_limit_error' : 'upstream_error',
+          retryable: upstreamError.status === 502 || upstreamError.status === 429,
+          retryAfterMs: upstreamError.status === 429 ? 3000 : 2000,
+        }),
+      );
       await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'error')]));
       await streamWriter.write('data: [DONE]\n\n');
       logStore.updateEntry(logId, (entry) => {

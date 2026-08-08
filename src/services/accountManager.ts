@@ -213,8 +213,24 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
     }));
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
 }
-export function loadAccountsFromFile(): Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean; state?: { token: string; refreshToken: string | null; expiresAt: number }; profileCookies?: string }> {
-  const tryLoad = (filePath: string): Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean; state?: { token: string; refreshToken: string | null; expiresAt: number }; profileCookies?: string }> | null => {
+export function loadAccountsFromFile(): Array<{
+  email: string;
+  password: string;
+  throttledUntil?: number;
+  disabled?: boolean;
+  state?: { token: string; refreshToken: string | null; expiresAt: number };
+  profileCookies?: string;
+}> {
+  const tryLoad = (
+    filePath: string,
+  ): Array<{
+    email: string;
+    password: string;
+    throttledUntil?: number;
+    disabled?: boolean;
+    state?: { token: string; refreshToken: string | null; expiresAt: number };
+    profileCookies?: string;
+  }> | null => {
     try {
       if (!existsSync(filePath)) return null;
       const raw = readFileSync(filePath, 'utf-8');

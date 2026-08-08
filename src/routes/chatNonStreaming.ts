@@ -357,20 +357,26 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
   if (upstreamError) {
     logStore.finalizeRequest(logId);
     const cleanMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
-    const retryable = upstreamError.status === 502 || upstreamError.status === 503 || upstreamError.status === 504 || upstreamError.status === 429;
+    const retryable =
+      upstreamError.status === 502 || upstreamError.status === 503 || upstreamError.status === 504 || upstreamError.status === 429;
     const retryAfterMs =
-      upstreamError.status === 429 ? 3600000 :
-      upstreamError.status === 502 || upstreamError.status === 503 || upstreamError.status === 504 ? 3000 :
-      undefined;
-    return c.json({
-      error: {
-        message: cleanMessage,
-        type: upstreamError.status === 429 ? 'rate_limit_error' : 'server_error',
-        code: upstreamError.status === 429 ? 'rate_limit_exceeded' : undefined,
-        retryable,
-        ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
+      upstreamError.status === 429
+        ? 3600000
+        : upstreamError.status === 502 || upstreamError.status === 503 || upstreamError.status === 504
+          ? 3000
+          : undefined;
+    return c.json(
+      {
+        error: {
+          message: cleanMessage,
+          type: upstreamError.status === 429 ? 'rate_limit_error' : 'server_error',
+          code: upstreamError.status === 429 ? 'rate_limit_exceeded' : undefined,
+          retryable,
+          ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
+        },
       },
-    }, upstreamError.status);
+      upstreamError.status,
+    );
   }
 
   flushAndDetectLoops(state, logId);

@@ -284,7 +284,11 @@ export async function createQwenStream(
             throttleAccount(currentAccountEmail, throttleMs);
             const detailsLower = (details || '').toLowerCase();
             if (detailsLower.includes('upper limit for today') || detailsLower.includes('reached the upper limit')) {
-              logStore.log('warn', 'qwen', `[Qwen] DAILY LIMIT: ${currentAccountEmail} reached daily usage upper limit — disabling account`);
+              logStore.log(
+                'warn',
+                'qwen',
+                `[Qwen] DAILY LIMIT: ${currentAccountEmail} reached daily usage upper limit — disabling account`,
+              );
               setAccountDisabled(currentAccountEmail, true);
             }
             const nextAccount = await pickAccount(currentAccountEmail);

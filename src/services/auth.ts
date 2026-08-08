@@ -26,7 +26,6 @@ import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
 import { getActivePage } from './playwright.ts';
 
-
 export {
   addAccount,
   decodeJwt,
@@ -84,9 +83,14 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
   const discovered = discoverSavedAccounts();
 
   // Merge persisted accounts (which may include throttledUntil and profileCookies) with discovered accounts
-  const merged: Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean; state?: { token: string; refreshToken: string | null; expiresAt: number }; profileCookies?: string }> = [
-    ...discovered,
-  ];
+  const merged: Array<{
+    email: string;
+    password: string;
+    throttledUntil?: number;
+    disabled?: boolean;
+    state?: { token: string; refreshToken: string | null; expiresAt: number };
+    profileCookies?: string;
+  }> = [...discovered];
   for (const p of persisted) {
     const existing = merged.find((a) => a.email.toLowerCase().trim() === p.email.toLowerCase().trim());
     if (existing) {
@@ -121,40 +125,40 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
     return;
   }
 
-   accounts.length = 0;
-   for (const a of merged) {
-     // Reset throttledUntil to 0 if it's in the past
-     const persistedUntil = (a as any).throttledUntil || 0;
-     let initialState: AuthState | null = null;
-     if (a.state?.token) {
-       const payload = decodeJwt(a.state.token);
-       const jwtExpiresAt = payload?.exp && typeof payload.exp === 'number' ? payload.exp * 1000 : a.state.expiresAt;
-       if (jwtExpiresAt > Date.now()) {
-         initialState = {
-           token: a.state.token,
-           expiresAt: jwtExpiresAt,
-           refreshToken: a.state.refreshToken,
-         };
-         logStore.log('info', 'auth', `Restored persisted token for ${a.email}`);
-       } else {
-         logStore.log('warn', 'auth', `Persisted token expired for ${a.email}`);
-       }
-     }
-     accounts.push({
-       email: a.email,
-       password: a.password,
-       state: initialState,
-       lastUsed: 0,
-       throttledUntil: persistedUntil > Date.now() ? persistedUntil : 0,
-       refreshInFlight: null,
-       loginAttempt: 0,
-       inFlight: 0,
-       totalRequests: 0,
-       profileCookies: a.profileCookies,
-       disabled: (a as any).disabled ?? false,
-       startupStatus: 'initializing',
-     });
-   }
+  accounts.length = 0;
+  for (const a of merged) {
+    // Reset throttledUntil to 0 if it's in the past
+    const persistedUntil = (a as any).throttledUntil || 0;
+    let initialState: AuthState | null = null;
+    if (a.state?.token) {
+      const payload = decodeJwt(a.state.token);
+      const jwtExpiresAt = payload?.exp && typeof payload.exp === 'number' ? payload.exp * 1000 : a.state.expiresAt;
+      if (jwtExpiresAt > Date.now()) {
+        initialState = {
+          token: a.state.token,
+          expiresAt: jwtExpiresAt,
+          refreshToken: a.state.refreshToken,
+        };
+        logStore.log('info', 'auth', `Restored persisted token for ${a.email}`);
+      } else {
+        logStore.log('warn', 'auth', `Persisted token expired for ${a.email}`);
+      }
+    }
+    accounts.push({
+      email: a.email,
+      password: a.password,
+      state: initialState,
+      lastUsed: 0,
+      throttledUntil: persistedUntil > Date.now() ? persistedUntil : 0,
+      refreshInFlight: null,
+      loginAttempt: 0,
+      inFlight: 0,
+      totalRequests: 0,
+      profileCookies: a.profileCookies,
+      disabled: (a as any).disabled ?? false,
+      startupStatus: 'initializing',
+    });
+  }
   rebuildEmailIndex();
 
   try {

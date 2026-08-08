@@ -1,6 +1,6 @@
 import type { ParsedToolCall } from '../types/openai.ts';
-import type { QwenPayload } from './qwen.ts';
 import { logStore } from './logStore.ts';
+import type { QwenPayload } from './qwen.ts';
 
 let qwenLogDir: string | undefined;
 let qwenWriteCount = 0;
@@ -28,12 +28,16 @@ function maybeCleanup(dir: string): void {
     if (files.length < 500) return;
 
     const entries = files
-      .map((f) => ({ name: f, path: join(dir, f), mtime: statSync(join(dir, f)).mtimeMs }))
-      .sort((a, b) => a.mtime - b.mtime);
+      .map((f: string) => ({ name: f, path: join(dir, f), mtime: statSync(join(dir, f)).mtimeMs }))
+      .sort((a: { mtime: number }, b: { mtime: number }) => a.mtime - b.mtime);
 
     const toRemove = entries.slice(0, entries.length - 400);
     for (const entry of toRemove) {
-      try { unlinkSync(entry.path); } catch { /* ignore */ }
+      try {
+        unlinkSync(entry.path);
+      } catch {
+        /* ignore */
+      }
     }
   } catch {
     /* cleanup is best-effort */
@@ -109,12 +113,7 @@ export function logQwenResponse(
   });
 }
 
-export function logQwenSSE(
-  logFile: string | undefined,
-  sseEvents: number,
-  toolCallEvents: number,
-  toolCalls: ParsedToolCall[],
-): void {
+export function logQwenSSE(logFile: string | undefined, sseEvents: number, toolCallEvents: number, toolCalls: ParsedToolCall[]): void {
   const dir = ensureLogDir();
   if (!dir || !logFile) return;
 

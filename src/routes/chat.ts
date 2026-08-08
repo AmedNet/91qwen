@@ -507,10 +507,7 @@ export async function chatCompletions(c: Context) {
     const status = err.upstreamStatus || 500;
     const cleanMessage = cleanTextOfXmlArtifacts(err.message || String(err)).cleanedText || err.message || 'Internal error';
     const retryable = status === 502 || status === 503 || status === 504 || status === 429;
-    const retryAfterMs =
-      status === 429 ? 3600000 :
-      status === 502 || status === 503 || status === 504 ? 3000 :
-      undefined;
+    const retryAfterMs = status === 429 ? 3600000 : status === 502 || status === 503 || status === 504 ? 3000 : undefined;
     return c.json(
       {
         error: {

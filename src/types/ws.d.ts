@@ -1,7 +1,6 @@
 declare module 'ws' {
   import { EventEmitter } from 'events';
-  import { Agent, ClientRequest, IncomingMessage } from 'http';
-  import { Server as HTTPServer } from 'http';
+  import { Agent, ClientRequest, Server as HTTPServer, IncomingMessage } from 'http';
   import { Server as HTTPSServer } from 'https';
   import { Duplex, DuplexOptions } from 'stream';
   import { SecureContextOptions } from 'tls';

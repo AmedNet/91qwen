@@ -235,7 +235,11 @@ function handleManualLogin(email) {
         headers: authHeaders(),
       });
       var pwData;
-      try { pwData = await pwRes.json(); } catch { pwData = null; }
+      try {
+        pwData = await pwRes.json();
+      } catch {
+        pwData = null;
+      }
       if (!pwRes.ok || !pwData || !pwData.password) {
         throw new Error(pwData && pwData.error && pwData.error.message ? pwData.error.message : 'Could not retrieve password');
       }
@@ -278,7 +282,9 @@ function openBrowserView(email, password) {
     headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
     body: JSON.stringify({ email: email, password: password }),
   })
-    .then(function (res) { return res.json(); })
+    .then(function (res) {
+      return res.json();
+    })
     .then(function (data) {
       if (data.error) throw new Error(data.error);
 
@@ -295,7 +301,11 @@ function openBrowserView(email, password) {
 
       ws.onmessage = function (evt) {
         var msg;
-        try { msg = JSON.parse(evt.data); } catch { return; }
+        try {
+          msg = JSON.parse(evt.data);
+        } catch {
+          return;
+        }
 
         if (msg.type === 'frame') {
           /* Render JPEG frame on canvas */
@@ -311,7 +321,9 @@ function openBrowserView(email, password) {
         } else if (msg.type === 'login_complete') {
           status.textContent = 'Login complete!';
           showToast('Login completed for ' + email, 'success');
-          setTimeout(function () { closeBrowserView(); }, 1500);
+          setTimeout(function () {
+            closeBrowserView();
+          }, 1500);
           pollAuth(email, 5);
           loadAccounts();
         } else if (msg.type === 'browser_closed') {
@@ -375,13 +387,19 @@ function setupCanvasInput(canvas, ws) {
     ws.send(JSON.stringify({ type: 'input', event: { type: 'mouseup', x: coords.x, y: coords.y, button: e.button } }));
   });
 
-  canvas.addEventListener('wheel', function (e) {
-    e.preventDefault();
-    var coords = getCanvasCoords(e);
-    ws.send(JSON.stringify({ type: 'input', event: { type: 'scroll', x: coords.x, y: coords.y > 0 ? 1 : -1 } }));
-  }, { passive: false });
+  canvas.addEventListener(
+    'wheel',
+    function (e) {
+      e.preventDefault();
+      var coords = getCanvasCoords(e);
+      ws.send(JSON.stringify({ type: 'input', event: { type: 'scroll', x: coords.x, y: coords.y > 0 ? 1 : -1 } }));
+    },
+    { passive: false },
+  );
 
-  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  canvas.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+  });
 
   /* Keyboard — focus canvas first, then capture keys */
   canvas.setAttribute('tabindex', '0');
@@ -390,26 +408,32 @@ function setupCanvasInput(canvas, ws) {
 
   canvas.addEventListener('keydown', function (e) {
     e.preventDefault();
-    ws.send(JSON.stringify({
-      type: 'input',
-      event: { type: 'keydown', key: e.key, code: e.code, text: e.key.length === 1 ? e.key : '' },
-    }));
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        event: { type: 'keydown', key: e.key, code: e.code, text: e.key.length === 1 ? e.key : '' },
+      }),
+    );
   });
 
   canvas.addEventListener('keyup', function (e) {
     e.preventDefault();
-    ws.send(JSON.stringify({
-      type: 'input',
-      event: { type: 'keyup', key: e.key, code: e.code },
-    }));
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        event: { type: 'keyup', key: e.key, code: e.code },
+      }),
+    );
   });
 
   canvas.addEventListener('keypress', function (e) {
     e.preventDefault();
-    ws.send(JSON.stringify({
-      type: 'input',
-      event: { type: 'keypress', key: e.key, code: e.code, text: e.key },
-    }));
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        event: { type: 'keypress', key: e.key, code: e.code, text: e.key },
+      }),
+    );
   });
 }
 
