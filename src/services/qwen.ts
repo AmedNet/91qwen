@@ -270,7 +270,7 @@ export async function createQwenStream(
       try {
         const errorJson = JSON.parse(errText);
         if (errorJson?.data?.details?.includes('chat is in progress') || errorJson?.data?.details?.includes('The chat is in progress')) {
-          const retryAfterMs = 2000 + Math.floor(Math.random() * 2000);
+          const retryAfterMs = 5000 + Math.floor(Math.random() * 5000);
           errorEntry(debugEntryId, errorJson.data.details);
           throw new RetryableQwenStreamError(`Qwen: ${errorJson.data.details}`, retryAfterMs);
         }

@@ -282,6 +282,10 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         lastFailedEmail = resolvedEmail;
         lastError = err;
         if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+        if (err instanceof RetryableQwenStreamError && err.retryAfterMs > 0) {
+          logStore.log('debug', 'chat', `[Chat]   -> waiting ${err.retryAfterMs}ms before retry`);
+          await new Promise((resolve) => setTimeout(resolve, err.retryAfterMs));
+        }
         continue;
       }
       // Timeout / slow response: Qwen didn't respond in time — skip to next account without penalty
