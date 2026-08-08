@@ -5,6 +5,7 @@ import { buildFeatureConfig, createQwenStream } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import type { ModelSpec } from '../types/openai.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
+import { resolveToolName } from '../utils/toolNameMap.ts';
 import { pendingCorrections } from './chatHelpersCore.ts';
 import { compressToolResult } from './compressToolResult.ts';
 
@@ -178,7 +179,8 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       const fn = t.function || {};
       const rawDesc = fn.description || '';
       const desc = rawDesc.length > MAX_TOOL_DESC_LENGTH ? rawDesc.substring(0, MAX_TOOL_DESC_LENGTH) + '...' : rawDesc;
-      localMcp['★'][fn.name] = {
+      const canonicalName = resolveToolName(fn.name);
+      localMcp['★'][canonicalName] = {
         description: desc,
         input_schema: fn.parameters || { type: 'object', properties: {} },
       };

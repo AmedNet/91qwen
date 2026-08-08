@@ -5,13 +5,14 @@ import { pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
-import { RetryableQwenStreamError } from '../services/qwen.ts';
+import { computeMaxInlineBytes, RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 import type { OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
 import { checkContextWindow, estimateTokens } from '../utils/tokenEstimator.ts';
+import { resolveToolName } from '../utils/toolNameMap.ts';
 import {
   acquireSessionWithCorrections,
   buildQwenMessages,
@@ -156,16 +157,9 @@ function finishReasonToAnthropic(reason: string): string {
 }
 
 // ponytail: normalize Qwen tool name case to match Claude Code conventions
+// also resolve namespace/tool separators (- vs _) via toolNameMap
 function normalizeToolName(name: string): string {
-  const CASE_MAP: Record<string, string> = {
-    bash: 'Bash',
-    read: 'Read',
-    edit: 'Edit',
-    write: 'Write',
-    websearch: 'WebSearch',
-    web_search: 'WebSearch',
-  };
-  return CASE_MAP[name] || name;
+  return resolveToolName(name);
 }
 
 // ponytail: simple formatter for Anthropic content blocks in log display
@@ -504,15 +498,8 @@ async function setupAnthropicSession(
 
     if (firstChunk.value && !firstChunk.done) {
       const firstText = new TextDecoder().decode(firstChunk.value);
-      if (
-        firstText.includes('FAIL_SYS_USER_VALIDATE') ||
-        firstText.includes('CAPTCHA') ||
-        firstText.includes('punish')
-      ) {
-        const err = new RetryableQwenStreamError(
-          `Qwen validation failed: ${firstText.substring(0, 200)}`,
-          3000,
-        );
+      if (firstText.includes('FAIL_SYS_USER_VALIDATE') || firstText.includes('CAPTCHA') || firstText.includes('punish')) {
+        const err = new RetryableQwenStreamError(`Qwen validation failed: ${firstText.substring(0, 200)}`, 3000);
         logStore.log(
           'warn',
           'chat',
@@ -1195,10 +1182,7 @@ export async function anthropicMessages(c: Context) {
         logStore.log('error', 'chat', `[Anthropic] OpenAI endpoint returned error: ${JSON.stringify(openAIResp.error)}`);
         const status = openAIResponse.status;
         const retryable = status === 502 || status === 503 || status === 504 || status === 429;
-        const retryAfterMs =
-          status === 429 ? 3600000 :
-          status === 502 || status === 503 || status === 504 ? 3000 :
-          undefined;
+        const retryAfterMs = status === 429 ? 3600000 : status === 502 || status === 503 || status === 504 ? 3000 : undefined;
         return c.json(
           {
             error: {
@@ -1263,21 +1247,21 @@ export async function anthropicMessages(c: Context) {
     const status = err.upstreamStatus || 500;
     const cleanMessage = cleanTextOfXmlArtifacts(err.message || String(err)).cleanedText || err.message || 'Internal error';
     const retryable = status === 502 || status === 503 || status === 504 || status === 429;
-    const retryAfterMs =
-      status === 429 ? 3600000 :
-      status === 502 || status === 503 || status === 504 ? 3000 :
-      undefined;
+    const retryAfterMs = status === 429 ? 3600000 : status === 502 || status === 503 || status === 504 ? 3000 : undefined;
     logStore.log('error', 'chat', `[Anthropic] Returning ${status}: ${cleanMessage}`);
     cancelWatchdog();
     if (anthropicVersion) c.header('anthropic-version', anthropicVersion);
-    return c.json({
-      error: {
-        message: cleanMessage,
-        type: err.type || 'server_error',
-        code: err.code || undefined,
-        retryable,
-        ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
+    return c.json(
+      {
+        error: {
+          message: cleanMessage,
+          type: err.type || 'server_error',
+          code: err.code || undefined,
+          retryable,
+          ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
+        },
       },
-    }, <any>status);
+      <any>status,
+    );
   }
 }

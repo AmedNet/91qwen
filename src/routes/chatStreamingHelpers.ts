@@ -4,6 +4,7 @@ import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from 
 import type { ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
+import { resolveToolName } from '../utils/toolNameMap.ts';
 import {
   type AmplificationGuardState,
   cleanThinkTags,
@@ -12,7 +13,7 @@ import {
   getSnapshotDelta,
 } from './chatHelpers.ts';
 
-import { writeContentDelta, writeEvent, writeReasoningEvent, writeToolCallEvent, buildErrorEvent } from './writeHelpers.ts';
+import { buildErrorEvent, writeContentDelta, writeEvent, writeReasoningEvent, writeToolCallEvent } from './writeHelpers.ts';
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -59,7 +60,7 @@ export function extractLocalMcpToolCalls(sseData: any): ParsedToolCall[] {
   for (const tool of serverTools) {
     if (tool?.tool_name && tool?.params !== undefined) {
       const rawName = tool.tool_name;
-      const name = rawName.startsWith('★-') ? rawName.slice(2) : rawName;
+      const name = resolveToolName(rawName.startsWith('★-') ? rawName.slice(2) : rawName);
       toolCalls.push({
         id: `call_${crypto.randomUUID()}`,
         name,
@@ -171,13 +172,16 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
-    await writeEvent(streamWriter, buildErrorEvent(completionId, model, {
-      message: errMsg,
-      type: 'server_error',
-      code: 'upstream_sse_error',
-      retryable: true,
-      retryAfterMs: 2000,
-    }));
+    await writeEvent(
+      streamWriter,
+      buildErrorEvent(completionId, model, {
+        message: errMsg,
+        type: 'server_error',
+        code: 'upstream_sse_error',
+        retryable: true,
+        retryAfterMs: 2000,
+      }),
+    );
     return 'break_stream';
   }
   const deltaStatus = data.choices?.[0]?.delta?.status;
@@ -187,13 +191,16 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
-    await writeEvent(streamWriter, buildErrorEvent(completionId, model, {
-      message: 'Upstream stream delta returned error status',
-      type: 'server_error',
-      code: 'upstream_delta_error',
-      retryable: true,
-      retryAfterMs: 2000,
-    }));
+    await writeEvent(
+      streamWriter,
+      buildErrorEvent(completionId, model, {
+        message: 'Upstream stream delta returned error status',
+        type: 'server_error',
+        code: 'upstream_delta_error',
+        retryable: true,
+        retryAfterMs: 2000,
+      }),
+    );
     return 'break_stream';
   }
   let streamFinished = false;
