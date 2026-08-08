@@ -93,6 +93,26 @@ export async function writeToolCallEvent(streamWriter: any, completionId: string
   );
 }
 
+export function buildErrorEvent(
+  completionId: string,
+  model: string,
+  error: { message: string; type?: string; code?: string; retryable?: boolean; retryAfterMs?: number },
+): any {
+  return buildChunkEvent(completionId, model, [
+    makeChoice({
+      role: 'assistant',
+      content: '',
+      error: {
+        message: error.message,
+        type: error.type || 'server_error',
+        code: error.code,
+        retryable: error.retryable ?? false,
+        ...(error.retryAfterMs !== undefined ? { retry_after_ms: error.retryAfterMs } : {}),
+      },
+    }),
+  ]);
+}
+
 export function buildUsage(promptTokens: number, completionTokens: number, reasoningBuffer: string) {
   const streamReasoningTokensEstimate = reasoningBuffer ? Math.ceil(reasoningBuffer.length / 4) : 0;
   return {

@@ -3,6 +3,7 @@ import type { QwenPayload } from './qwen.ts';
 import { logStore } from './logStore.ts';
 
 let qwenLogDir: string | undefined;
+let qwenWriteCount = 0;
 
 export function initQwenLogger(dir: string): void {
   qwenLogDir = dir;
@@ -19,12 +20,37 @@ function ensureLogDir(): string | undefined {
   }
 }
 
+function maybeCleanup(dir: string): void {
+  try {
+    const { readdirSync, unlinkSync, statSync } = require('node:fs');
+    const { join } = require('node:path');
+    const files = readdirSync(dir);
+    if (files.length < 500) return;
+
+    const entries = files
+      .map((f) => ({ name: f, path: join(dir, f), mtime: statSync(join(dir, f)).mtimeMs }))
+      .sort((a, b) => a.mtime - b.mtime);
+
+    const toRemove = entries.slice(0, entries.length - 400);
+    for (const entry of toRemove) {
+      try { unlinkSync(entry.path); } catch { /* ignore */ }
+    }
+  } catch {
+    /* cleanup is best-effort */
+  }
+}
+
 function writeJsonFile(dir: string, name: string, data: unknown): void {
   try {
     const { join } = require('node:path');
     const { writeFileSync } = require('node:fs');
     const filePath = join(dir, name);
     writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+
+    qwenWriteCount++;
+    if (qwenWriteCount % 50 === 0) {
+      maybeCleanup(dir);
+    }
   } catch (err) {
     logStore.log('warn', 'qwenLogger', `Failed to write ${name}: ${(err as Error).message}`);
   }

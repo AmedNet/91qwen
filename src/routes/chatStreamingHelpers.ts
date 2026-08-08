@@ -12,7 +12,7 @@ import {
   getSnapshotDelta,
 } from './chatHelpers.ts';
 
-import { writeContentDelta, writeReasoningEvent, writeToolCallEvent } from './writeHelpers.ts';
+import { writeContentDelta, writeReasoningEvent, writeToolCallEvent, buildErrorEvent } from './writeHelpers.ts';
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -171,6 +171,13 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
+    await writeEvent(streamWriter, buildErrorEvent(completionId, model, {
+      message: errMsg,
+      type: 'server_error',
+      code: 'upstream_sse_error',
+      retryable: true,
+      retryAfterMs: 2000,
+    }));
     return 'break_stream';
   }
   const deltaStatus = data.choices?.[0]?.delta?.status;
@@ -180,6 +187,13 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
       entry.finalResponse.finishReason = 'error';
     });
+    await writeEvent(streamWriter, buildErrorEvent(completionId, model, {
+      message: 'Upstream stream delta returned error status',
+      type: 'server_error',
+      code: 'upstream_delta_error',
+      retryable: true,
+      retryAfterMs: 2000,
+    }));
     return 'break_stream';
   }
   let streamFinished = false;

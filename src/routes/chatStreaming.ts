@@ -7,7 +7,7 @@ import { type AmplificationGuardState } from './chatHelpers.ts';
 import { type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { cleanupImmediately } from './cleanupHelpers.ts';
 import { handlePostStreamCompletion, runStreamLoop } from './streamLoop.ts';
-import { buildChunkEvent, makeChoice, writeEvent } from './writeHelpers.ts';
+import { buildChunkEvent, buildErrorEvent, makeChoice, writeEvent } from './writeHelpers.ts';
 
 export interface StreamingContext {
   c: Context;
@@ -80,10 +80,24 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
       const loopResult = await runStreamLoop(c, reader, streamState, streamCtx, ampState, bufferRef);
 
       if (loopResult.error) {
-        // Upstream went silent — silently terminate stream, log server-side only
         logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
         logStore.addError(logId, loopResult.error);
-        await streamWriter.write('data: [DONE]\n\n');
+        try {
+          await writeEvent(streamWriter, buildErrorEvent(completionId, body.model, {
+            message: loopResult.error,
+            type: 'server_error',
+            code: 'stream_idle_timeout',
+            retryable: true,
+            retryAfterMs: 3000,
+          }));
+        } catch {
+          /* stream may already be closed */
+        }
+        try {
+          await streamWriter.write('data: [DONE]\n\n');
+        } catch {
+          /* stream may already be closed */
+        }
         logStore.updateEntry(logId, (entry) => {
           if (streamState.reasoningBuffer) entry.reasoningContent = streamState.reasoningBuffer;
           if (streamState.lastFullContent) entry.remainingText = streamState.lastFullContent;
@@ -91,8 +105,6 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           entry.finalResponse.finishReason = 'error';
         });
         logStore.finalizeRequest(ctx.logId);
-        // Release session and trigger deleteSession() — without this, the session
-        // leaks in the pool and the chat persists on Qwen's servers indefinitely.
         cleanupImmediately(
           streamReader,
           heartbeatInterval,
