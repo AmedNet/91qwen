@@ -2,6 +2,7 @@ import { launch as cloakLaunch } from 'cloakbrowser';
 import { Browser, BrowserContext, Cookie, chromium, firefox, Page, webkit } from 'playwright';
 import { logStore } from './logStore.ts';
 import { QWEN_BX_V } from './qwen.ts';
+import { getProxyArg } from '../utils/systemProxy.ts';
 
 export type { BrowserProfileOptions, LoginResult } from './browserProfiles.ts';
 export { BROWSER_DEFAULT_ARGS, getProfileDir, openBrowserProfile, refreshViaProfile } from './browserProfiles.ts';
@@ -169,6 +170,7 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
             '--disable-translate',
             '--metrics-recording-only',
             '--disable-blink-features=AutomationControlled',
+            ...getProxyArgs(),
             `--user-data-dir=/tmp/qwen-pw-${Math.random().toString(36).slice(2, 8)}`,
           ],
         });
@@ -179,7 +181,10 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
         headless,
         channel,
         ignoreDefaultArgs: ['--enable-automation'],
-        args: ['--disable-blink-features=AutomationControlled'],
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          ...getProxyArgs(),
+        ],
       });
     }
     const cleanupAllContexts = async () => {
@@ -199,6 +204,11 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
     initInFlight = null;
   });
   return initInFlight;
+}
+
+function getProxyArgs(): string[] {
+  const proxy = getProxyArg();
+  return proxy ? [`--proxy-server=${proxy}`] : [];
 }
 
 function typedCast<T>(v: unknown): T {

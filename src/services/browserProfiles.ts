@@ -10,6 +10,7 @@ import { join } from 'path';
 import type { Cookie } from 'playwright';
 import { projectPath } from '../utils/paths.ts';
 import { logStore } from './logStore.ts';
+import { getProxyArg } from '../utils/systemProxy.ts';
 
 export function getProfileDir(email: string): string {
   const safe = email
@@ -48,7 +49,12 @@ import { validateQwenUrl } from './playwright.ts';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const BROWSER_DEFAULT_ARGS: readonly string[] = ['--no-sandbox', '--disable-setuid-sandbox', '--ozone-platform-hint=auto'];
+export const BROWSER_DEFAULT_ARGS: readonly string[] = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--ozone-platform-hint=auto',
+  ...(getProxyArg() ? [`--proxy-server=${getProxyArg()}`] : []),
+];
 
 function getBrowserArgs(): string[] {
   return [...BROWSER_DEFAULT_ARGS];

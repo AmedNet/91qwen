@@ -5,8 +5,8 @@ import { decrementInFlight, getTokenWithAccount, pickAccount, throttleAccount } 
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
-import { completeEntry, createNetworkEntry, errorEntry, recordResponse, recordStreamChunk } from './networkDebug.ts';
-import { logQwenRequest, logQwenResponse } from './qwenLogger.ts';
+import { completeEntry, errorEntry, recordStreamChunk } from './networkDebug.ts';
+import { logQwenRequest } from './qwenLogger.ts';
 
 export { configureAccount, deleteAllChats, fetchQwenModels } from './qwenModels.ts';
 

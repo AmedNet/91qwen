@@ -11,7 +11,7 @@
  *   acw_tc and other WAF session cookies. This is the only remaining
  *   browser dependency — runs once per 30 min per account.
  */
-import { writeFileSync } from 'fs';
+
 import { resolve } from 'path';
 import { getBxUaToken } from './bxUaGenerator.ts';
 import { logStore } from './logStore.ts';
