@@ -134,7 +134,12 @@ export async function handlePostStreamCompletion(
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
 
   try {
-    logStore.log('debug', 'stream', `[Stream] Post-stream buffer (${buffer.length} chars): ${buffer.substring(0, 2000)}`);
+    if (buffer) {
+      try {
+        require('fs').writeFileSync('J:\\Program Files (x86)\\qwen-gate\\.logs\\qwen-poststream-buffer.json', buffer.slice(0, 10000));
+      } catch (e) {}
+      logStore.log('debug', 'stream', `[Stream] Post-stream buffer (${buffer.length} chars): ${buffer.substring(0, 2000)}`);
+    }
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError && !streamState.lastFullContent) {
       logStore.log('warn', 'stream', `[Stream] Upstream error with empty content: ${upstreamError.message}`);

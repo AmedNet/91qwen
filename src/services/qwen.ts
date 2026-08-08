@@ -417,7 +417,7 @@ export async function createQwenStream(
       try {
         const clone = response.clone();
         const text = await clone.text();
-        qwenResponsePreview = text.substring(0, 10000);
+        qwenResponsePreview = text.substring(0, 50000);
         logQwenResponse(makeRequestQwenLogFile || '', response.status, response.statusText, qwenResponseHeaders, qwenResponsePreview);
       } catch (err) {
         logStore.log('warn', 'qwen', `[Qwen] Failed to read response for logging: ${(err as Error).message}`);
