@@ -109,7 +109,7 @@ export function logQwenResponse(
     status,
     statusText,
     headers,
-    responsePreview: responsePreview.substring(0, 10000),
+    responsePreview: responsePreview.substring(0, 50000),
   });
 }
 
