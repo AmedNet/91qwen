@@ -240,10 +240,10 @@ export async function createQwenStream(
     parent_id: actualParentId,
     messages: qwenMessages,
     timestamp: timestamp + 1,
-    // Only send tools via feature_config.local_mcp (Qwen native format).
-    // Do NOT inject top-level tools/tool_choice — that triggers OpenAI
-    // compatibility mode which silently downgrades thinking_format to summary.
-    // local_mcp is already populated in chatHelpers.ts when body.tools exist.
+    // Only send tools via system-prompt XML (no top-level tools/tool_choice).
+    // Top-level tools would trigger OpenAI compatibility mode which silently
+    // downgrades thinking_format to summary. Tool descriptions are injected
+    // into the system prompt by chatHelpers.ts when body.tools exist.
   };
 
   const urlObj = new URL(QWEN_CHAT_COMPLETIONS_URL);

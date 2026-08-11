@@ -5,7 +5,6 @@ import { buildFeatureConfig, createQwenStream } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import type { ModelSpec } from '../types/openai.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
-import { resolveToolName } from '../utils/toolNameMap.ts';
 import { pendingCorrections } from './chatHelpersCore.ts';
 import { compressToolResult } from './compressToolResult.ts';
 
@@ -20,7 +19,7 @@ export * from './chatHelpersCore.ts';
 /** Pre-compiled regex patterns for user content sanitization */
 const SYSTEM_REMINDER_RE = /<system-reminder\b[^>]*>([\s\S]*?)<\/system-reminder>/gi;
 const TAG_STRIP_RE = /<(?:system|instruction|prompt|rule)\b[^>]*>[\s\S]*?<\/(?:system|instruction|prompt|rule)>/gi;
-const THINK_TAG_STRIP_RE = new RegExp(`<(?:${THINK_TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?<\/(?:${THINK_TAG_NAMES.join('|')})>`, 'gi');
+const THINK_TAG_STRIP_RE = new RegExp(`<(?:${THINK_TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?<\\/(?:${THINK_TAG_NAMES.join('|')})>`, 'gi');
 const ROLE_PREFIX_RE = /^(?:System|Assistant|User|Human):\s*/gim;
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
 
@@ -172,25 +171,14 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const featureConfig = buildFeatureConfig(true);
 
-  const MAX_TOOL_DESC_LENGTH = 300;
-
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
-    const localMcp: Record<string, any> = {};
-    localMcp['★'] = {};
     const toolNames: string[] = [];
     for (const t of body.tools) {
       const fn = t.function || {};
       const rawDesc = fn.description || '';
-      const desc = rawDesc.length > MAX_TOOL_DESC_LENGTH ? rawDesc.substring(0, MAX_TOOL_DESC_LENGTH) + '...' : rawDesc;
-      const canonicalName = resolveToolName(fn.name);
-      localMcp['★'][canonicalName] = {
-        description: desc,
-        input_schema: fn.parameters || { type: 'object', properties: {} },
-      };
       const shortDesc = rawDesc.length > 150 ? rawDesc.substring(0, 150) + '...' : rawDesc;
       toolNames.push(`${fn.name}${shortDesc ? ` (${shortDesc})` : ''}`);
     }
-    featureConfig.local_mcp = localMcp;
     const toolDescriptions = body.tools
       .map((t: any) => {
         const fn = t.function || {};
@@ -200,14 +188,12 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         return `- ${fn.name}${desc ? `: ${desc}` : ''}${params ? ` (params: ${params})` : ''}`;
       })
       .join('\n');
-    systemParts.push(
-      `You have access to the following tools:\n${toolDescriptions}\n\nTo call a tool, respond with the tool call in the appropriate format.`,
-    );
+            systemParts.push(
+      `You have access to the following tools:\n${toolDescriptions}\n\nTo call a tool, respond with the tool call in XML format:\n<function=NAME>\n`);
   }
 
-  // Single message (Qwen API only accepts 1 message per chat)
-  const fid = randomUUID();
   const systemContent = systemParts.length > 0 ? systemParts.join('\n\n') : undefined;
+  const fid = randomUUID();
   const formatToolResult = (r: {
     type: string;
     tool: string;

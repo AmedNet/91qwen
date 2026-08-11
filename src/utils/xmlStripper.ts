@@ -26,6 +26,9 @@ export function stripToolCallArtifacts(text: string): string {
   // Strip any </...tool_result> where prefix between </ and tool_result may be garbled
   const garbledCloseRe = new RegExp(`<\\/(?:\\w+)?${TOOL_RESULT_KEYWORDS[0]}\\s*>`, 'g');
   text = text.replace(garbledCloseRe, '');
+  // Strip <environment_details> blocks (model-generated context artifacts)
+  const envDetailsRe = /<environment_details>[\s\S]*?<\/environment_details>/g;
+  text = text.replace(envDetailsRe, '');
   // Strip partial / incomplete tool tags at end of text (streaming boundaries).
   // These are conservatively matched — only unambiguous tool tag prefixes.
   // Combined into a single regex built from the shared keyword array.

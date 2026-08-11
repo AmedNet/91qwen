@@ -23,7 +23,6 @@ import {
 } from './chatHelpers.ts';
 import type { NonStreamingContext } from './chatNonStreaming.ts';
 import { handleNonStreamingRequest } from './chatNonStreaming.ts';
-import { extractLocalMcpToolCalls } from './chatStreamingHelpers.ts';
 
 // ── Anthropic → Qwen model map ─────────────────────────────────────
 
@@ -598,7 +597,6 @@ async function handleAnthropicStream(
       let reasoningBuffer = '';
       let completionTokens = 0;
       let promptTokensFromChunks = 0;
-      let localToolCallsAccum: any[] = [];
       let hasEmittedContent = false;
       let textBlockIndex = 0;
 
@@ -671,18 +669,6 @@ async function handleAnthropicStream(
           if (chunk.usage) {
             if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
             if (chunk.usage.input_tokens) promptTokensFromChunks = chunk.usage.input_tokens;
-          }
-
-          // Extract local MCP tool calls
-          const deltaStatus = chunk.choices?.[0]?.delta?.status;
-          const deltaPhase = chunk.choices?.[0]?.delta?.phase;
-          if (deltaPhase === 'local_tool') {
-            const calls = extractLocalMcpToolCalls(chunk);
-            logStore.log('debug', 'chat', `[Anthropic] local_mcp SSE chunk: extracted ${calls.length} tool calls`);
-            for (const c of calls) {
-              logStore.log('debug', 'chat', `[Anthropic] local_mcp tool: name=${c.name} id=${c.id} args=${JSON.stringify(c.arguments)}`);
-              if (!localToolCallsAccum.some((e) => e.id === c.id)) localToolCallsAccum.push(c);
-            }
           }
 
           const deltaResult = extractDeltaContent(chunk, targetResponseId, currentThoughtIndex, reasoningBuffer);
@@ -806,37 +792,22 @@ async function handleAnthropicStream(
       logStore.log(
         'debug',
         'chat',
-        `[Anthropic] Stream ended. lastFullContent length=${lastFullContent.length}, localToolCallsAccum=${localToolCallsAccum.length}`,
+        `[Anthropic] Stream ended. lastFullContent length=${lastFullContent.length}`,
       );
 
       const { toolCalls: xmlToolCalls } = parseXmlToolCalls(lastFullContent);
-      const xmlParsedCalls = xmlToolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
-      logStore.log('debug', 'chat', `[Anthropic] XML parsed from text: ${xmlParsedCalls.length} tool calls`);
-      for (const tc of xmlParsedCalls) {
+      const allToolCalls = xmlToolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));
+      logStore.log('debug', 'chat', `[Anthropic] XML parsed from text: ${allToolCalls.length} tool calls`);
+      for (const tc of allToolCalls) {
         logStore.log('debug', 'chat', `[Anthropic] XML tool: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)}`);
       }
-
-      const allToolCalls = [...xmlParsedCalls];
-      for (const ltc of localToolCallsAccum) {
-        if (!allToolCalls.some((e) => e.id === ltc.id)) {
-          logStore.log('debug', 'chat', `[Anthropic] Merging local_mcp tool: name=${ltc.name} id=${ltc.id}`);
-          allToolCalls.push(ltc);
-        } else {
-          logStore.log('debug', 'chat', `[Anthropic] Skipping duplicate local_mcp tool (already in XML): name=${ltc.name} id=${ltc.id}`);
-        }
-      }
-      logStore.log(
-        'debug',
-        'chat',
-        `[Anthropic] Merged tool calls: ${allToolCalls.length} total (${xmlParsedCalls.length} XML + ${localToolCallsAccum.length} local_mcp)`,
-      );
 
       // Log raw tool calls from Qwen before filtering
       for (const tc of allToolCalls) {
         logStore.log(
           'debug',
           'chat',
-          `[Anthropic] Raw tool call from Qwen: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)} source=${tc.id.startsWith('call_xml') ? 'xml' : 'local_mcp'}`,
+          `[Anthropic] Raw tool call from Qwen: name=${tc.name} id=${tc.id} args=${JSON.stringify(tc.arguments)} source=xml`,
         );
       }
 
@@ -933,7 +904,7 @@ async function handleAnthropicStream(
       }
 
       // Emit tool_use content blocks using pre-validated calls
-      // ponytail: full args JSON in one delta since we know it upfront (local_mcp/XML)
+      // ponytail: full args JSON in one delta since we know it upfront (XML)
       let blockIndex = emittedTextBlock ? textBlockIndex + 1 : emittedThinkingBlock ? 1 : 0;
       for (let i = 0; i < validToolCalls.length; i++) {
         const tc = validToolCalls[i];
@@ -1061,7 +1032,7 @@ export async function anthropicMessages(c: Context) {
     const cleanOutput = config.getBool('CLEAN_OUTPUT', true);
 
     // Convert Anthropic tool_choice to OpenAI format (issue 8)
-    // NOTE: Qwen doesn't enforce tool_choice — tools via feature_config.local_mcp always allow free choice.
+    // NOTE: Qwen doesn't enforce tool_choice — tools via system-prompt XML always allow free choice.
     const rawToolChoice = rawBody.tool_choice;
     let toolChoice: any = undefined;
     if (rawToolChoice === 'any') {

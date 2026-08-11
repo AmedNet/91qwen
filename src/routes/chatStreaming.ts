@@ -206,6 +206,8 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
     pendingChunk: '',
   };
 }

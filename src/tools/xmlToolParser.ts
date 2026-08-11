@@ -74,23 +74,20 @@ export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[
  * Built dynamically from the shared TOOL_CALL_KEYWORDS array so adding
  * new tool call tag keywords is a one-line change.
  */
-const [TOOL_MARKUP_RE, EXCESS_NEWLINES_RE] = (() => {
+const [TOOL_MARKUP_RE, ENV_DETAILS_RE, EXCESS_NEWLINES_RE] = (() => {
   const markupParts: string[] = [];
   for (const kw of TOOL_CALL_KEYWORDS) {
-    // 1. Complete block (or truncated at next occurrence of same keyword)
     markupParts.push(`<${kw}=[^\\s>][^>]*>[\\s\\S]*?(?:<\\/${kw}>|<${kw}=|$)`);
-    // 2. Bare tag with =value (no >, or > at end)
     markupParts.push(`<${kw}=[^>]*(?:>|(?=\\n|$))`);
-    // 3. Bare <keyword prefix followed by whitespace, <, or end
     markupParts.push(`<${kw}(?=[\\s<]|$)`);
-    // 4. Opening/closing tag
     markupParts.push(`<\\/?${kw}>`);
   }
-  return [new RegExp(markupParts.join('|'), 'g'), /\n{3,}/g];
+  const envDetailsRe = /<environment_details>[\s\S]*?<\/environment_details>/g;
+  return [new RegExp(markupParts.join('|'), 'g'), envDetailsRe, /\n{3,}/g];
 })();
 
 function stripRemainingXmlMarkup(text: string): string {
-  return text.replace(TOOL_MARKUP_RE, '').replace(EXCESS_NEWLINES_RE, '\n\n');
+  return text.replace(TOOL_MARKUP_RE, '').replace(ENV_DETAILS_RE, '').replace(EXCESS_NEWLINES_RE, '\n\n');
 }
 
 export function cleanTextOfXmlArtifacts(text: string): { toolCalls: ParsedXmlToolCall[]; cleanedText: string } {

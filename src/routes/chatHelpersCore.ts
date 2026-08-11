@@ -135,6 +135,9 @@ export function cleanThinkTags(t: string): string {
   s = s.replace(TOOL_RESULT_TAG_PATTERN, '');
   // Strip tool call XML tags (complete + partial at chunk boundaries)
   s = s.replace(TOOL_TAG_RE, '');
+  // Strip <environment_details> blocks (model-generated context artifacts)
+  s = s.replace(/<environment_details>[\s\S]*?<\/environment_details>/g, '');
+  s = s.replace(/<environment_details>[\s\S]*$/g, '');
   // Generic chunk-boundary artifact cleanup: works for ANY XML-like output from any AI,
   // not just known tool call keywords. Covers all fragment types that LLM tokenizers can
   // produce at arbitrary split points:

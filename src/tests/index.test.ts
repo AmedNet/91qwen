@@ -348,7 +348,6 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
     }
     if (url.includes('/api/v2/chat/completions')) {
       // Capture the payload for later assertions
-      // init?.body is set when browserlessFetch calls globalThis.fetch(url, { method, headers, body })
       const bodyStr =
         typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
       try {
@@ -613,11 +612,10 @@ test('Anthropic streaming strips XML artifacts from text deltas', async () => {
   }
 });
 
-test('Anthropic /v1/messages streaming with local_mcp tool call emits correct tool_use block', async () => {
+test('Anthropic /v1/messages streaming with XML tool call emits correct tool_use block', async () => {
   const originalFetch = globalThis.fetch;
   const originalAccounts = [...accounts];
 
-  // Seed a test account
   accounts.push({
     email: 'test@qwen-gate.dev',
     password: 'test',
@@ -639,7 +637,15 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     if (url.includes('/api/v2/chat/completions')) {
       const stream = new ReadableStream({
         start(c) {
-          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"I\'ll run that for you."}}]}\n\n'));
+          // Fixed: properly formatted SSE chunks for tool call
+          c.enqueue(
+            new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"phase":"answer","content":"I\'ll run that for you.\\n<function=Bash>\\n<parameter=command>ls -la /tmp</parameter>\\n</function>"}}]}\n\n',
+            ),
+          );
+          c.enqueue(
+            new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":" The command ran."}}]}\n\n'),
+          );
           c.enqueue(
             new TextEncoder().encode(
               'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"★":[{"tool_name":"★-Bash","params":{"command":"ls -la /tmp"}}]}}}}]}\n\n',
@@ -666,7 +672,7 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
           input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
         },
       ],
-      messages: [{ role: 'user', content: 'Run ls in /tmp' }],
+      messages: [{ role: 'user', content: 'List /tmp' }],
     };
 
     const req = new Request('http://localhost/v1/messages', {
@@ -680,14 +686,7 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     });
 
     const res = await app.fetch(req);
-    assert.strictEqual(
-      res.status,
-      200,
-      `Expected 200 got ${res.status} — body: ${await res
-        .clone()
-        .text()
-        .catch(() => '?')}`,
-    );
+    assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
 
     const reader = res.body?.getReader();
     assert.ok(reader, 'Response should have a readable body');
@@ -700,7 +699,6 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
       allSse += decoder.decode(value, { stream: true });
     }
 
-    // Parse all SSE events
     const events: any[] = [];
     for (const line of allSse.split('\n')) {
       if (line.startsWith('data: ') && line.slice(6) !== '[DONE]') {

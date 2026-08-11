@@ -4,7 +4,6 @@ import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from 
 import type { ParsedToolCall } from '../types/openai.ts';
 import { filterContent } from '../utils/contentFilter.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
-import { resolveToolName } from '../utils/toolNameMap.ts';
 import {
   type AmplificationGuardState,
   cleanThinkTags,
@@ -34,57 +33,17 @@ const SELF_CLOSING_TAG_PATTERN = new RegExp(`^[\\n\\s]*<\\/?(?:${THINK_TAG_NAMES
  */
 const MAX_BUFFER_CHARS = 200;
 
-// ── Local MCP tool call extraction (from Qwen Studio local_tool phase) ──
-
-/**
- * Extract tool calls from SSE data containing `extra.local_mcp` in the delta.
- * Qwen Studio sends tool calls in this format during the `local_tool` phase:
- *
- * ```json
- * {"choices": [{"delta": {"role": "assistant", "content": "", "phase": "local_tool",
- *   "status": "finished",
- *   "extra": {"local_mcp": {"★": [{"tool_name": "★-bash", "params": {"command": "ls -la /tmp"}}]}}}}]}
- * ```
- *
- * @param sseData - Parsed SSE data chunk
- * @returns Array of ParsedToolCall with UUID call IDs
- */
-export function extractLocalMcpToolCalls(sseData: any): ParsedToolCall[] {
-  const localMcp = sseData?.choices?.[0]?.delta?.extra?.local_mcp;
-  if (localMcp) {
-    const serverTools = localMcp['★'];
-    if (Array.isArray(serverTools)) {
-      const toolCalls: ParsedToolCall[] = [];
-      for (const tool of serverTools) {
-        if (tool?.tool_name && tool?.params !== undefined) {
-          const rawName = tool.tool_name;
-          const name = resolveToolName(rawName.startsWith('★-') ? rawName.slice(2) : rawName);
-          toolCalls.push({
-            id: `call_${crypto.randomUUID()}`,
-            name,
-            arguments: tool.params,
-          });
-        }
-      }
-      return toolCalls;
-    }
-  }
-
-  const delta = sseData?.choices?.[0]?.delta;
-  if (delta?.phase === 'local_tool' && delta?.tool_name) {
-    const rawName = delta.tool_name;
-    const name = resolveToolName(rawName.startsWith('★-') ? rawName.slice(2) : rawName);
-    return [
-      {
-        id: `call_${crypto.randomUUID()}`,
-        name,
-        arguments: delta.params || {},
-      },
-    ];
-  }
-
-  return [];
-}
+// ── Tool call open/close tag counters ────────────────────────────────
+// Pre-compiled to avoid recompilation on every chunk (called 50-200x per
+// streaming request). Counters stay accurate across SSE chunk boundaries:
+// a single `<function=NAME>...</function>` block may be split mid-tag
+// across multiple chunks, so per-chunk `rawText.includes(...)` checks fail
+// to track depth correctly. Counting open/close occurrences on the
+// post-pendingChunk merged text, and accumulating into state, guarantees
+// toolCallDepth matches the actual open-block count in lastFullContent.
+const FKW = TOOL_CALL_KEYWORDS[0]; // 'function'
+const TOOL_TAG_OPEN_RE = new RegExp(`<${FKW}=[^\\s>>]+`, 'g');
+const TOOL_TAG_CLOSE_RE = new RegExp(`</${FKW}>`, 'g');
 
 // ── Per-chunk stream processing ────────────────────────────────────
 
@@ -106,6 +65,15 @@ export interface StreamProcessingState {
   lastParsePosition: number;
   /** Depth tracking for nested tool call XML blocks. >0 means suppress content emission. */
   toolCallDepth: number;
+  /**
+   * Cumulative counter for `<function=` occurrences seen so far across all
+   * processed chunks. Maintained alongside `closeFnTagCount` so the resulting
+   * toolCallDepth is accurate even when chunk boundaries split a tag
+   * (e.g. `<function=shell` + `_command>\n...`). Reset to 0 at stream start.
+   */
+  openFnTagCount: number;
+  /** Cumulative counter for `</function>` occurrences seen so far across all chunks. */
+  closeFnTagCount: number;
   /**
    * One-chunk buffer for handling XML tag splits across SSE chunk boundaries.
    * When a chunk contains `<` without `>`, it might be a tag split (e.g. `<func` + `tion=read>`).
@@ -221,38 +189,8 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   let streamFinished = false;
   if (deltaStatus === 'finished') {
     const deltaPhase = data.choices[0].delta.phase;
-    // Always extract and emit local MCP tool calls before breaking
-    if (deltaPhase === 'local_tool') {
-      const localToolCalls = extractLocalMcpToolCalls(data);
-      const newToolCalls = localToolCalls.filter((tc) => {
-        const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
-        if (state.loggedToolCalls.has(key)) return false;
-        state.loggedToolCalls.add(key);
-        return true;
-      });
-
-      if (newToolCalls.length > 0) {
-        logStore.updateEntry(logId, (entry) => {
-          for (const tc of newToolCalls) {
-            entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.arguments) });
-          }
-        });
-        for (let i = 0; i < newToolCalls.length; i++) {
-          await writeToolCallEvent(streamWriter, completionId, model, newToolCalls[i], ctx.emittedToolCallCount + i);
-        }
-        ctx.emittedToolCallCount += newToolCalls.length;
-      }
-      if (ctx.qwenLogFile && localToolCalls.length > 0) {
-        logQwenSSE(ctx.qwenLogFile, ctx.sseEventCount || 0, localToolCalls.length, localToolCalls);
-      }
-    }
-    // Don't break on think-phase finished — with thinking_format=full,
-    // answer content arrives in a separate answer phase after think completes.
-    // For all other phases, mark as finished but still run content extraction:
-    // content may be bundled in the same SSE event as the finished status.
     if (deltaPhase !== 'thinking_summary' && deltaPhase !== 'think') {
       streamFinished = true;
-      // Fall through to content extraction so content in finished chunk isn't lost
     }
   }
 
@@ -316,23 +254,29 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     state.lastVStrRaw = vStr;
   }
 
-  // ── One-chunk buffer: delay chunks with '<' but no '>' ──────────
-  // When an XML tag splits across SSE chunk boundaries (e.g. `<func` + `tion=read>`),
-  // the first chunk has '<' without '>'. Delaying by 1 chunk lets us combine them
-  // so cleanThinkTags sees the complete tag `<function=read>` and strips it via
-  // prefix matching, instead of leaking partial fragments like `ction=read>`.
-  //
-  // If the combined text has '>', the tag completed — toolCallDepth handles suppression.
-  // If it still has no '>', cleanThinkTags still catches partial tags via TOOL_TAG_RE
-  // prefix matching (the `` clause handles non-tool-call `<` content like "x < 3").
-  // MAX_BUFFER_CHARS prevents indefinite buffering of `<` in non-XML text.
+  // ── One-chunk buffer: delay chunks that may be split mid-tag ─────
+  // Two mirror cases both delay by one chunk so tag opens/closes that
+  // straddle the SSE chunk boundary can be combined:
+  //   1. Chunk has '<' but no '>'      → tag open might be incomplete
+  //      (e.g. `<func` + `tion=read>`)
+  //   2. Chunk ends with `</[A-Za-z]*` → tag close might be incomplete
+  //      (e.g. `</` + `function>`)
+  // Without case 2, a `</function>` close that splits into `</` and
+  // `function>` would leak the open-tag content (mid-block fragments) to
+  // the client before the close arrived — the close regex would never
+  // see a complete `</function>` and toolCallDepth would never decrement.
+  // MAX_BUFFER_CHARS prevents indefinite buffering of non-tag content
+  // such as "x < 3" that happens to satisfy these patterns.
 
   if (state.pendingChunk) {
     rawText = state.pendingChunk + rawText;
     state.pendingChunk = '';
   }
 
-  if (rawText.includes('<') && !rawText.includes('>') && rawText.length < MAX_BUFFER_CHARS) {
+  const hasOpenBracketNoClose = rawText.includes('<') && !rawText.includes('>');
+  // Case 2: tail like `</` or `</function` (still missing the trailing `>`).
+  const trailingCloseStart = /<\/[A-Za-z]*$/.test(rawText) && !rawText.endsWith('>');
+  if ((hasOpenBracketNoClose || trailingCloseStart) && rawText.length < MAX_BUFFER_CHARS) {
     state.pendingChunk = rawText;
     return 'continue';
   }
@@ -350,11 +294,24 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // When inside a tool call block (depth > 0), don't accumulate into
   // lastFilteredFullContent or emit content deltas to the client. The flush
   // path handles the clean version of the tool call text.
-  const FKW = TOOL_CALL_KEYWORDS[0];
-  const tagOpen = rawText.includes(`<${FKW}=`);
-  const tagClose = rawText.includes(`</${FKW}>`);
-  if (tagOpen) state.toolCallDepth++;
-  if (tagClose) state.toolCallDepth = Math.max(0, state.toolCallDepth - 1);
+  //
+  // Count occurrences in this merged rawText (post-pendingChunk) and
+  // accumulate into state. Per-chunk `includes(...)` checks fail when a
+  // tag is split across chunks (e.g. `<function=shell` ends one chunk,
+  // `_command>...` begins the next), which previously caused the entire
+  // `<function=...>...</function>` block to be emitted to the client as
+  // plain text. Counting every occurrence on every chunk — including
+  // split-tag cases where the open/close strings appear intact only after
+  // pendingChunk merge — closes that gap.
+  TOOL_TAG_OPEN_RE.lastIndex = 0;
+  TOOL_TAG_CLOSE_RE.lastIndex = 0;
+  let chunkOpens = 0;
+  while (TOOL_TAG_OPEN_RE.exec(rawText) !== null) chunkOpens++;
+  let chunkCloses = 0;
+  while (TOOL_TAG_CLOSE_RE.exec(rawText) !== null) chunkCloses++;
+  state.openFnTagCount += chunkOpens;
+  state.closeFnTagCount += chunkCloses;
+  state.toolCallDepth = Math.max(0, state.openFnTagCount - state.closeFnTagCount);
 
   // Parse tool calls from the accumulated content
   const newToolCallContent = state.lastFullContent;

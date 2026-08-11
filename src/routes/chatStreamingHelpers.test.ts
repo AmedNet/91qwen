@@ -24,6 +24,8 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
     pendingChunk: '',
   };
 
@@ -159,6 +161,8 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
     pendingChunk: '',
   };
 
@@ -221,6 +225,118 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
   assert.strictEqual(contentEvents.length, 0, 'no content should be emitted while inside tool call block');
 });
 
+test('regression: full <function=NAME> tag split mid-tag across chunks must not leak XML to client', async () => {
+  // Production incident (2026-08-11, .logs/qwen/req_2026-08-11T13-49-46-619Z):
+  // Qwen streamed 6 back-to-back tool calls as answer-phase content. The raw
+  // SSE chunks split `<function=NAME>` itself across chunk boundaries, e.g.
+  //   chunk 1: "<function=shell"
+  //   chunk 2: "_command>\n<"
+  // so no single rawText chunk contained a literal `<function=` substring.
+  // Pre-fix code used `rawText.includes('<function=')` to bump toolCallDepth,
+  // which always returned false on every chunk → depth stayed 0 → the entire
+  // XML tool block was emitted to the client as plain text.
+  //
+  // Post-fix: depth is computed from cumulative open/close tag counters
+  // (openFnTagCount / closeFnTagCount), so depth correctly rises to 1 once
+  // the pendingChunk merges "<function=shell" + "_command>\n<" and then
+  // falls back to 0 when "</function>" finally completes across chunks.
+  const logId = 'test-regression-split-tag-log-id';
+  logStore.createEntry(logId, 'qwen3.7-max', true);
+
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
+    pendingChunk: '',
+  };
+
+  const writtenEvents: string[] = [];
+  const mockStreamWriter = {
+    write: async (chunk: string) => {
+      writtenEvents.push(chunk);
+    },
+  };
+
+  const ctx: StreamProcessingCtx = {
+    streamWriter: mockStreamWriter,
+    completionId: 'test-regression-split-tag-completion',
+    model: 'qwen3.7-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: false,
+    logId: logId,
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+
+  // Reproduce the exact 7-segment chunk split observed in the production log.
+  // Note: chunk 1 has '<' but no '>' so it gets buffered via pendingChunk;
+  // chunk 2 supplies '>' and releases the buffered chunk; the merged
+  // rawText then contains the full '<function=shell_command>'.
+  const chunks = [
+    '<function=shell',
+    '_command>\n<',
+    ' --stat</parameter',
+    '>\n</',
+    'function>\n<',
+    '>\n<parameter',
+    '-only</parameter>',
+  ];
+
+  for (const chunk of chunks) {
+    const data = {
+      choices: [{ delta: { phase: 'answer', content: chunk } }],
+    };
+    await processStreamData(data, state, ctx);
+  }
+
+  // lastFullContent still contains the raw text (it's the unfiltered buffer).
+  assert.ok(
+    state.lastFullContent.includes('<function=shell_command>'),
+    'lastFullContent should hold the combined tool call text for downstream parsing',
+  );
+
+  // The cumulative counters must reflect that exactly one function block was
+  // opened and closed across all 7 chunks.
+  assert.strictEqual(state.openFnTagCount, 1, 'one <function= open should have been counted');
+  assert.strictEqual(state.closeFnTagCount, 1, 'one </function> close should have been counted');
+
+  // Final toolCallDepth must be back to 0 after the close arrived.
+  assert.strictEqual(state.toolCallDepth, 0, 'toolCallDepth should return to 0 after </function>');
+
+  // The filtered stream sent to the client must NOT contain any raw XML
+  // tool call markup. This is the user-visible contract.
+  const clientPayload = writtenEvents.join('');
+  assert.ok(
+    !clientPayload.includes('<function='),
+    'no <function= XML must reach the client (tool leak regression)',
+  );
+  assert.ok(
+    !clientPayload.includes('</function>'),
+    'no </function> close tag must reach the client (tool leak regression)',
+  );
+  assert.ok(
+    !clientPayload.includes('<parameter='),
+    'no <parameter= markup must reach the client (tool leak regression)',
+  );
+});
+
 test('one-chunk buffer: releases non-tool-call < content normally', async () => {
   const logId = 'test-non-tool-call-buffer-log-id';
   logStore.createEntry(logId, 'qwen3.7-max', true);
@@ -242,6 +358,8 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
     pendingChunk: '',
   };
 
@@ -340,6 +458,8 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     loggedToolCalls: new Set(),
     lastParsePosition: 0,
     toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
     pendingChunk: '',
   };
 
