@@ -4,7 +4,7 @@
  * Handles account CRUD, discovery, persistence, and the account file watcher.
  */
 import crypto from 'crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync, copyFileSync, renameSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { AccountEntry } from '../types/auth.ts';
@@ -19,6 +19,7 @@ export const accounts: AccountEntry[] = [];
 
 const ACCOUNTS_FILE = projectPath('.qwen', 'accounts.json');
 const FALLBACK_ACCOUNTS_FILE = projectPath('.qwen', 'accounts.jsonc');
+const ACCOUNTS_SIG_FILE = projectPath('.qwen', 'accounts.json.sha256');
 const QWEN_DIR = projectPath('.qwen');
 
 const OLD_ACCOUNTS_FILE = projectPath('qwen_profile', 'accounts.json');
@@ -189,6 +190,44 @@ function decryptPassword(encryptedText: string): string {
 // O(1) email→account lookup index (synced with accounts array mutations)
 const emailIndex = new Map<string, AccountEntry>();
 
+/* ── File integrity guard ── */
+function computeSignature(content: string): string {
+  return crypto.createHash('sha256').update(content, 'utf-8').digest('hex');
+}
+
+function writeSignature(sig: string): void {
+  const dir = path.dirname(ACCOUNTS_SIG_FILE);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(ACCOUNTS_SIG_FILE, sig, 'utf-8');
+}
+
+function readSignature(): string | null {
+  try {
+    if (!existsSync(ACCOUNTS_SIG_FILE)) return null;
+    return readFileSync(ACCOUNTS_SIG_FILE, 'utf-8').trim();
+  } catch {
+    return null;
+  }
+}
+
+function verifyIntegrity(content: string): boolean {
+  const expected = readSignature();
+  if (!expected) return true;
+  return computeSignature(content) === expected;
+}
+
+function restoreFromBackup(): string | null {
+  const bakFile = ACCOUNTS_FILE + '.bak';
+  try {
+    if (existsSync(bakFile)) {
+      return readFileSync(bakFile, 'utf-8');
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 export function rebuildEmailIndex(): void {
   emailIndex.clear();
   for (const acct of accounts) {
@@ -211,7 +250,17 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
       ...(a.state ? { state: { token: a.state.token, refreshToken: a.state.refreshToken, expiresAt: a.state.expiresAt } } : {}),
       ...(a.profileCookies ? { profileCookies: a.profileCookies } : {}),
     }));
-  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  const json = JSON.stringify(data, null, 2);
+  JSON.parse(json);
+
+  const tmpFile = ACCOUNTS_FILE + '.tmp';
+  const bakFile = ACCOUNTS_FILE + '.bak';
+  writeFileSync(tmpFile, json, 'utf-8');
+  if (existsSync(ACCOUNTS_FILE)) {
+    copyFileSync(ACCOUNTS_FILE, bakFile);
+  }
+  renameSync(tmpFile, ACCOUNTS_FILE);
+  writeSignature(computeSignature(json));
 }
 export function loadAccountsFromFile(): Array<{
   email: string;
@@ -234,17 +283,17 @@ export function loadAccountsFromFile(): Array<{
     try {
       if (!existsSync(filePath)) return null;
       const raw = readFileSync(filePath, 'utf-8');
-      const data: PersistedAccountData[] = JSON.parse(stripJsoncComments(raw));
-      return data
-        .filter((d) => d.email && d.password)
-        .map((d) => ({
-          email: d.email,
-          password: decryptPassword(d.password),
-          throttledUntil: d.throttledUntil,
-          disabled: d.disabled ?? false,
-          ...(d.state ? { state: d.state } : {}),
-          ...(d.profileCookies ? { profileCookies: d.profileCookies } : {}),
-        }));
+      if (!verifyIntegrity(raw)) {
+        logStore.log('error', 'auth', `Integrity check failed for ${filePath} — attempting backup recovery`);
+        const backupRaw = restoreFromBackup();
+        if (backupRaw && verifyIntegrity(backupRaw)) {
+          logStore.log('warn', 'auth', `Restored ${filePath} from backup`);
+          return parseAccountData(backupRaw);
+        }
+        logStore.log('error', 'auth', `Backup recovery failed for ${filePath}`);
+        return null;
+      }
+      return parseAccountData(raw);
     } catch (err: any) {
       logStore.log('error', 'auth', `Failed to load ${filePath}: ${err.message}`);
       return null;
@@ -252,6 +301,26 @@ export function loadAccountsFromFile(): Array<{
   };
 
   return tryLoad(ACCOUNTS_FILE) ?? tryLoad(FALLBACK_ACCOUNTS_FILE) ?? [];
+}
+function parseAccountData(raw: string): Array<{
+  email: string;
+  password: string;
+  throttledUntil?: number;
+  disabled?: boolean;
+  state?: { token: string; refreshToken: string | null; expiresAt: number };
+  profileCookies?: string;
+}> {
+  const data: PersistedAccountData[] = JSON.parse(stripJsoncComments(raw));
+  return data
+    .filter((d) => d.email && d.password)
+    .map((d) => ({
+      email: d.email,
+      password: decryptPassword(d.password),
+      throttledUntil: d.throttledUntil,
+      disabled: d.disabled ?? false,
+      ...(d.state ? { state: d.state } : {}),
+      ...(d.profileCookies ? { profileCookies: d.profileCookies } : {}),
+    }));
 }
 export async function addAccount(email: string, password: string): Promise<{ loginSucceeded: boolean; loginError?: string }> {
   const normalizedEmail = email.toLowerCase().trim();

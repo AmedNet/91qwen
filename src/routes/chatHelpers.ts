@@ -150,17 +150,20 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         }
       }
 
-      const truncated = compressToolResult(contentStr || '');
+      const fullContent = contentStr || '';
       toolResultObjects.push({
         type: 'function',
         tool: toolName || 'unknown',
         result: {
           success: true,
-          stdout: truncated,
+          stdout: fullContent,
           stderr: '',
           command: toolName || '',
         },
       });
+      segments.push(
+        `<tool_result tool="${toolName || 'unknown'}" success="true">\n<command>${escXml(toolName || '')}</command>\n<stdout>${escXml(fullContent)}</stdout>\n<stderr></stderr>\n</tool_result>`,
+      );
     }
   }
 
@@ -231,7 +234,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
     },
   ];
 
-  return { qwenMessages, systemContent, toolResultsContent };
+  return { qwenMessages, systemContent };
 }
 
 export function handleImageModelFallback(body: any, messages: any[]): void {

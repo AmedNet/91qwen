@@ -210,5 +210,18 @@ function compressLongContent(content: string, lines: string[], totalLines: numbe
  * into a form the model can analyze but cannot verbatim-repeat.
  */
 export function compressToolResult(content: string): string {
-  return content;
+  if (!content) return '';
+  const encoded = new TextEncoder().encode(content);
+  if (encoded.length <= 4096) return content;
+
+  const headBytes = Math.floor(4096 * 0.45);
+  const tailBytes = Math.floor(4096 * 0.45);
+
+  const headView = new Uint8Array(encoded.buffer, 0, headBytes);
+  const head = new TextDecoder('utf-8', { fatal: false }).decode(headView);
+  const tailStart = encoded.length - tailBytes;
+  const tailView = new Uint8Array(encoded.buffer, tailStart, tailBytes);
+  const tail = new TextDecoder('utf-8', { fatal: false }).decode(tailView);
+
+  return `${head}\n... [truncated ${content.length - headBytes - tailBytes} chars] ...\n${tail}`;
 }
