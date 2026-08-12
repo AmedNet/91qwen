@@ -1,4 +1,4 @@
-import { ALL_TOOL_KEYWORDS, TOOL_RESULT_KEYWORDS } from './tagNames.ts';
+import { ALL_TOOL_KEYWORDS, LLM_META_TAGS, PRESERVED_HTML_TAGS, TOOL_RESULT_KEYWORDS } from './tagNames.ts';
 
 /**
  * Tool echo patterns — strip lines where the model echoes tool results
@@ -41,9 +41,37 @@ export function stripToolCallArtifacts(text: string): string {
   // Strip JSON tool result echo blocks (handles both single-line and pretty-printed multi-line):
   //   [{"type":"function","tool":"name","result":{"success":true,"stdout":"...","stderr":"","command":"name"}}]
   text = text.replace(/\[\s*\{[\s\S]*?"type"\s*:\s*"function"[\s\S]*?"tool"\s*:\s*"[a-z_]+"[\s\S]*?\}\s*\]/g, '');
+  // Strip LLM-metadata tag pairs (<plan>, <purpose>, <answer>, ...) and any
+  // generic <tag>...</tag> whose name is not in PRESERVED_HTML_TAGS. Covers
+  // the leak where Qwen's output_schema='phase' boundaries are misaligned
+  // and the model emits its internal scaffolding into the answer stream.
+  text = stripUnknownLlmMetaTags(text);
   text = stripToolEcho(text);
   text = text.replace(/\n{3,}/g, '\n\n');
   return text;
+}
+
+// Same implementation as the stripper in tools/xmlToolParser.ts but exposed
+// here so contentFilter can sanitize isolated segments without pulling in
+// the tool-call parser. Idempotent — safe to run multiple times.
+const PRESERVED_SET = new Set<string>(PRESERVED_HTML_TAGS);
+const META_TAG_NAMES = [...new Set(LLM_META_TAGS.map((t) => t.toLowerCase()))].sort((a, b) => b.length - a.length);
+const META_OPEN_CLOSE_RE = new RegExp(
+  `<(${META_TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?<\\/\\1>`,
+  'gi',
+);
+const GENERIC_PAIR_RE = /<([a-z][a-z0-9-]{0,39})\b[^>]*>[\s\S]*?<\/\1>/gi;
+// "Answer-wrapping" tags: drop the wrapper, keep the inner content (see
+// ANSWER_WRAPPER_RE comment in tools/xmlToolParser.ts for rationale).
+const ANSWER_WRAPPER_RE = /<\/?(answer|response)\b[^>]*>/gi;
+
+function stripUnknownLlmMetaTags(text: string): string {
+  let out = text.replace(ANSWER_WRAPPER_RE, '');
+  out = out.replace(META_OPEN_CLOSE_RE, '');
+  out = out.replace(GENERIC_PAIR_RE, (match, name: string) =>
+    PRESERVED_SET.has(name.toLowerCase()) ? match : '',
+  );
+  return out;
 }
 
 export function stripToolEcho(text: string): string {

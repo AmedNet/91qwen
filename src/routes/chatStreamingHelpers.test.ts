@@ -26,6 +26,9 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 
@@ -163,6 +166,9 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 
@@ -262,6 +268,9 @@ test('regression: full <function=NAME> tag split mid-tag across chunks must not 
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 
@@ -360,6 +369,9 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 
@@ -460,6 +472,9 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 
@@ -575,6 +590,9 @@ test('regression: consecutive <function=...> blocks with multi-tag splits across
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 
@@ -693,4 +711,165 @@ test('regression: consecutive <function=...> blocks with multi-tag splits across
   // did its job and the gateway converted the XML into OpenAI tool_calls.
   const toolCallEvents = writtenEvents.filter((e) => e.includes('"tool_calls"'));
   assert.ok(toolCallEvents.length >= 1, 'at least one tool_calls event should be emitted to client');
+});
+
+// ── LLM metadata tag leak (repro 2026-08-12) ────────────────────────
+// Qwen with output_schema='phase' occasionally leaks its own internal
+// scaffolding into the answer stream — `<plan>...</plan>`,
+// `<purpose>...</purpose>`, `<answer>...</answer>` wrapper. The fix
+// tracks LLM-meta tag open/close depth across chunks (mirroring the
+// toolCallDepth pattern for <function=...>) and suppresses text emission
+// while depth > 0. Reproduced on qwen3.6-plus / qwen3.7-max.
+
+test('LLM meta-tag depth tracks across chunks and suppresses emission until close', async () => {
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
+    pendingChunk: '',
+  };
+  const writtenEvents: string[] = [];
+  const ctx: StreamProcessingCtx = {
+    streamWriter: { write: async (c: string) => void writtenEvents.push(c) },
+    completionId: 'test-meta-depth',
+    model: 'qwen3.6-plus',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: true,
+    logId: 'test-log-id',
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+
+  // Simulate the answer phase emitting: "<plan>\n1. step one\n2. step two\n</plan>\n\nreal answer body"
+  // Split across SSE chunks the way the real upstream splits them.
+  const chunks = [
+    '<plan>\n1.',
+    ' step one\n2.',
+    ' step two\n</plan>',
+    '\n\nreal answer body',
+  ];
+
+  for (const text of chunks) {
+    await processStreamData(
+      {
+        choices: [{ delta: { phase: 'answer', content: text } }],
+        response_id: 'r1',
+      },
+      state,
+      ctx,
+    );
+  }
+
+  // The text content reaching the client must NOT contain the leaked
+  // <plan>...</plan> scaffolding. Real "real answer body" must survive.
+  const assistantContent = writtenEvents
+    .map((e) => {
+      // Use the raw delta.content field directly (decode JSON escapes)
+      const m = e.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      return m ? JSON.parse(`"${m[1]}"`) : '';
+    })
+    .join('');
+
+  assert.ok(!assistantContent.includes('<plan'), 'opening plan tag must not leak to client');
+  assert.ok(!assistantContent.includes('</plan>'), 'closing plan tag must not leak to client');
+  assert.ok(!assistantContent.includes('step one'), 'inner content of stripped meta-tag must not leak');
+  assert.ok(assistantContent.includes('real answer body'), 'real content outside meta-tag must reach client');
+  assert.strictEqual(state.llmMetaDepth, 0, 'depth must return to 0 after closing tag');
+  assert.strictEqual(state.openLlmMetaCount, 1);
+  assert.strictEqual(state.closeLlmMetaCount, 1);
+});
+
+test('answer wrapper tag drops wrapper but preserves inner content (streaming)', async () => {
+  // <answer> is NOT in LLM_META_TAGS — it is an "answer wrapper" tag whose
+  // inner content IS the real reply. The streaming pipeline treats it as
+  // ordinary text (stripped only at flush), so depth counters stay at 0.
+  // The wrapper is dropped and the inner content reaches the client.
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
+    pendingChunk: '',
+  };
+  const writtenEvents: string[] = [];
+  const ctx: StreamProcessingCtx = {
+    streamWriter: { write: async (c: string) => void writtenEvents.push(c) },
+    completionId: 'test-answer-wrapper',
+    model: 'qwen3.6-plus',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: true,
+    logId: 'test-log-id',
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+
+  const chunks = ['<answer>', 'real answer', '</answer>'];
+
+  for (const text of chunks) {
+    await processStreamData(
+      {
+        choices: [{ delta: { phase: 'answer', content: text } }],
+        response_id: 'r1',
+      },
+      state,
+      ctx,
+    );
+  }
+
+  // <answer>/<response> are not in LLM_META_TAGS (they're answer wrappers,
+  // see ANSWER_WRAPPER_RE). Depth counters stay at 0; cleanTextOfXmlArtifacts
+  // strips the wrapper via ANSWER_WRAPPER_RE while preserving inner content.
+  assert.strictEqual(state.llmMetaDepth, 0);
+  assert.strictEqual(state.openLlmMetaCount, 0);
+  assert.strictEqual(state.closeLlmMetaCount, 0);
+
+  const assistantContent = writtenEvents
+    .map((e) => {
+      const m = e.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      return m ? JSON.parse(`"${m[1]}"`) : '';
+    })
+    .join('');
+
+  assert.ok(!assistantContent.includes('<answer'), 'answer wrapper must be stripped');
+  assert.ok(!assistantContent.includes('</answer'), 'closing answer wrapper must be stripped');
+  assert.ok(assistantContent.includes('real answer'), 'inner content must reach client');
 });

@@ -3,7 +3,7 @@ import { logStore } from '../services/logStore.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 
 import { filterContent } from '../utils/contentFilter.ts';
-import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
+import { LLM_META_TAGS, THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 import {
   type AmplificationGuardState,
   cleanThinkTags,
@@ -45,6 +45,23 @@ const FKW = TOOL_CALL_KEYWORDS[0]; // 'function'
 const TOOL_TAG_OPEN_RE = new RegExp(`<${FKW}=[^\\s>>]+`, 'g');
 const TOOL_TAG_CLOSE_RE = new RegExp(`</${FKW}>`, 'g');
 
+// ── LLM metadata tag depth counter ──────────────────────────────────
+// Qwen with output_schema='phase' sometimes leaks its internal scaffolding
+// (<plan>...</plan>, <purpose>...</purpose>, ...) into the answer stream.
+// Per-chunk strippers can't match the closing tag until it arrives, so we
+// track open/close depth on the merged (post-pendingChunk) text just like
+// <function=...> blocks. Depth > 0 → suppress text emission until close.
+// Tag names sorted DESC by length so longer names match first inside the
+// alternation (e.g. "thinking_summary" before "thinking").
+const META_OPEN_TAG_RE = new RegExp(
+  `<(${[...LLM_META_TAGS].sort((a, b) => b.length - a.length).join('|')})\\b`,
+  'g',
+);
+const META_CLOSE_TAG_RE = new RegExp(
+  `</(${[...LLM_META_TAGS].sort((a, b) => b.length - a.length).join('|')})>`,
+  'g',
+);
+
 // ── Per-chunk stream processing ────────────────────────────────────
 
 export interface StreamProcessingState {
@@ -74,6 +91,18 @@ export interface StreamProcessingState {
   openFnTagCount: number;
   /** Cumulative counter for `</function>` occurrences seen so far across all chunks. */
   closeFnTagCount: number;
+  /**
+   * Cumulative counter for LLM-metadata tag opens (`<plan>`, `<purpose>`,
+   * `<answer>`, etc.) seen across all processed chunks. Combined with
+   * `closeLlmMetaCount` to compute `llmMetaDepth`. When depth > 0, text
+   * emission is suppressed because we are inside a leaked scaffolding
+   * block. See `stripLlmMetaTags` in tools/xmlToolParser.ts.
+   */
+  openLlmMetaCount: number;
+  /** Cumulative counter for LLM-metadata tag closes (`</plan>`, etc.). */
+  closeLlmMetaCount: number;
+  /** >0 means we are inside a leaked LLM-metadata block; suppress emit. */
+  llmMetaDepth: number;
   /**
    * One-chunk buffer for handling XML tag splits across SSE chunk boundaries.
    * When a chunk contains `<` without `>`, it might be a tag split (e.g. `<func` + `tion=read>`).
@@ -111,17 +140,18 @@ export function filterContentPipeline(
   text: string,
   enableContentFiltering: boolean,
   /** Set true for per-chunk deltas to avoid mangling partial XML tool call syntax.
-   *  Skips cleanTextOfXmlArtifacts and filterContent (both strip incomplete
-   *  XML tags and create orphaned tail fragments). Only runs cleanThinkTags
-   *  which strips complete tags safely. Full XML stripping happens on flush. */
+   *  Skips filterContent (which strips incomplete XML tags and creates orphaned
+   *  tail fragments). Runs cleanTextOfXmlArtifacts + cleanThinkTags — both
+   *  strip complete tags safely. Full XML stripping happens on flush. */
   skipXmlArtifactStripping?: boolean,
 ): { cleanText: string | null; thinking: string } {
   if (!text) return { cleanText: null, thinking: '' };
   if (skipXmlArtifactStripping) {
-    // Per-chunk: only strip complete think/function tags. Partial XML tool call
-    // syntax (e.g. "<function" or "=read>\n" split across chunks) is handled
-    // on the full accumulated text during flush processing.
-    const cleaned = cleanThinkTags(text);
+    // Per-chunk: strip complete XML artifacts (function=, plan=, etc.)
+    // and think tags. llmMetaDepth (state, not local) still suppresses
+    // emission when inside a meta-tag block that hasn't closed yet.
+    const { cleanedText } = cleanTextOfXmlArtifacts(text);
+    const cleaned = cleanThinkTags(cleanedText);
     return { cleanText: cleaned || null, thinking: '' };
   }
   // Full-text processing (flush path): strip ALL XML tool call artifacts.
@@ -316,6 +346,28 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   state.closeFnTagCount += chunkCloses;
   state.toolCallDepth = Math.max(0, state.openFnTagCount - state.closeFnTagCount);
 
+  // Track LLM-metadata tag depth (plan / purpose / answer wrapper / ...).
+  // We compute depth "pre-increment" — i.e. the depth that applies to THIS
+  // chunk's rawText — so the close tag arriving inside a chunk sees depth
+  // = open_count - close_count_in_prior_chunks (i.e. still > 0) and the
+  // accumulator captures the close tag as part of the meta-tag block to
+  // strip, rather than leaking it as residual content.
+  const preMetaDepth = state.openLlmMetaCount - state.closeLlmMetaCount;
+  META_OPEN_TAG_RE.lastIndex = 0;
+  META_CLOSE_TAG_RE.lastIndex = 0;
+  let metaOpens = 0;
+  while (META_OPEN_TAG_RE.exec(rawText) !== null) metaOpens++;
+  let metaCloses = 0;
+  while (META_CLOSE_TAG_RE.exec(rawText) !== null) metaCloses++;
+  state.openLlmMetaCount += metaOpens;
+  state.closeLlmMetaCount += metaCloses;
+  // Post-chunk depth (used for next iteration's gate)
+  state.llmMetaDepth = Math.max(0, state.openLlmMetaCount - state.closeLlmMetaCount);
+  // Depth "in this chunk" — combined preMetaDepth + the opens that THIS
+  // chunk adds. If > 0, rawText is at least partially inside a meta-tag
+  // block and must be buffered without emit.
+  const chunkMetaDepth = Math.max(0, preMetaDepth + metaOpens - metaCloses);
+
   // Parse tool calls from the accumulated content
   const newToolCallContent = state.lastFullContent;
   const { toolCalls: xmlToolCalls } = parseXmlToolCalls(newToolCallContent);
@@ -369,20 +421,37 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // on every chunk. Accumulate filtered output for snapshot diffing.
   //
   // Skip entirely when inside a tool call block (depth > 0): the filter
-  // pipeline result would be discarded anyway (line 347 checks toolCallDepth),
-  // but running it wastes regex cycles on content like "=filePath>" fragments.
+  // pipeline result would be discarded anyway, but running it wastes regex
+  // cycles on content like "=filePath>" fragments.
+  //
+  // Also skip when preMetaDepth > 0: rawText is part of a leaked meta-tag
+  // block. The block gets buffered and stripped at the close tag's arrival.
   let deltaCleaned: string | null = null;
   let deltaThinking = '';
-  if (state.toolCallDepth === 0) {
+  if (state.toolCallDepth === 0 && chunkMetaDepth === 0) {
     const filterDelta = filterContentPipeline(rawText, enableContentFiltering, true);
     deltaCleaned = filterDelta.cleanText;
     deltaThinking = filterDelta.thinking;
   }
-
   // Only accumulate filtered content when outside a tool call block.
   // Inside a tool call (depth > 0), fragments like "-edit" or "=filePath>" would
   // leak through cleanThinkTags and corrupt the client's content stream.
-  if (deltaCleaned && state.toolCallDepth === 0) state.lastFilteredFullContent = (state.lastFilteredFullContent || '') + deltaCleaned;
+  //
+  // For LLM-meta blocks we use preMetaDepth (the depth that applied to THIS
+  // chunk's rawText before incrementing counters). That ensures the close
+  // tag arriving inside chunk N is treated as still being inside the meta
+  // block (depth > 0) and gets buffered+stripped, rather than leaking as
+  // residual "</plan>" to the client.
+  // Always accumulate rawText into lastFilteredFullContent when we have
+  // valid text and we're outside a tool-call block. Strip complete
+  // meta-tag pairs from the merged accumulator every time so the
+  // close-tag-arrival case (<plan> in chunk 1, </plan> in chunk N) is
+  // caught here — the per-chunk cleanTextOfXmlArtifacts can only see one
+  // side of a cross-chunk pair, but the merged accumulator sees both.
+  if (state.toolCallDepth === 0 && rawText) {
+    const merged = (state.lastFilteredFullContent || '') + rawText;
+    state.lastFilteredFullContent = cleanTextOfXmlArtifacts(merged).cleanedText;
+  }
   if (deltaThinking) state.lastDeltaThinkingFull = (state.lastDeltaThinkingFull || '') + deltaThinking;
 
   const cleanedText = state.lastFilteredFullContent || null;
@@ -396,10 +465,16 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     }
   }
 
-  if (cleanedText && state.toolCallDepth === 0) {
-    // Text-only content (no tool calls): write content delta to SSE + logStore
-    const contentDelta = getSnapshotDelta(cleanedText, state.lastFilteredSnapshot);
-    state.lastFilteredSnapshot = cleanedText;
+  if (cleanedText && state.toolCallDepth === 0 && chunkMetaDepth === 0) {
+    // Re-strip the FULL snapshot before emitting and before recording it as
+    // the diff baseline. This is essential: when a meta-tag pair straddles
+    // multiple chunks, the per-chunk `cleanTextOfXmlArtifacts(rawText)` only
+    // sees one side of the pair and can't strip it. The accumulating buffer
+    // `cleanedText` therefore contains the residual close tag (e.g. `</plan>`)
+    // which must be cleaned before we emit any delta off it.
+    const finalSnapshot = cleanTextOfXmlArtifacts(cleanedText).cleanedText || '';
+    const contentDelta = getSnapshotDelta(finalSnapshot, state.lastFilteredSnapshot);
+    state.lastFilteredSnapshot = finalSnapshot;
     if (contentDelta) {
       await writeContentDelta(
         streamWriter,

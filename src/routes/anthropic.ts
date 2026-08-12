@@ -592,6 +592,16 @@ async function handleAnthropicStream(
       let emittedThinkingBlock = false;
       let emittedTextBlock = false;
       let lastFullContent = '';
+      // LLM-metadata tag depth counter (mirrors chatStreamingHelpers.ts).
+      // Tracks <plan>/<purpose>/<answer-wrapper>/... open/close across
+      // chunks; depth > 0 means rawText is inside a leaked scaffolding
+      // block. We buffer rawText + strip the merged accumulator each
+      // chunk so cross-chunk pairs are caught.
+      let openLlmMetaCount = 0;
+      let closeLlmMetaCount = 0;
+      let anthropicTextBuffer = '';
+      let anthropicPendingChunk = '';
+      let lastEmittedCleanText = '';
       let targetResponseId: string | null = null;
       let currentThoughtIndex = 0;
       let reasoningBuffer = '';
@@ -769,20 +779,87 @@ async function handleAnthropicStream(
           // Strip XML tool call artifacts from emitted text (Claude Code may
           // fall back to parsing tool calls from text content, and XML artifacts
           // can produce spurious tool calls or confuse the client).
-          const cleanedText = cleanTextOfXmlArtifacts(deltaResult.vStr).cleanedText || '';
-
-          // Emit cleaned text delta to Claude Code
-          await streamWriter.write(
-            `event: content_block_delta\ndata: ${JSON.stringify({
-              type: 'content_block_delta',
-              index: textBlockIndex,
-              delta: { type: 'text_delta', text: cleanedText },
-            })}\n\n`,
+          //
+          // Strategy for LLM-metadata leak prevention: maintain a running
+          // buffer `anthropicTextBuffer`, append rawText (with one-chunk
+          // delay when rawText ends with an incomplete meta-tag close like
+          // `</plan`), then strip the WHOLE buffer on every chunk. The diff
+          // against `lastEmittedCleanText` is what we emit. Cross-chunk
+          // pairs (<plan> in chunk 1, </plan> in chunk N) are caught when
+          // the close arrives — the stripper sees the whole pair and removes
+          // it, the new stripped snapshot diffs cleanly against the
+          // previous emit, and only the post-meta content reaches the
+          // client.
+          //
+          // One-chunk delay for partial meta-tag at end of rawText:
+          //   `</plan` (missing `>`)  — close tag opener split off
+          //   `<plan`  (missing `>`)  — open tag name split off
+          //   `<`      alone           — even the open tag name not yet arrived
+          // We must buffer all three so the stripper sees the full tag
+          // when the next chunk arrives. Mirrors the tool-call
+          // pendingChunk logic in chatStreamingHelpers (case 2 + case 3
+          // + bare-`<` extension).
+          const trailingCloseStart = /<\/[A-Za-z][A-Za-z0-9-]*$/.test(deltaResult.vStr) && !deltaResult.vStr.endsWith('>');
+          const trailingOpenStart = /<[A-Za-z][A-Za-z0-9-]*=?$/.test(deltaResult.vStr) && !deltaResult.vStr.endsWith('>');
+          const trailingBareLt = /<$/.test(deltaResult.vStr);
+          if (trailingCloseStart || trailingOpenStart || trailingBareLt) {
+            // Wait for the next chunk to complete the tag.
+            anthropicPendingChunk = deltaResult.vStr;
+          } else {
+            if (anthropicPendingChunk) {
+              anthropicTextBuffer += anthropicPendingChunk + deltaResult.vStr;
+              anthropicPendingChunk = '';
+            } else {
+              anthropicTextBuffer += deltaResult.vStr;
+            }
+          }
+          const stripped = cleanTextOfXmlArtifacts(anthropicTextBuffer).cleanedText || '';
+          let contentDelta = '';
+          // If stripped still contains an UNCLOSED meta-tag (any of the
+          // known LLM_META_TAGS present without a matching close tag in
+          // the same buffer), suppress emission. Single-chunk strippers
+          // can't remove half a pair, so emitting now would leak "<plan>"
+          // or "step one" before the close arrives. Once the close tag
+          // arrives the stripper will collapse the pair and emit only the
+          // post-meta content.
+          const hasUnclosedMeta = /<(plan|purpose|goal|context|step|analysis|thought|summary|conclusion|reasoning|reflection|note|notes|thinking_summary|thinking|think)\b/i.test(
+            stripped,
           );
+          if (process.env.QWEN_DEBUG_META === '1') {
+            console.log('[META-DBG]', JSON.stringify({
+              rawText: deltaResult.vStr,
+              bufferLen: anthropicTextBuffer.length,
+              strippedLen: stripped.length,
+              lastEmittedLen: lastEmittedCleanText.length,
+              hasUnclosedMeta,
+            }));
+          }
+          if (hasUnclosedMeta) {
+            // Hold emission — don't update lastEmittedCleanText so future
+            // deltas are measured against the prior baseline.
+          } else if (stripped.length > lastEmittedCleanText.length && stripped.startsWith(lastEmittedCleanText)) {
+            contentDelta = stripped.slice(lastEmittedCleanText.length);
+            lastEmittedCleanText = stripped;
+          } else if (stripped !== lastEmittedCleanText) {
+            // Stripper removed characters (meta-tag closed) — find common prefix.
+            let i = 0;
+            while (i < Math.min(lastEmittedCleanText.length, stripped.length) && lastEmittedCleanText[i] === stripped[i]) i++;
+            contentDelta = stripped.slice(i);
+            lastEmittedCleanText = stripped;
+          }
+          if (contentDelta && !anthropicPendingChunk) {
+            await streamWriter.write(
+              `event: content_block_delta\ndata: ${JSON.stringify({
+                type: 'content_block_delta',
+                index: textBlockIndex,
+                delta: { type: 'text_delta', text: contentDelta },
+              })}\n\n`,
+            );
+          }
 
           // Accumulate RAW text (with XML) for XML fallback tool call parsing
           lastFullContent += deltaResult.vStr;
-          logStore.addProcessedOutput(logId, cleanedText);
+          if (contentDelta) logStore.addProcessedOutput(logId, contentDelta);
           logStore.addRawChunk(logId, deltaResult.vStr);
           hasEmittedContent = true;
         }
@@ -794,6 +871,28 @@ async function handleAnthropicStream(
         'chat',
         `[Anthropic] Stream ended. lastFullContent length=${lastFullContent.length}`,
       );
+
+      // Flush any pending meta-tag chunk that didn't get its close. The
+      // stream is over so the partial close tag can be safely treated as
+      // residual scaffolding and stripped.
+      if (anthropicPendingChunk) {
+        anthropicTextBuffer += anthropicPendingChunk;
+        anthropicPendingChunk = '';
+        const stripped = cleanTextOfXmlArtifacts(anthropicTextBuffer).cleanedText || '';
+        let i = 0;
+        while (i < Math.min(lastEmittedCleanText.length, stripped.length) && lastEmittedCleanText[i] === stripped[i]) i++;
+        const flushDelta = stripped.slice(i);
+        if (flushDelta) {
+          lastEmittedCleanText = stripped;
+          await streamWriter.write(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: textBlockIndex,
+              delta: { type: 'text_delta', text: flushDelta },
+            })}\n\n`,
+          );
+        }
+      }
 
       const { toolCalls: xmlToolCalls } = parseXmlToolCalls(lastFullContent);
       const allToolCalls = xmlToolCalls.map((tc, i) => xmlToolCallToParsed(tc, i));

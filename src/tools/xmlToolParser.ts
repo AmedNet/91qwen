@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
+import { LLM_META_TAGS, PRESERVED_HTML_TAGS, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 
 export interface ParsedXmlToolCall {
   name: string;
@@ -86,13 +86,69 @@ const [TOOL_MARKUP_RE, ENV_DETAILS_RE, EXCESS_NEWLINES_RE] = (() => {
   return [new RegExp(markupParts.join('|'), 'g'), envDetailsRe, /\n{3,}/g];
 })();
 
+// Generic LLM-metadata tag stripping. The Qwen upstream occasionally leaks
+// its own internal scaffolding (<plan>, <purpose>, <answer>, ...) into the
+// answer stream when output_schema='phase' boundaries are misaligned. We
+// strip any complete <tag>...</tag> pair whose name is:
+//   1. In the LLM_META_TAGS whitelist (always stripped, even mid-content), OR
+//   2. A short, lowercase, hyphen-allowed word that is NOT in PRESERVED_HTML_TAGS
+//      (default-deny for anything that looks like a tag but isn't a known
+//      semantic HTML element).
+//
+// Tag name matcher: lowercase letters, digits, hyphens. Must start with a
+// letter. Maximum 40 chars to avoid pathological regex on garbage input.
+// Attribute syntax (<tag attr="x">) is permitted — attributes are dropped
+// along with the tag, since leaked LLM metadata never has useful attrs.
+const PRESERVED_SET = new Set<string>(PRESERVED_HTML_TAGS);
+const META_SET = new Set<string>(LLM_META_TAGS.map((t) => t.toLowerCase()));
+// Sort by length DESC so longer names match first (e.g. "thinking_summary"
+// before "thinking" inside the alternation).
+const META_TAG_NAMES = [...META_SET].sort((a, b) => b.length - a.length);
+const META_OPEN_CLOSE_RE = new RegExp(
+  `<(${META_TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?<\\/\\1>`,
+  'gi',
+);
+// Generic pattern: any tag name not in PRESERVED_HTML_TAGS.
+// Negative lookahead against the preserved set — too long for a literal
+// regex, so we filter in the replacer callback.
+const GENERIC_PAIR_RE = /<([a-z][a-z0-9-]{0,39})\b[^>]*>[\s\S]*?<\/\1>/gi;
+
+// "Answer-wrapping" tags: when the model wraps its final reply in
+// <answer>...</answer>, we want to KEEP the inner content (that's the real
+// reply) and just drop the wrapper tags. Discovered 2026-08-12 — Qwen with
+// output_schema='phase' commonly emits the final answer wrapped in
+// <answer>...</answer> on top of the phase='answer' stream boundary.
+const ANSWER_WRAPPER_RE = /<\/?(answer|response)\b[^>]*>/gi;
+
+function stripLlmMetaTags(text: string): string {
+  // Pass 0: drop wrappers around the final answer but preserve their content.
+  let out = text.replace(ANSWER_WRAPPER_RE, '');
+  // Pass 1: known LLM meta tags — always stripped (including inner content).
+  out = out.replace(META_OPEN_CLOSE_RE, '');
+  // Pass 2: generic <word>...</word> where word is NOT a preserved HTML tag.
+  out = out.replace(GENERIC_PAIR_RE, (match, name: string) =>
+    PRESERVED_SET.has(name.toLowerCase()) ? match : '',
+  );
+  return out;
+}
+
 function stripRemainingXmlMarkup(text: string): string {
-  return text.replace(TOOL_MARKUP_RE, '').replace(ENV_DETAILS_RE, '').replace(EXCESS_NEWLINES_RE, '\n\n');
+  return text
+    .replace(TOOL_MARKUP_RE, '')
+    .replace(ENV_DETAILS_RE, '')
+    .replace(EXCESS_NEWLINES_RE, '\n\n');
+}
+
+// Strip LLM meta-tag pairs without affecting tool-call markup.
+// Public export so other sanitizers (e.g. contentFilter thinking capture)
+// can run the same pass on isolated segments.
+export function stripUnknownXmlTags(text: string): string {
+  return stripLlmMetaTags(text).replace(/\n{3,}/g, '\n\n');
 }
 
 export function cleanTextOfXmlArtifacts(text: string): { toolCalls: ParsedXmlToolCall[]; cleanedText: string } {
   const { toolCalls, cleanedText } = parseXmlToolCalls(text);
-  const fullyCleaned = stripRemainingXmlMarkup(cleanedText);
+  const fullyCleaned = stripLlmMetaTags(stripRemainingXmlMarkup(cleanedText));
   return { toolCalls, cleanedText: fullyCleaned };
 }
 

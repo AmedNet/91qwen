@@ -31,3 +31,53 @@ export const TOOL_RESULT_KEYWORDS = ['tool_result'] as const;
 
 /** Every known tool-related XML tag name (all Qwen API versions). */
 export const ALL_TOOL_KEYWORDS = [...TOOL_CALL_KEYWORDS, ...TOOL_RESULT_KEYWORDS, 'tool_call', 'tool_use'] as const;
+
+/**
+ * HTML/Markdown tags that must be PRESERVED when stripping unknown XML
+ * blocks from LLM output. Anything in this set is treated as legitimate
+ * markup (code blocks, emphasis, lists, tables, links, headings) and is
+ * not stripped by the generic "<word>...</word>" pass.
+ *
+ * Keep this list tight — any tag added here survives the leak sanitizer
+ * and reaches the client. Only add a tag if a real model emits it as
+ * semantic HTML/Markdown (not as LLM metadata scaffolding).
+ */
+export const PRESERVED_HTML_TAGS = [
+  // Code / preformatted
+  'code', 'pre', 'kbd', 'samp', 'var',
+  // Emphasis
+  'b', 'i', 'u', 's', 'em', 'strong', 'sub', 'sup', 'small', 'mark', 'del', 'ins',
+  // Structure
+  'br', 'hr', 'p', 'span', 'div',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+  // Tables
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption',
+  // Links / media
+  'a', 'img', 'figure', 'figcaption',
+  // Quotes
+  'blockquote', 'q', 'cite',
+] as const;
+
+/**
+ * Known LLM metadata tag names that the Qwen model has been observed to
+ * emit as part of its own internal scaffolding (often leaked into the
+ * answer stream when output_schema='phase' boundaries are misaligned by
+ * the upstream). Stripped aggressively along with their inner content —
+ * better to lose a tag than to leak "<plan>...</plan>" verbatim.
+ *
+ * Note: "answer" and "response" are intentionally NOT here. When the model
+ * wraps its final reply in <answer>...</answer>, we keep the inner content
+ * (that IS the real reply) and only drop the wrapper tags. See
+ * ANSWER_WRAPPER_RE in tools/xmlToolParser.ts.
+ *
+ * Source: confirmed via direct repro on qwen3.6-plus / qwen3.7-max with
+ * prompts asking the model to wrap reasoning in such tags. Reproduced
+ * 2026-08-12.
+ */
+export const LLM_META_TAGS = [
+  'plan', 'purpose', 'goal',
+  'context', 'step', 'analysis', 'thought', 'summary',
+  'conclusion', 'reasoning', 'reflection', 'note', 'notes',
+  'thinking_summary', 'thinking', 'think',
+] as const;

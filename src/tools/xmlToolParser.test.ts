@@ -367,4 +367,130 @@ describe('xmlToolParser', () => {
       }
     });
   });
+
+  describe('LLM metadata tag leak sanitization (repro 2026-08-12)', () => {
+    // Qwen upstream with output_schema='phase' sometimes leaks its own
+    // internal scaffolding into the answer stream. Reproduced on qwen3.6-plus
+    // / qwen3.7-max with prompts asking the model to wrap reasoning in such
+    // tags. The fix strips complete <tag>...</tag> pairs whose name is NOT
+    // in the PRESERVED_HTML_TAGS whitelist.
+
+    it('strips <plan>...</plan> pair from answer text', () => {
+      const input = 'Before\n<plan>\n1. step one\n2. step two\n</plan>\nAfter';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<plan>'), 'opening plan tag must be stripped');
+      assert.ok(!result.cleanedText.includes('</plan>'), 'closing plan tag must be stripped');
+      assert.ok(result.cleanedText.includes('Before'), 'text before must remain');
+      assert.ok(result.cleanedText.includes('After'), 'text after must remain');
+    });
+
+    it('strips <purpose>...</purpose> pair from answer text', () => {
+      const input = '<purpose>The purpose is to clarify.</purpose>\nBody content here.';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<purpose>'));
+      assert.ok(!result.cleanedText.includes('</purpose>'));
+      assert.ok(!result.cleanedText.includes('The purpose is to clarify.'));
+      assert.ok(result.cleanedText.includes('Body content here.'));
+    });
+
+    it('strips <answer> wrapper but PRESERVES inner content (the real answer)', () => {
+      // Qwen with output_schema='phase' commonly wraps the final answer in
+      // <answer>...</answer>. The wrapper is leaked scaffolding; the inner
+      // content is the actual reply and must reach the client.
+      const input = '<answer>This is the real answer body with details.</answer>';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<answer>'), 'opening answer wrapper must be stripped');
+      assert.ok(!result.cleanedText.includes('</answer>'), 'closing answer wrapper must be stripped');
+      assert.ok(result.cleanedText.includes('This is the real answer body with details.'), 'inner content must be preserved');
+    });
+
+    it('strips <answer> wrapper in the double-emission case (inner content survives)', () => {
+      // Real repro: model writes the answer once wrapped in <answer>, then
+      // again as plain text outside any tag (the "second copy"). Both copies
+      // survive; the wrapper is gone.
+      const input = '<answer>Some real answer here.</answer>\n\nSome real answer here.';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<answer>'));
+      assert.ok(!result.cleanedText.includes('</answer>'));
+      assert.ok(result.cleanedText.includes('Some real answer here.'), 'plain text must remain');
+    });
+
+    it('handles the multi-tag real repro (plan stripped, answer wrapper stripped, content preserved)', () => {
+      // Reproduced verbatim from qwen3.6-plus on 2026-08-12 with prompt
+      // "Always wrap your reasoning in <plan>...</plan> before answering,
+      // then wrap the answer in <answer>...</answer>".
+      const input =
+        '<plan>\n1. Analyze the request\n2. Structure answer\n</plan>\n\nReal answer body.\n\n<answer>\nReal answer body.\n</answer>';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<plan'));
+      assert.ok(!result.cleanedText.includes('</plan>'));
+      assert.ok(!result.cleanedText.includes('<answer'));
+      assert.ok(!result.cleanedText.includes('</answer>'));
+      // First occurrence of body (outside <answer>) must remain
+      assert.ok(result.cleanedText.includes('Real answer body.'));
+    });
+
+    it('strips arbitrary unknown tags (not in preserved whitelist)', () => {
+      const input = 'Intro\n<my-custom-tag>leaked content</my-custom-tag>\nOutro';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<my-custom-tag>'));
+      assert.ok(!result.cleanedText.includes('leaked content'), 'inner content of stripped tag must also be removed');
+      assert.ok(result.cleanedText.includes('Intro'));
+      assert.ok(result.cleanedText.includes('Outro'));
+    });
+
+    it('PRESERVES known HTML/Markdown tags (code, pre, b, em, h1, ul, li, ...)', () => {
+      const inputs = [
+        'Use <code>printf</code> to print.',
+        '<pre><code>x = 1\ny = 2</code></pre>',
+        'This is <b>bold</b> and <em>emphasized</em>.',
+        '<h1>Title</h1>\n<p>paragraph</p>',
+        '<ul><li>one</li><li>two</li></ul>',
+        'See <a href="https://example.com">link</a>.',
+        '<table><tr><td>cell</td></tr></table>',
+      ];
+      for (const input of inputs) {
+        const result = cleanTextOfXmlArtifacts(input);
+        // Each preserved tag must survive the sanitization
+        for (const tag of ['code', 'pre', 'b', 'em', 'h1', 'p', 'ul', 'li', 'a', 'table', 'tr', 'td']) {
+          if (input.includes(`<${tag}`) || input.includes(`</${tag}>`)) {
+            assert.ok(
+              result.cleanedText.includes(`<${tag}`) || result.cleanedText.includes(`</${tag}>`),
+              `tag <${tag}> must be preserved in: ${input} -> got: ${result.cleanedText}`,
+            );
+          }
+        }
+      }
+    });
+
+    it('strips tag pairs with attributes (Qwen sometimes adds attrs to meta tags)', () => {
+      const input = '<plan priority="high">\nsteps\n</plan>';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<plan'), 'opening plan with attrs must be stripped');
+      assert.ok(!result.cleanedText.includes('</plan>'));
+      assert.ok(!result.cleanedText.includes('steps'), 'inner content must be stripped too');
+    });
+
+    it('handles the multi-tag real repro (plan + answer double-emission)', () => {
+      // Reproduced verbatim from qwen3.6-plus on 2026-08-12 with prompt
+      // "Always wrap your reasoning in <plan>...</plan> before answering,
+      // then wrap the answer in <answer>...</answer>".
+      const input =
+        '<plan>\n1. Analyze the request\n2. Structure answer\n</plan>\n\nReal answer body.\n\n<answer>\nReal answer body.\n</answer>';
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('<plan'));
+      assert.ok(!result.cleanedText.includes('</plan>'));
+      assert.ok(!result.cleanedText.includes('<answer'));
+      assert.ok(!result.cleanedText.includes('</answer>'));
+      // First occurrence of body (outside <answer>) must remain
+      assert.ok(result.cleanedText.includes('Real answer body.'));
+    });
+
+    it('idempotent — running twice produces same result', () => {
+      const input = '<plan>foo</plan>\n<purpose>bar</purpose>\nReal text.';
+      const pass1 = cleanTextOfXmlArtifacts(input).cleanedText;
+      const pass2 = cleanTextOfXmlArtifacts(pass1).cleanedText;
+      assert.equal(pass1, pass2);
+    });
+  });
 });

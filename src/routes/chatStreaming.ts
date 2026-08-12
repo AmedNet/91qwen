@@ -208,6 +208,9 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     toolCallDepth: 0,
     openFnTagCount: 0,
     closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
     pendingChunk: '',
   };
 }
