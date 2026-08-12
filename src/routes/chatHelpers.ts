@@ -6,7 +6,7 @@ import { sessionPool } from '../services/sessionPool.ts';
 import type { ModelSpec } from '../types/openai.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 import { pendingCorrections } from './chatHelpersCore.ts';
-import { compressToolResult } from './compressToolResult.ts';
+
 
 /** Escape special XML characters in a string (for safe attribute & element content). */
 function escXml(s: string): string {
@@ -169,7 +169,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   // Single user message with all history wrapped in <user>/<assist> tags
   let prompt = segments.length > 0 ? segments.join('\n\n') : '';
 
-  const featureConfig = buildFeatureConfig(true);
+  const featureConfig = buildFeatureConfig(!body.model.includes('no-thinking'));
 
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const toolNames: string[] = [];

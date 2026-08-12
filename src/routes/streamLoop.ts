@@ -138,7 +138,7 @@ export async function handlePostStreamCompletion(
     if (upstreamError) {
       try {
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
-      } catch (e) {}
+      } catch  {}
       const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
       await writeEvent(
         streamWriter,

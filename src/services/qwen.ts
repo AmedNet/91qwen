@@ -16,15 +16,15 @@ export const QWEN_CHAT_COMPLETIONS_URL = `${QWEN_API_BASE}/api/v2/chat/completio
 export const QWEN_SETTINGS_URL = `${QWEN_API_BASE}/api/v2/users/user/settings/update`;
 
 /** Build shared feature_config for Qwen message payloads. */
-export function buildFeatureConfig(_enableThinking: boolean): Record<string, any> {
+export function buildFeatureConfig(enableThinking: boolean): Record<string, any> {
   return {
-    thinking_enabled: true,
+    thinking_enabled: enableThinking,
     output_schema: 'phase',
     research_mode: 'normal',
-    auto_thinking: false,
+    auto_thinking: enableThinking,
     thinking_mode: 'Thinking',
     thinking_format: 'summary',
-    auto_search: true,
+    auto_search: enableThinking,
   };
 }
 export const QWEN_CHATS_URL = `${QWEN_API_BASE}/api/v2/chats/`;

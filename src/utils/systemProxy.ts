@@ -12,9 +12,6 @@ function getRegistryValue(path: string, name: string): string | null {
 export function getSystemProxy(): string | null {
   if (process.platform !== 'win32') return null;
 
-  const proxyEnable = getRegistryValue('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', 'ProxyEnable');
-  if (!proxyEnable || proxyEnable === '0x0') return null;
-
   const proxyServer = getRegistryValue('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', 'ProxyServer');
   if (!proxyServer) return null;
 

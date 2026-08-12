@@ -1,7 +1,7 @@
 import { logStore } from '../services/logStore.ts';
-import { logQwenSSE } from '../services/qwenLogger.ts';
+
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
-import type { ParsedToolCall } from '../types/openai.ts';
+
 import { filterContent } from '../utils/contentFilter.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 import {
@@ -255,16 +255,17 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   }
 
   // ── One-chunk buffer: delay chunks that may be split mid-tag ─────
-  // Two mirror cases both delay by one chunk so tag opens/closes that
-  // straddle the SSE chunk boundary can be combined:
+  // Three mirror cases delay by one chunk so tag opens/closes that
+  // straddle the SSE chunk boundary can be combined before parsing:
   //   1. Chunk has '<' but no '>'      → tag open might be incomplete
   //      (e.g. `<func` + `tion=read>`)
   //   2. Chunk ends with `</[A-Za-z]*` → tag close might be incomplete
   //      (e.g. `</` + `function>`)
-  // Without case 2, a `</function>` close that splits into `</` and
-  // `function>` would leak the open-tag content (mid-block fragments) to
-  // the client before the close arrived — the close regex would never
-  // see a complete `</function>` and toolCallDepth would never decrement.
+  //   3. Chunk ends with `<[A-Za-z]+(=|$)` without a matching `>`
+  //      → tag open started but split BEFORE the `>` (e.g. `<function`
+  //      + `=exec_command>`). Without this case, the open regex sees
+  //      `=exec_command>` alone (no leading `<`) and never bumps depth,
+  //      so the next tool block leaks to the client.
   // MAX_BUFFER_CHARS prevents indefinite buffering of non-tag content
   // such as "x < 3" that happens to satisfy these patterns.
 
@@ -276,7 +277,9 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   const hasOpenBracketNoClose = rawText.includes('<') && !rawText.includes('>');
   // Case 2: tail like `</` or `</function` (still missing the trailing `>`).
   const trailingCloseStart = /<\/[A-Za-z]*$/.test(rawText) && !rawText.endsWith('>');
-  if ((hasOpenBracketNoClose || trailingCloseStart) && rawText.length < MAX_BUFFER_CHARS) {
+  // Case 3: tail like `<function` or `<function=` (open tag started, no `>` yet).
+  const trailingOpenStart = /<[A-Za-z][A-Za-z0-9-]*=?$/.test(rawText) && !rawText.endsWith('>');
+  if ((hasOpenBracketNoClose || trailingCloseStart || trailingOpenStart) && rawText.length < MAX_BUFFER_CHARS) {
     state.pendingChunk = rawText;
     return 'continue';
   }

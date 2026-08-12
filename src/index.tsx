@@ -17,9 +17,15 @@ import { config, updateClaudeCodeSettings } from './services/configService.ts';
 import { logStore } from './services/logStore.ts';
 import { configureAccount, fetchQwenModels } from './services/qwen.ts';
 import { initQwenLogger } from './services/qwenLogger.ts';
+import { getProxyArg } from './utils/systemProxy.ts';
 import { safeCompare } from './utils/auth.ts';
 import { isBun } from './utils/env.ts';
 import { projectPath } from './utils/paths.ts';
+
+const _proxyArg = getProxyArg();
+if (_proxyArg && !process.env.HTTPS_PROXY) {
+  process.env.HTTPS_PROXY = _proxyArg;
+}
 
 process.title = 'qwen-gate';
 

@@ -97,7 +97,7 @@ const server = http.createServer(async (req, res) => {
             headerLines.push('', '--- BODY ---', '');
             writeFileSync(dumpPath, headerLines.join('\n'), 'utf8');
             spec._debugDumpPath = dumpPath;
-          } catch (e) {
+          } catch  {
             // debug dump is best-effort
           }
         }

@@ -530,3 +530,167 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
   assert.ok(contentEvents.length > 0, 'content should be emitted after buffer overflow force-release');
 });
+
+test('regression: consecutive <function=...> blocks with multi-tag splits across chunks must not leak', async () => {
+  // Production incident (2026-08-11, .logs/qwen/req_2026-08-11T18-25-25-775Z):
+  // Qwen streamed two back-to-back `<function=exec_command>...</function>` blocks
+  // where EVERY tag boundary (open AND close) was split across SSE chunks, e.g.
+  //   chunk 7:  "2\n</parameter"
+  //   chunk 8:  ">\n</function"
+  //   chunk 9:  ">\n<function"       ← next open starts here, but `=` arrives in chunk 10
+  //   chunk 10: "=exec_command>"
+  // Pre-fix: the open regex `<function=[^\s>]+` never matched because chunk 9
+  // ended with `<function` (no `=`) and chunk 10 started with `=exec_command>`
+  // (no `<`). After the merge in chunk 10's pendingChunk release, the raw
+  // text contained BOTH opens (`<function=exec_command>` and the prior
+  // `<function=exec_command>` already opened) — but the depth accounting
+  // went negative at chunk 9's pending-release because opens=0 / closes=1
+  // (the </function> close from chunk 8 was merged in). The second block's
+  // open was effectively never counted → toolCallDepth returned to 0 →
+  // every subsequent chunk (parameters, values, body text) leaked to the
+  // client as plain text.
+  //
+  // Post-fix: pendingChunk now also delays chunks whose tail is an
+  // unterminated open tag (`<[A-Za-z]+=?$` without trailing `>`), so chunk 9
+  // waits for chunk 10 to complete `<function=exec_command>` before counting.
+  const logId = 'test-regression-consecutive-tool-blocks-log-id';
+  logStore.createEntry(logId, 'qwen3.7-max', true);
+
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
+    pendingChunk: '',
+  };
+
+  const writtenEvents: string[] = [];
+  const mockStreamWriter = {
+    write: async (chunk: string) => {
+      writtenEvents.push(chunk);
+    },
+  };
+
+  const ctx: StreamProcessingCtx = {
+    streamWriter: mockStreamWriter,
+    completionId: 'test-regression-consecutive-completion',
+    model: 'qwen3.8-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: false,
+    logId: logId,
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+
+  // The exact 15-chunk sequence observed in the production log.
+  const chunks = [
+    '<function=exec',
+    '_command>\n<',
+    'parameter=cmd>',
+    '\nls -la',
+    ' /Users/apoli',
+    '/Music/midi',
+    '2\n</parameter',
+    '>\n</function',
+    '>\n<function',
+    '=exec_command>',
+    '\n<parameter=',
+    'cmd>\ngit',
+    ' -C /Users',
+    '/apoli/Music',
+    '/midi2 log',
+  ];
+
+  for (const chunk of chunks) {
+    const data = { choices: [{ delta: { phase: 'answer', content: chunk } }] };
+    await processStreamData(data, state, ctx);
+  }
+
+  // Two `<function=` opens must have been counted (one per tool block).
+  assert.strictEqual(state.openFnTagCount, 2, 'two <function= opens should have been counted');
+
+  // At least one `</function>` close must have been counted. The production
+  // log preview is truncated at 10_000 chars, so the second `</function>`
+  // may not be present in this 15-chunk sample; the assertion allows for
+  // either 1 or 2 closes here. The leak-free property is enforced below
+  // by the client-payload assertions, which are the user-visible contract.
+  assert.ok(
+    state.closeFnTagCount >= 1 && state.closeFnTagCount <= 2,
+    'one or two </function> closes should have been counted (got ' + state.closeFnTagCount + ')',
+  );
+
+  // Depth must be at least 1 (second tool block may still be open in the
+  // truncated sample) and at most 2 (we never opened more than 2 blocks).
+  assert.ok(
+    state.toolCallDepth >= 1 && state.toolCallDepth <= 2,
+    'toolCallDepth should be 1 or 2 after 2 opens and 1-2 closes (got ' + state.toolCallDepth + ')',
+  );
+
+  // The filtered stream sent to the client must NOT contain any raw XML
+  // tool call markup leaking as plain text content. This is the
+  // user-visible contract — tool calls must arrive ONLY as the structured
+  // OpenAI `tool_calls` delta, never as raw `<function=...>` strings in
+  // the assistant content stream.
+  //
+  // Note: structured tool_calls events (written via writeToolCallEvent)
+  // DO contain the command body inside their JSON `arguments` field —
+  // that's the correct, expected format and must NOT be asserted against.
+  // We check the assistant `content` field by isolating delta.content values
+  // from any event whose delta carries tool_calls.
+  const assistantContent = writtenEvents
+    .map((e) => {
+      const m = e.match(/"delta":\s*\{([^}]*)\}/);
+      if (!m) return '';
+      const inner = m[1];
+      const contentMatch = inner.match(/"content":\s*"((?:[^"\\]|\\.)*)"/);
+      return contentMatch ? contentMatch[1] : '';
+    })
+    .filter(Boolean)
+    .join('');
+  assert.ok(
+    !assistantContent.includes('<function='),
+    'no <function= XML must leak into assistant content (leaked: ' + JSON.stringify(assistantContent.slice(0, 200)) + ')',
+  );
+  assert.ok(
+    !assistantContent.includes('</function>'),
+    'no </function> close tag must leak into assistant content',
+  );
+  assert.ok(
+    !assistantContent.includes('<parameter='),
+    'no <parameter= markup must leak into assistant content',
+  );
+  assert.ok(
+    !assistantContent.includes('</parameter>'),
+    'no </parameter> close tag must leak into assistant content',
+  );
+  assert.ok(
+    !assistantContent.includes('ls -la'),
+    'no tool command body must leak into assistant content',
+  );
+  assert.ok(
+    !assistantContent.includes('git -C'),
+    'no second tool command body must leak into assistant content',
+  );
+
+  // And the structured tool_calls event MUST have been written exactly once
+  // for the first recognized tool block — that confirms parseXmlToolCalls
+  // did its job and the gateway converted the XML into OpenAI tool_calls.
+  const toolCallEvents = writtenEvents.filter((e) => e.includes('"tool_calls"'));
+  assert.ok(toolCallEvents.length >= 1, 'at least one tool_calls event should be emitted to client');
+});

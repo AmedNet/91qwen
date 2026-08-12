@@ -236,6 +236,13 @@ export function rebuildEmailIndex(): void {
 }
 
 export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
+  // Guard: under `bun test` / `node test` / `vitest` etc, NODE_ENV is set to "test".
+  // Without this, any test that touches `accounts` and triggers saveCookies or a
+  // throttle would overwrite the real .qwen/accounts.json with fixture data and
+  // leave a savecookies-test@example.com stub as the only account.
+  if (process.env.NODE_ENV === 'test') {
+    return;
+  }
   const dir = path.dirname(ACCOUNTS_FILE);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
