@@ -69,7 +69,38 @@ export async function runStreamLoop(
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
+      if (!trimmed || trimmed.startsWith(':')) continue;
+
+      // Qwen upstream sometimes returns a non-SSE JSON error envelope as the
+      // entire response body (e.g. {"success":false,"data":{"code":"CHAT_IN_PROGRESS",...}})
+      // wrapped in the streaming response. When the line is not an SSE `data: `
+      // frame, check if it is a Qwen error envelope. If so, surface it to the
+      // client as a stream error instead of silently dropping the entire stream.
+      if (!trimmed.startsWith('data: ')) {
+        const upstreamError = parseQwenErrorPayload(trimmed);
+        if (upstreamError) {
+          logStore.addError(streamCtx.logId, upstreamError.message);
+          logStore.updateEntry(streamCtx.logId, (entry) => {
+            entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+            entry.finalResponse.finishReason = 'upstream_error';
+          });
+          await writeEvent(
+            streamCtx.streamWriter,
+            buildErrorEvent(streamCtx.completionId, streamCtx.model, {
+              message: upstreamError.message,
+              type: 'server_error',
+              code: upstreamError.status === 429 ? 'rate_limit_error' : 'upstream_error',
+              retryable: upstreamError.status === 429 || upstreamError.status === 502,
+              retryAfterMs: upstreamError.status === 429 ? 3000 : 2000,
+            }),
+          );
+          await streamCtx.streamWriter.write('data: [DONE]\n\n');
+          streamDone = true;
+          break;
+        }
+        // Not an SSE frame and not a Qwen error envelope: skip silently
+        continue;
+      }
 
       const dataStr = trimmed.slice(6);
       if (dataStr === '[DONE]') {
