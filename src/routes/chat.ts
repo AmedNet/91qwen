@@ -294,8 +294,27 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         retrySameAccount = resolvedEmail;
         continue;
       }
+      // 暂时注释掉 FAIL_SYS_USER_VALIDATE 判断，避免误判
+      // if (
+      //   (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
+      //   (err.message || '').includes('CAPTCHA') ||
+      //   err instanceof RetryableQwenStreamError
+      // ) {
+      //   lastFailedEmail = resolvedEmail;
+      //   lastError = err;
+      //   if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+      //   continue;
+      // }
+
+      // 对于 "ChatInProgress" 错误，直接返回给客户端，不再重试
+      if (err.upstreamCode === 'ChatInProgress') {
+        logStore.log('info', 'chat', `Chat in progress error, returning to client for ${resolvedEmail}`);
+        // 删除上游会话，强制释放（release 里的删除是延迟执行的，这里立即删）
+        sessionPool.deleteSession(session.chatId, sessionHeaders, resolvedEmail).catch(() => {});
+        throw err;
+      }
+
       if (
-        (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
         (err.message || '').includes('CAPTCHA') ||
         err instanceof RetryableQwenStreamError
       ) {

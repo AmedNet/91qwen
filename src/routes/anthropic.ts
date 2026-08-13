@@ -482,8 +482,26 @@ async function setupAnthropicSession(
         retrySameAccount = resolvedEmail;
         continue;
       }
+      // 暂时注释掉 FAIL_SYS_USER_VALIDATE 判断，避免误判
+      // if (
+      //   (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
+      //   (err.message || '').includes('CAPTCHA') ||
+      //   err instanceof RetryableQwenStreamError
+      // ) {
+      //   logStore.log('warn', 'chat', `[Anthropic]   -> CAPTCHA/validation, throttling + trying next`);
+      //   lastFailedEmail = resolvedEmail;
+      //   lastError = err;
+      //   if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+      //   continue;
+      // }
+
+      // 对于 "ChatInProgress" 错误，直接返回给客户端，不再重试
+      if (err.upstreamCode === 'ChatInProgress') {
+        logStore.log('info', 'chat', `[Anthropic] Chat in progress error for ${resolvedEmail}, returning to client`);
+        throw err;
+      }
+
       if (
-        (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
         (err.message || '').includes('CAPTCHA') ||
         err instanceof RetryableQwenStreamError
       ) {
@@ -540,7 +558,9 @@ async function setupAnthropicSession(
 
     if (firstChunk.value && !firstChunk.done) {
       const firstText = new TextDecoder().decode(firstChunk.value);
-      if (firstText.includes('FAIL_SYS_USER_VALIDATE') || firstText.includes('CAPTCHA') || firstText.includes('punish')) {
+      // 暂时注释掉 FAIL_SYS_USER_VALIDATE 判断，避免误判
+      // if (firstText.includes('FAIL_SYS_USER_VALIDATE') || firstText.includes('CAPTCHA') || firstText.includes('punish')) {
+      if (firstText.includes('CAPTCHA') || firstText.includes('punish')) {
         const err = new RetryableQwenStreamError(`Qwen validation failed: ${firstText.substring(0, 200)}`, 3000);
         logStore.log(
           'warn',

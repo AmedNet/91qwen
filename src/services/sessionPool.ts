@@ -125,6 +125,10 @@ export class SessionPool {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const resolvedEmail = email || (await pickAccount())?.email;
+      // 没有可用账号时直接失败，绝不走"默认账号"路径（会绕过 inFlight 并发保护）
+      if (!resolvedEmail) {
+        throw new Error('No available account — all accounts busy or throttled');
+      }
 
       try {
         // Fast path: reuse a pre-created EMPTY chat from the pool (no chats/new round trip).

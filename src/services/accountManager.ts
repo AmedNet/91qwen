@@ -445,6 +445,8 @@ export function isAvailable(acct: AccountEntry): boolean {
   if (acct.disabled) return false;
   if (!acct.state) return false;
   if (acct.throttledUntil > Date.now()) return false;
+  // 一个账号最多只能处理一个请求，避免 chat is in progress 错误
+  if (acct.inFlight > 0) return false;
   return true;
 }
 export async function pickAccount(excludeEmail?: string): Promise<AccountEntry | null> {
@@ -457,28 +459,28 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
       available = available.filter((a) => a.email !== excludeEmail);
     }
     if (available.length === 0) {
-      // All accounts are throttled or unauthenticated — return null instead
-      // of falling back to a throttled account (which would guaranteed fail).
-      // The caller should return a proper "all accounts exhausted" error.
+      // 所有账号都不可用（被限制、未认证、或正在处理请求）
+      // 不再回退到选择有请求的账号，而是返回 null 让调用方等待
       if (accounts.length === 0) {
         return null;
       }
       const throttled = accounts.filter((a) => a.throttledUntil > Date.now()).length;
       const noState = accounts.filter((a) => !a.state).length;
-      logStore.log('warn', 'auth', `All ${accounts.length} accounts exhausted — ${throttled} throttled, ${noState} unauthenticated`);
+      const busy = accounts.filter((a) => a.inFlight > 0 && a.state && a.throttledUntil <= Date.now() && !a.disabled).length;
+      logStore.log('warn', 'auth', `No available accounts — ${throttled} throttled, ${noState} unauthenticated, ${busy} busy`);
       return null;
     }
+    // 只选择 inFlight === 0 的账号（一个账号最多处理一个请求）
     const pool = available.filter((a) => a.inFlight === 0);
-    const candidates = pool.length > 0 ? pool : available;
+    const candidates = pool;
     // Single-pass O(N) min-find instead of O(N log N) sort
     let bestIdx = 0;
     for (let i = 1; i < candidates.length; i++) {
       const a = candidates[i];
       const b = candidates[bestIdx];
       if (
-        a.inFlight < b.inFlight ||
-        (a.inFlight === b.inFlight && a.totalRequests < b.totalRequests) ||
-        (a.inFlight === b.inFlight && a.totalRequests === b.totalRequests && (a.lastUsed || 0) < (b.lastUsed || 0))
+        a.totalRequests < b.totalRequests ||
+        (a.totalRequests === b.totalRequests && (a.lastUsed || 0) < (b.lastUsed || 0))
       ) {
         bestIdx = i;
       }

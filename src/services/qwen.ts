@@ -285,9 +285,14 @@ export async function createQwenStream(
       try {
         const errorJson = JSON.parse(errText);
         if (errorJson?.data?.details?.includes('chat is in progress') || errorJson?.data?.details?.includes('The chat is in progress')) {
-          const retryAfterMs = 2000 + Math.floor(Math.random() * 2000);
+          // 上游会话仍在处理中（通常是上一个请求超时/中断后在上游残留）。
+          // 冷却该账号，避免后续请求在会话释放前再次打到同一账号。
+          if (currentAccountEmail) {
+            throttleAccount(currentAccountEmail, 30_000);
+          }
           errorEntry(debugEntryId, errorJson.data.details);
-          throw new RetryableQwenStreamError(`Qwen: ${errorJson.data.details}`, retryAfterMs);
+          logStore.log('warn', 'qwen', `Chat in progress for ${currentAccountEmail} — throttled 30s`);
+          throw new QwenUpstreamError(`Qwen: ${errorJson.data.details}`, 'ChatInProgress', 409);
         }
 
         if (errorJson?.success === false) {
