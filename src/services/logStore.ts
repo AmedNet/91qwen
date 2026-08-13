@@ -9,6 +9,7 @@ import { mkdirSync, readdirSync, unlinkSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { join } from 'path';
 import { config } from './configService.ts';
+import { sanitizeLogChunks, sanitizeLogText, sanitizeLogValue } from '../utils/logSanitizer.ts';
 import {
   getAllModelHealth as _getAllModelHealth,
   getModelHealth as _getModelHealth,
@@ -359,7 +360,7 @@ export class RequestLogStore extends SystemLogger {
         } catch {
           /* keep string */
         }
-        return { name: tc.name, arguments: args };
+        return { name: sanitizeLogText(tc.name, 200), arguments: sanitizeLogValue(args, 2000) };
       });
       const payload = {
         id: entry.id,
@@ -370,16 +371,16 @@ export class RequestLogStore extends SystemLogger {
         finish_reason: entry.finalResponse?.finishReason || null,
         stream: entry.stream,
         latency_ms: entry.latency_ms,
-        thinking_content: entry.reasoningContent || '',
-        raw_output: entry.rawFullContent || '',
-        proccessed_output: entry.processedApiOutput || '',
+        thinking_content: sanitizeLogText(entry.reasoningContent || '', 2000),
+        raw_output: sanitizeLogText(entry.rawFullContent || '', 10000),
+        proccessed_output: sanitizeLogText(entry.processedApiOutput || '', 10000),
         tool_call_count: toolCalls.length,
         tool_calls: toolCalls,
-        errors: entry.errors || [],
-        chunks: entry.qwenRawChunks || [],
-        input: entry.clientRequest || {},
+        errors: (entry.errors || []).map((error) => sanitizeLogText(error, 500)),
+        chunks: sanitizeLogChunks(entry.qwenRawChunks || []),
+        input: sanitizeLogValue(entry.clientRequest || {}, 500),
       };
-      const fileName = `${dateStr}_${timeStr}.json`;
+      const fileName = `${dateStr}_${timeStr}_${entry.id}.json`;
       const filePath = join(this.requestLogDir, fileName);
       // Periodic cleanup instead of readdirSync+sort on every request
       this.requestFileCount++;

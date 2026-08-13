@@ -492,5 +492,62 @@ describe('xmlToolParser', () => {
       const pass2 = cleanTextOfXmlArtifacts(pass1).cleanedText;
       assert.equal(pass1, pass2);
     });
+
+    it('strips malformed parameter-only tool blocks so parameter values cannot leak', () => {
+      const input = [
+        '拿到文件列表了，现在看具体改动内容。',
+        '<parameter=shell_command>',
+        '<parameter=command>git diff --cached</parameter>',
+        '<parameter=workdir>J:\\Program Files (x86)\\qwen-gate</parameter>',
+        '<parameter=timeout_ms>30000</parameter>',
+        '</function>',
+      ].join('\n');
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(result.cleanedText.includes('拿到文件列表了，现在看具体改动内容。'));
+      assert.ok(!result.cleanedText.includes('git diff'));
+      assert.ok(!result.cleanedText.includes('Program Files'));
+      assert.ok(!result.cleanedText.includes('30000'));
+      assert.ok(!result.cleanedText.includes('<parameter'));
+      assert.ok(!result.cleanedText.includes('</function>'));
+    });
+
+    it('strips tagless tool result echo and keeps prose after the block', () => {
+      const input = [
+        '我先执行命令。',
+        'tool_result tool_name="shell_command" success="true">',
+        '<command>shell_command</command>',
+        '<stdout>Exit code: 0',
+        'diff --git a.ts b.ts',
+        '</stdout>',
+        '</tool_result>',
+        '真实回答',
+      ].join('\n');
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(result.cleanedText.includes('我先执行命令。'));
+      assert.ok(result.cleanedText.includes('真实回答'));
+      assert.ok(!result.cleanedText.includes('shell_command'));
+      assert.ok(!result.cleanedText.includes('diff --git'));
+      assert.ok(!result.cleanedText.includes('<stdout'));
+      assert.ok(!result.cleanedText.includes('<command'));
+    });
+
+    it('strips orphan tool result opening when the tag prefix is missing', () => {
+      const input = [
+        '前面内容',
+        '="shell_command" success="true">',
+        '<command>shell_command</command>',
+        '<stdout>Exit code: 0',
+        'secret output',
+        '</stdout>',
+        '后续内容',
+      ].join('\n');
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(result.cleanedText.includes('前面内容'));
+      assert.ok(result.cleanedText.includes('后续内容'));
+      assert.ok(!result.cleanedText.includes('="shell_command"'));
+      assert.ok(!result.cleanedText.includes('secret output'));
+      assert.ok(!result.cleanedText.includes('<command'));
+      assert.ok(!result.cleanedText.includes('<stdout'));
+    });
   });
 });

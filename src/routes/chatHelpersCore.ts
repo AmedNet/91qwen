@@ -94,7 +94,7 @@ export function getSnapshotDelta(newSnapshot: string, lastSnapshot: string): str
 }
 
 /** Matches tool result tag fragments (requires closing > to avoid false stripping of /toolbox /toolkit etc). */
-const TOOL_RESULT_TAG_PATTERN = new RegExp(`<\\/${TOOL_RESULT_KEYWORDS.join('|')}>`, 'gi');
+const TOOL_RESULT_TAG_PATTERN = new RegExp(`<\\/(?:${TOOL_RESULT_KEYWORDS.join('|')})>`, 'gi');
 
 /**
  * Data-driven regex builder for tool call XML tag & tail stripping.

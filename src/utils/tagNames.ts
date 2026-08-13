@@ -23,14 +23,20 @@
 /** Known XML tag names for tool call blocks (function + parameter). */
 export const TOOL_CALL_KEYWORDS = ['function', 'parameter'] as const;
 
+/**
+ * Newer Qwen tool-call envelope. It wraps one or more
+ * `<invoke name="tool_name">` entries inside `<function_calls>`.
+ */
+export const FUNCTION_CALLS_TAGS = ['function_calls', 'invoke'] as const;
+
 /** Known XML tag names for think/reasoning blocks. */
 export const THINK_TAG_NAMES = ['think', 'thinking', 'thought'] as const;
 
 /** Known XML tag names for tool result blocks (legacy format). */
-export const TOOL_RESULT_KEYWORDS = ['tool_result'] as const;
+export const TOOL_RESULT_KEYWORDS = ['tool_result', 'tool_call', 'tool_use'] as const;
 
 /** Every known tool-related XML tag name (all Qwen API versions). */
-export const ALL_TOOL_KEYWORDS = [...TOOL_CALL_KEYWORDS, ...TOOL_RESULT_KEYWORDS, 'tool_call', 'tool_use'] as const;
+export const ALL_TOOL_KEYWORDS = [...new Set([...TOOL_CALL_KEYWORDS, ...TOOL_RESULT_KEYWORDS])] as const;
 
 /**
  * HTML/Markdown tags that must be PRESERVED when stripping unknown XML
@@ -81,3 +87,15 @@ export const LLM_META_TAGS = [
   'conclusion', 'reasoning', 'reflection', 'note', 'notes',
   'thinking_summary', 'thinking', 'think',
 ] as const;
+
+/**
+ * Structural tags from the conversation format that the model sometimes
+ * echoes back into its answer stream. These are only seen as orphan closers
+ * in practice, so they are stripped explicitly as closing tags.
+ */
+
+export const LLM_STRUCTURE_TAGS = ['assist', 'invoke'] as const;
+/** Non-thinking LLM metadata closers that may leak as orphan tags. */
+export const LLM_META_CLOSE_TAGS = LLM_META_TAGS.filter(
+  (tag) => !THINK_TAG_NAMES.includes(tag as (typeof THINK_TAG_NAMES)[number]),
+);

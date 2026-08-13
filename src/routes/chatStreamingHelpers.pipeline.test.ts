@@ -428,4 +428,25 @@ describe('filterContentPipeline — per-chunk XML tool call preservation', () =>
       assert.ok(!result.cleanedText.includes('</parameter>'), `${log.name}: no </parameter> remains`);
     }
   });
+
+  test('strip orphaned conversation-structure closers while preserving prose', () => {
+    const cases: Array<[string, string]> = [
+      ['抱歉，刚才命令参数写错了，重新来。\n\n</assist>', '抱歉，刚才命令参数写错了，重新来。'],
+      ['拿到了目录结构，继续看核心入口和\n\n</invoke>文档。\n\n</invoke>', '拿到了目录结构，继续看核心入口和'],
+    ];
+
+    for (const [input, expectedCore] of cases) {
+      const result = cleanTextOfXmlArtifacts(input);
+      assert.ok(!result.cleanedText.includes('</assist>'), `</assist> must not leak: ${result.cleanedText}`);
+      assert.ok(!result.cleanedText.includes('</invoke>'), `</invoke> must not leak: ${result.cleanedText}`);
+      assert.ok(result.cleanedText.includes(expectedCore), `prose must be preserved: ${result.cleanedText}`);
+    }
+  });
+
+  test('filterContentPipeline strips structure closers in flush path', () => {
+    const result = filterContentPipeline('好的，继续。\n\n</assist>', true, false);
+    assert.ok(result.cleanText !== null, 'flush path must return cleanText');
+    assert.ok(!result.cleanText!.includes('</assist>'), 'flush path must strip </assist>');
+    assert.ok(result.cleanText!.includes('好的，继续。'), 'flush path must preserve prose');
+  });
 });

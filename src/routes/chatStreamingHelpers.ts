@@ -42,8 +42,51 @@ const MAX_BUFFER_CHARS = 200;
 // post-pendingChunk merged text, and accumulating into state, guarantees
 // toolCallDepth matches the actual open-block count in lastFullContent.
 const FKW = TOOL_CALL_KEYWORDS[0]; // 'function'
+const PKW = TOOL_CALL_KEYWORDS[1]; // 'parameter'
 const TOOL_TAG_OPEN_RE = new RegExp(`<${FKW}=[^\\s>>]+`, 'g');
 const TOOL_TAG_CLOSE_RE = new RegExp(`</${FKW}>`, 'g');
+// Malformed Qwen output sometimes emits parameter blocks without a
+// `<function=...>` wrapper. Treat a bare `<parameter=` as an open tool block
+// so its values are suppressed until `</function>` arrives.
+const TOOL_DEPTH_TOKEN_RE = new RegExp(
+  `<${FKW}=[^\\s>]+>|<\\/${FKW}>|<${PKW}=[^\\s>]+>|<function_calls\\b[^>]*>|<\\/function_calls>|<invoke\\b[^>]*>|<\\/invoke>`,
+  'g',
+);
+/**
+ * Returns only the non-tool-call portions of a merged stream chunk.
+ * `processStreamData` suppresses content emission while tool-call XML is
+ * streaming, but a single chunk can still contain prose immediately before
+ * or after the tool block (for example `"。\n\n<function=...>`). That prose
+ * must still enter the filtered-content accumulator, otherwise the flush
+ * pass sees a different snapshot and re-emits already-shown text.
+ */
+function extractNonToolText(rawText: string, preToolDepth: number): string {
+  if (!rawText) return '';
+  let depth = preToolDepth;
+  let last = 0;
+  const parts: string[] = [];
+  TOOL_DEPTH_TOKEN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = TOOL_DEPTH_TOKEN_RE.exec(rawText)) !== null) {
+    if (depth === 0) parts.push(rawText.slice(last, match.index));
+    if (match[0].startsWith(`<${FKW}=`)) {
+      depth++;
+    } else if (match[0] === `</${FKW}>` && depth > 0) {
+      depth--;
+    } else if (depth === 0 && match[0].startsWith(`<${PKW}=`)) {
+      depth = 1;
+    } else if (match[0].startsWith('<function_calls') || match[0].startsWith('<invoke')) {
+      depth++;
+    } else if (match[0] === '</function_calls>' && depth > 0) {
+      depth = 0;
+    } else if (match[0] === '</invoke>' && depth > 0) {
+      depth--;
+    }
+    last = match.index + match[0].length;
+  }
+  if (depth === 0) parts.push(rawText.slice(last));
+  return parts.join('');
+}
 
 // ── LLM metadata tag depth counter ──────────────────────────────────
 // Qwen with output_schema='phase' sometimes leaks its internal scaffolding
@@ -103,6 +146,8 @@ export interface StreamProcessingState {
   closeLlmMetaCount: number;
   /** >0 means we are inside a leaked LLM-metadata block; suppress emit. */
   llmMetaDepth: number;
+  /** True while a tagless tool result echo block is streaming. */
+  inToolResultEcho?: boolean;
   /**
    * One-chunk buffer for handling XML tag splits across SSE chunk boundaries.
    * When a chunk contains `<` without `>`, it might be a tag split (e.g. `<func` + `tion=read>`).
@@ -309,7 +354,25 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   const trailingCloseStart = /<\/[A-Za-z]*$/.test(rawText) && !rawText.endsWith('>');
   // Case 3: tail like `<function` or `<function=` (open tag started, no `>` yet).
   const trailingOpenStart = /<[A-Za-z][A-Za-z0-9-]*=?$/.test(rawText) && !rawText.endsWith('>');
-  if ((hasOpenBracketNoClose || trailingCloseStart || trailingOpenStart) && rawText.length < MAX_BUFFER_CHARS) {
+  // Case 4: tail is a bare `<` (the next chunk can start with `function=`).
+  const trailingBareOpenStart = rawText.endsWith('<');
+  // Case 5: the merged text contains an unfinished tool open whose
+  // closing `>` is still in a future chunk (e.g. `...<function=shell` + `_command>`).
+  const lastToolOpenIdx = Math.max(
+    rawText.lastIndexOf(`<${FKW}=`),
+    rawText.lastIndexOf(`<${PKW}=`),
+    rawText.lastIndexOf('<function_calls'),
+    rawText.lastIndexOf('<invoke'),
+  );
+  const hasIncompleteToolOpen = lastToolOpenIdx !== -1 && rawText.indexOf('>', lastToolOpenIdx) === -1;
+  if (
+    (hasOpenBracketNoClose ||
+      trailingCloseStart ||
+      trailingOpenStart ||
+      trailingBareOpenStart ||
+      hasIncompleteToolOpen) &&
+    rawText.length < MAX_BUFFER_CHARS
+  ) {
     state.pendingChunk = rawText;
     return 'continue';
   }
@@ -344,7 +407,54 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   while (TOOL_TAG_CLOSE_RE.exec(rawText) !== null) chunkCloses++;
   state.openFnTagCount += chunkOpens;
   state.closeFnTagCount += chunkCloses;
-  state.toolCallDepth = Math.max(0, state.openFnTagCount - state.closeFnTagCount);
+
+  // Qwen sometimes emits stray `</function>` closers (for example while
+  // recovering from a malformed tool block). A cumulative
+  // open-count-minus-close-count calculation lets those orphaned closers
+  // consume later valid opens and forces depth back to 0 while the next
+  // tool block is still streaming. Walk the merged tokens in order instead,
+  // ignoring closes when no block is open, so every `<function=NAME>` still
+  // suppresses emission until its matching `</function>`.
+  const preToolDepth = state.toolCallDepth;
+  TOOL_DEPTH_TOKEN_RE.lastIndex = 0;
+  let toolDepth = state.toolCallDepth;
+  let tokenMatch: RegExpExecArray | null;
+  while ((tokenMatch = TOOL_DEPTH_TOKEN_RE.exec(rawText)) !== null) {
+    if (tokenMatch[0].startsWith(`<${FKW}=`)) {
+      toolDepth++;
+    } else if (tokenMatch[0] === `</${FKW}>` && toolDepth > 0) {
+      toolDepth--;
+    } else if (toolDepth === 0 && tokenMatch[0].startsWith(`<${PKW}=`)) {
+      toolDepth = 1;
+    } else if (tokenMatch[0].startsWith('<function_calls') || tokenMatch[0].startsWith('<invoke')) {
+      toolDepth++;
+    } else if (tokenMatch[0] === '</function_calls>' && toolDepth > 0) {
+      toolDepth = 0;
+    } else if (tokenMatch[0] === '</invoke>' && toolDepth > 0) {
+      toolDepth--;
+    }
+  }
+  state.toolCallDepth = toolDepth;
+
+  // Tagless tool result echoes (e.g. `tool_result tool_name="..." success="true">`
+  // without a leading `<`) are not XML blocks. Suppress them explicitly until
+  // the closing result tag arrives, otherwise stdout content leaks to the client.
+  const resultEchoOpenRe = /(?:^|\n)\s*(?:<(?:tool_result|tool_call|tool_use)\b[^>]*>|tool_(?:result|call|use)\b|="[A-Za-z_]+"\s+success="[^"]*">)/;
+  const resultEchoCloseRe = /<\/(?:tool_result|tool_call|tool_use)>/;
+  let resultEchoClosed = false;
+  if (!state.inToolResultEcho && resultEchoOpenRe.test(rawText)) {
+    state.inToolResultEcho = true;
+  }
+  if (state.inToolResultEcho && resultEchoCloseRe.test(rawText)) {
+    resultEchoClosed = true;
+  }
+  const chunkResultEchoActive = !!state.inToolResultEcho;
+  if (resultEchoClosed) state.inToolResultEcho = false;
+
+  // A close tag and the tool-body fragments that precede it can arrive in the
+  // same chunk. The post-scan depth is 0 by then, but this chunk is still part
+  // of the tool block and must not be emitted as user content.
+  const chunkToolDepthActive = preToolDepth > 0 || state.toolCallDepth > 0 || chunkResultEchoActive;
 
   // Track LLM-metadata tag depth (plan / purpose / answer wrapper / ...).
   // We compute depth "pre-increment" — i.e. the depth that applies to THIS
@@ -426,14 +536,15 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   //
   // Also skip when preMetaDepth > 0: rawText is part of a leaked meta-tag
   // block. The block gets buffered and stripped at the close tag's arrival.
+  const nonToolText = chunkResultEchoActive ? '' : extractNonToolText(rawText, preToolDepth);
   let deltaCleaned: string | null = null;
   let deltaThinking = '';
-  if (state.toolCallDepth === 0 && chunkMetaDepth === 0) {
-    const filterDelta = filterContentPipeline(rawText, enableContentFiltering, true);
+  if (chunkMetaDepth === 0 && nonToolText) {
+    const filterDelta = filterContentPipeline(nonToolText, enableContentFiltering, true);
     deltaCleaned = filterDelta.cleanText;
     deltaThinking = filterDelta.thinking;
   }
-  // Only accumulate filtered content when outside a tool call block.
+  // Only accumulate filtered content when outside a tool-call block.
   // Inside a tool call (depth > 0), fragments like "-edit" or "=filePath>" would
   // leak through cleanThinkTags and corrupt the client's content stream.
   //
@@ -442,15 +553,14 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // tag arriving inside chunk N is treated as still being inside the meta
   // block (depth > 0) and gets buffered+stripped, rather than leaking as
   // residual "</plan>" to the client.
-  // Always accumulate rawText into lastFilteredFullContent when we have
-  // valid text and we're outside a tool-call block. Strip complete
-  // meta-tag pairs from the merged accumulator every time so the
-  // close-tag-arrival case (<plan> in chunk 1, </plan> in chunk N) is
-  // caught here — the per-chunk cleanTextOfXmlArtifacts can only see one
-  // side of a cross-chunk pair, but the merged accumulator sees both.
-  if (state.toolCallDepth === 0 && rawText) {
-    const merged = (state.lastFilteredFullContent || '') + rawText;
-    state.lastFilteredFullContent = cleanTextOfXmlArtifacts(merged).cleanedText;
+  // Always accumulate the non-tool prose from this chunk into
+  // lastFilteredFullContent, even when the same chunk starts or ends a tool
+  // block. extractNonToolText keeps prose around tool-call XML while dropping
+  // the XML itself, so the incremental snapshot stays aligned with the final
+  // flush pass.
+  if (chunkMetaDepth === 0 && nonToolText) {
+    const merged = (state.lastFilteredFullContent || '') + nonToolText;
+    state.lastFilteredFullContent = filterContentPipeline(merged, enableContentFiltering, true).cleanText || '';
   }
   if (deltaThinking) state.lastDeltaThinkingFull = (state.lastDeltaThinkingFull || '') + deltaThinking;
 
@@ -465,7 +575,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     }
   }
 
-  if (cleanedText && state.toolCallDepth === 0 && chunkMetaDepth === 0) {
+  if (cleanedText && !chunkToolDepthActive && chunkMetaDepth === 0) {
     // Re-strip the FULL snapshot before emitting and before recording it as
     // the diff baseline. This is essential: when a meta-tag pair straddles
     // multiple chunks, the per-chunk `cleanTextOfXmlArtifacts(rawText)` only

@@ -1,5 +1,13 @@
 import crypto from 'node:crypto';
-import { LLM_META_TAGS, PRESERVED_HTML_TAGS, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
+import {
+  LLM_META_CLOSE_TAGS,
+  LLM_META_TAGS,
+  LLM_STRUCTURE_TAGS,
+  PRESERVED_HTML_TAGS,
+  FUNCTION_CALLS_TAGS,
+  TOOL_CALL_KEYWORDS,
+  TOOL_RESULT_KEYWORDS,
+} from '../utils/tagNames.ts';
 
 export interface ParsedXmlToolCall {
   name: string;
@@ -14,6 +22,9 @@ const PKW = TOOL_CALL_KEYWORDS[1]; // 'parameter' — the parameter keyword
 const FUNCTION_BLOCK_RE = new RegExp(`<${FKW}=[^\\s>]+[\\s\\S]*?>[\\s\\S]*?(?:<\\/${FKW}>|$)`, 'g');
 const PARAM_RE = new RegExp(`<${PKW}=([^\\s>]+)>([\\s\\S]*?)<\\/${PKW}>`, 'g');
 const FUNC_NAME_RE = new RegExp(`^<${FKW}=([^\\s>]+)>`);
+const FUNCTION_CALLS_BLOCK_RE = /<function_calls\b[^>]*>([\s\S]*?)<\/function_calls>/g;
+const INVOKE_OPEN_RE = /<invoke\b[^>]*?\bname="([^"]+)"[^>]*>/g;
+const PARAM_OPEN_RE = /<parameter\b[^>]*?\bname="([^"]+)"[^>]*>([\s\S]*?)(?=<parameter\b|<\/parameter>|<invoke\b|<\/invoke>|<\/function_calls>|$)/g;
 
 function functionNameFromTag(tag: string): string | null {
   // Match function name from <KEYWORD=NAME...> — NAME can be any non-whitespace, non-> chars
@@ -23,12 +34,43 @@ function functionNameFromTag(tag: string): string | null {
 
 export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[]; cleanedText: string } {
   const toolCalls: ParsedXmlToolCall[] = [];
-  const unique = new Set<string>();
   let cleanedText = text;
 
-  // Fast path: skip the expensive regex exec loop when there's no tool call content
-  const hasToolCallStart = TOOL_CALL_KEYWORDS.some((kw) => text.includes(`<${kw}=`));
-  if (!hasToolCallStart) return { toolCalls, cleanedText };
+  // Newer Qwen format:
+  // <function_calls>
+  //   <invoke name="execute_command">
+  //     <parameter name="command">...</parameter>
+  //   </invoke>
+  // </function_calls>
+  FUNCTION_CALLS_BLOCK_RE.lastIndex = 0;
+  let callsMatch: RegExpExecArray | null;
+  while ((callsMatch = FUNCTION_CALLS_BLOCK_RE.exec(cleanedText)) !== null) {
+    const block = callsMatch[1];
+    const invokeMatches = Array.from(block.matchAll(INVOKE_OPEN_RE));
+    for (let i = 0; i < invokeMatches.length; i++) {
+      const invokeMatch = invokeMatches[i];
+      const name = invokeMatch[1].trim();
+      const invokeBodyStart = (invokeMatch.index || 0) + invokeMatch[0].length;
+      const invokeBodyEnd = i + 1 < invokeMatches.length ? invokeMatches[i + 1].index! : block.length;
+      const invokeBody = block.slice(invokeBodyStart, invokeBodyEnd);
+      const parameters: Record<string, string> = {};
+      PARAM_OPEN_RE.lastIndex = 0;
+      let paramMatch: RegExpExecArray | null;
+      while ((paramMatch = PARAM_OPEN_RE.exec(invokeBody)) !== null) {
+        parameters[paramMatch[1].trim()] = paramMatch[2].trim();
+      }
+      toolCalls.push({ name, parameters });
+    }
+    cleanedText = cleanedText.replace(callsMatch[0], '');
+    FUNCTION_CALLS_BLOCK_RE.lastIndex = 0;
+  }
+
+  // Legacy format: <function=name><parameter=key>value</parameter></function>
+  const unique = new Set<string>();
+  const hasLegacyToolCallStart = TOOL_CALL_KEYWORDS.some((kw) => cleanedText.includes(`<${kw}=`));
+  if (!hasLegacyToolCallStart) {
+    return { toolCalls, cleanedText: cleanedText.replace(/\n{3,}/g, '\n\n') };
+  }
 
   // Semantics: <keyword=NAME...chars...> body </keyword>
   // Matches the opening <keyword=, captures until first >, then lazily until </keyword> or end.
@@ -38,7 +80,7 @@ export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[
   let lastIdx = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = re.exec(text)) !== null) {
+  while ((match = re.exec(cleanedText)) !== null) {
     if (unique.has(match[0])) continue;
     unique.add(match[0]);
 
@@ -59,11 +101,11 @@ export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[
     }
 
     toolCalls.push({ name, parameters });
-    sections.push(text.slice(lastIdx, match.index));
+    sections.push(cleanedText.slice(lastIdx, match.index));
     lastIdx = re.lastIndex;
   }
 
-  sections.push(text.slice(lastIdx));
+  sections.push(cleanedText.slice(lastIdx));
   cleanedText = sections.join('');
 
   return { toolCalls, cleanedText: cleanedText.replace(/\n{3,}/g, '\n\n') };
@@ -77,7 +119,7 @@ export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[
 const [TOOL_MARKUP_RE, ENV_DETAILS_RE, EXCESS_NEWLINES_RE] = (() => {
   const markupParts: string[] = [];
   for (const kw of TOOL_CALL_KEYWORDS) {
-    markupParts.push(`<${kw}=[^\\s>][^>]*>[\\s\\S]*?(?:<\\/${kw}>|<${kw}=|$)`);
+    markupParts.push(`<${kw}=[^\\s>][^>]*>[\\s\\S]*?(?:<\\/${kw}>|$)`);
     markupParts.push(`<${kw}=[^>]*(?:>|(?=\\n|$))`);
     markupParts.push(`<${kw}(?=[\\s<]|$)`);
     markupParts.push(`<\\/?${kw}>`);
@@ -85,6 +127,33 @@ const [TOOL_MARKUP_RE, ENV_DETAILS_RE, EXCESS_NEWLINES_RE] = (() => {
   const envDetailsRe = /<environment_details>[\s\S]*?<\/environment_details>/g;
   return [new RegExp(markupParts.join('|'), 'g'), envDetailsRe, /\n{3,}/g];
 })();
+
+const NEW_TOOL_NAMES = `${FUNCTION_CALLS_TAGS.join('|')}|parameter`;
+const NEW_TOOL_BLOCK_RE = new RegExp(`<(?:${NEW_TOOL_NAMES})\\b[^>]*>[\\s\\S]*?<\\/(?:${NEW_TOOL_NAMES})>`, 'g');
+const NEW_TOOL_ORPHAN_TO_END_RE = new RegExp(`<(?:${NEW_TOOL_NAMES})\\b[^>]*>[\\s\\S]*$`, 'g');
+const NEW_TOOL_ORPHAN_CLOSE_RE = new RegExp(`<\\/(?:${NEW_TOOL_NAMES})>`, 'g');
+
+const TOOL_RESULT_NAMES = TOOL_RESULT_KEYWORDS.join('|');
+const TOOL_RESULT_BLOCK_RE = new RegExp(
+  `<(?:${TOOL_RESULT_NAMES})[^>]*>[\\s\\S]*?<\\/(?:${TOOL_RESULT_NAMES})>`,
+  'g',
+);
+const TOOL_RESULT_ORPHAN_RE = new RegExp(
+  `<(?:${TOOL_RESULT_NAMES})\\b[^>]*>[\\s\\S]*$`,
+  'g',
+);
+// Qwen sometimes emits tool results without the leading `<` on the opening
+// tag, e.g. `tool_result tool_name="shell_command" success="true">`.
+const TOOL_RESULT_TAGLESS_RE = new RegExp(
+  `(?:^|\\n)\\s*tool_(?:result|call|use)\\s+tool_name\\s*=\\s*(?:"[^"]*"|[^\\s>]+)[^>]*>[\\s\\S]*?(?:<\\/(?:${TOOL_RESULT_NAMES})>|$)`,
+  'g',
+);
+const TOOL_NAME_ORPHAN_RE = new RegExp(
+  `(?:^|\\n)\\s*(?:(?:tool_name)?="[^"]*"|tool_name=[^\\s>]+)\\s+success="[^"]*"[^>]*>`,
+  'g',
+);
+const COMMAND_STDOUT_BLOCK_RE = /<(?:command|stdout|stderr)[^>]*>[\s\S]*?<\/(?:command|stdout|stderr)>/g;
+const ORPHAN_COMMAND_STDOUT_RE = /<(?:command|stdout|stderr)[^>]*>[\s\S]*$/g;
 
 // Generic LLM-metadata tag stripping. The Qwen upstream occasionally leaks
 // its own internal scaffolding (<plan>, <purpose>, <answer>, ...) into the
@@ -121,14 +190,28 @@ const GENERIC_PAIR_RE = /<([a-z][a-z0-9-]{0,39})\b[^>]*>[\s\S]*?<\/\1>/gi;
 const ANSWER_WRAPPER_RE = /<\/?(answer|response)\b[^>]*>/gi;
 
 function stripLlmMetaTags(text: string): string {
+  // Pass -1: drop orphaned conversation-structure closers (</assist>, </invoke>)
+  // before wrapper/meta-tag handling so they cannot reach the answer stream.
+  const structureCloseRe = new RegExp(
+    `<\\/(?:${LLM_STRUCTURE_TAGS.join('|')})>`,
+    'gi',
+  );
+  let out = text.replace(structureCloseRe, '');
   // Pass 0: drop wrappers around the final answer but preserve their content.
-  let out = text.replace(ANSWER_WRAPPER_RE, '');
+  out = out.replace(ANSWER_WRAPPER_RE, '');
   // Pass 1: known LLM meta tags — always stripped (including inner content).
   out = out.replace(META_OPEN_CLOSE_RE, '');
   // Pass 2: generic <word>...</word> where word is NOT a preserved HTML tag.
   out = out.replace(GENERIC_PAIR_RE, (match, name: string) =>
     PRESERVED_SET.has(name.toLowerCase()) ? match : '',
   );
+  // Pass 3: drop orphaned LLM metadata closers (e.g. `</plan>`) that remain
+  // after complete pairs were already stripped.
+  const metaCloseRe = new RegExp(
+    `</(?:${LLM_META_CLOSE_TAGS.join('|')})>`,
+    'gi',
+  );
+  out = out.replace(metaCloseRe, '');
   return out;
 }
 
@@ -136,6 +219,16 @@ function stripRemainingXmlMarkup(text: string): string {
   return text
     .replace(TOOL_MARKUP_RE, '')
     .replace(ENV_DETAILS_RE, '')
+    .replace(NEW_TOOL_BLOCK_RE, '')
+    .replace(NEW_TOOL_ORPHAN_TO_END_RE, '')
+    .replace(NEW_TOOL_ORPHAN_CLOSE_RE, '')
+    .replace(TOOL_RESULT_BLOCK_RE, '')
+    .replace(TOOL_RESULT_ORPHAN_RE, '')
+    .replace(TOOL_RESULT_TAGLESS_RE, '')
+    .replace(TOOL_NAME_ORPHAN_RE, '')
+    .replace(COMMAND_STDOUT_BLOCK_RE, '')
+    .replace(ORPHAN_COMMAND_STDOUT_RE, '')
+    .replace(/<\/(?:command|stdout|stderr)>/g, '')
     .replace(EXCESS_NEWLINES_RE, '\n\n');
 }
 

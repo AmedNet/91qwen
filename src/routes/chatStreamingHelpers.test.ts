@@ -713,6 +713,96 @@ test('regression: consecutive <function=...> blocks with multi-tag splits across
   assert.ok(toolCallEvents.length >= 1, 'at least one tool_calls event should be emitted to client');
 });
 
+test('regression: stray </function> closers must not leak later tool blocks', async () => {
+  const logId = 'test-stray-close-log-id';
+  logStore.createEntry(logId, 'qwen3.8-max', true);
+
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
+    pendingChunk: '',
+  };
+
+  const writtenEvents: string[] = [];
+  const ctx: StreamProcessingCtx = {
+    streamWriter: { write: async (chunk: string) => void writtenEvents.push(chunk) },
+    completionId: 'test-stray-close-completion',
+    model: 'qwen3.8-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: true,
+    logId,
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+
+  const chunks = [
+    '<function=shell',
+    '_command>\n<',
+    'parameter=command>',
+    'echo first',
+    '</parameter>\n',
+    '</function>\n',
+    '</function>\n',
+    '<function=shell',
+    '_command>\n<',
+    'parameter=command>',
+    'echo second',
+    '</parameter>\n',
+    '</function>',
+  ];
+
+  for (const chunk of chunks) {
+    await processStreamData(
+      { choices: [{ delta: { phase: 'answer', content: chunk } }], response_id: 'r1' },
+      state,
+      ctx,
+    );
+  }
+
+  assert.strictEqual(state.openFnTagCount, 2, 'two function opens should be counted');
+  assert.strictEqual(state.closeFnTagCount, 3, 'raw close count includes the stray close');
+  assert.strictEqual(state.toolCallDepth, 0, 'depth should return to 0 after the final close');
+
+  const assistantContent = writtenEvents
+    .map((e) => {
+      const m = e.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      return m ? JSON.parse(`"${m[1]}"`) : '';
+    })
+    .join('');
+
+  assert.ok(!assistantContent.includes('<function='), 'function open tag must not leak');
+  assert.ok(!assistantContent.includes('</function>'), 'function close tag must not leak');
+  assert.ok(!assistantContent.includes('echo first'), 'first command body must not leak');
+  assert.ok(!assistantContent.includes('echo second'), 'second command body must not leak');
+
+  const toolCallEvents = writtenEvents.filter((e) => e.includes('"tool_calls"'));
+  assert.strictEqual(toolCallEvents.length, 2, 'both valid tool blocks should become tool_calls events');
+
+  const logEntry = (logStore as any).entryMap.get(logId);
+  assert.strictEqual(logEntry.parsedToolCalls.length, 2, 'both tool calls should be recorded');
+});
+
 // ── LLM metadata tag leak (repro 2026-08-12) ────────────────────────
 // Qwen with output_schema='phase' occasionally leaks its own internal
 // scaffolding into the answer stream — `<plan>...</plan>`,
@@ -872,4 +962,74 @@ test('answer wrapper tag drops wrapper but preserves inner content (streaming)',
   assert.ok(!assistantContent.includes('<answer'), 'answer wrapper must be stripped');
   assert.ok(!assistantContent.includes('</answer'), 'closing answer wrapper must be stripped');
   assert.ok(assistantContent.includes('real answer'), 'inner content must reach client');
+});
+
+test('tool-call boundary prose survives without being repeated on flush', async () => {
+  const logId = 'test-tool-boundary-prose';
+  logStore.createEntry(logId, 'qwen3.8-max', true);
+
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    openFnTagCount: 0,
+    closeFnTagCount: 0,
+    openLlmMetaCount: 0,
+    closeLlmMetaCount: 0,
+    llmMetaDepth: 0,
+    pendingChunk: '',
+  };
+  const writtenEvents: string[] = [];
+  const ctx: StreamProcessingCtx = {
+    streamWriter: { write: async (c: string) => void writtenEvents.push(c) },
+    completionId: 'test-tool-boundary-prose',
+    model: 'qwen3.8-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: true,
+    cleanOutput: true,
+    logId,
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+
+  const chunks = [
+    '权限参数搞错了，这次去掉多余参数直接执行',
+    '。\n\n<function',
+    '=shell_command>\n<parameter=command>echo hi</parameter>\n</function>',
+    '等一下，最后那个多了一个闭合标签，我重新来',
+  ];
+
+  for (const text of chunks) {
+    await processStreamData(
+      { choices: [{ delta: { phase: 'answer', content: text } }], response_id: 'r1' },
+      state,
+      ctx,
+    );
+  }
+
+  const assistantContent = writtenEvents
+    .map((e) => {
+      const m = e.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      return m ? JSON.parse(`"${m[1]}"`) : '';
+    })
+    .join('');
+
+  assert.ok(!assistantContent.includes('<function'), 'tool XML must not leak into assistant content');
+  assert.ok(assistantContent.includes('执行。\n\n等一下'), 'prose before the tool block must keep its separator');
+  assert.ok(assistantContent.includes('重新来'), 'prose after the tool block must reach the client');
+  assert.strictEqual(assistantContent.match(/等一下/g)?.length ?? 0, 1, 'self-correction prose must not be repeated');
 });

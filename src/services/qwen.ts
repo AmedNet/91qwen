@@ -413,15 +413,6 @@ export async function createQwenStream(
       response.headers.forEach((value, key) => {
         qwenResponseHeaders[key] = value;
       });
-
-      try {
-        const clone = response.clone();
-        const text = await clone.text();
-        qwenResponsePreview = text.substring(0, 10000);
-        logQwenResponse(makeRequestQwenLogFile || '', response.status, response.statusText, qwenResponseHeaders, qwenResponsePreview);
-      } catch (err) {
-        logStore.log('warn', 'qwen', `[Qwen] Failed to read response for logging: ${(err as Error).message}`);
-      }
     }
 
     return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile };
@@ -446,22 +437,42 @@ export async function createQwenStream(
   const streamDebugEntryId = lastDebugEntryId;
   const textDecoder = new TextDecoder();
   const wreqClose = (result.response as any)._wreqClose as (() => void) | undefined;
+  // Log while forwarding so makeRequest can return as soon as headers arrive.
   const wrappedStream = result.response.body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
+        const decoded = textDecoder.decode(chunk, { stream: true });
         if (streamDebugEntryId) {
-          recordStreamChunk(streamDebugEntryId, textDecoder.decode(chunk, { stream: true }));
+          recordStreamChunk(streamDebugEntryId, decoded);
         }
         if (config.get('SAVE_REQUEST_LOGS') === 'true') {
           sseEventCount++;
+          if (qwenResponsePreview.length < 10000) {
+            qwenResponsePreview += decoded;
+            const cut = qwenResponsePreview.lastIndexOf('\n', 10000);
+            qwenResponsePreview = qwenResponsePreview.slice(0, cut > 0 ? cut : 10000);
+          }
         }
         controller.enqueue(chunk);
       },
       flush() {
+        const tail = textDecoder.decode();
+        if (config.get('SAVE_REQUEST_LOGS') === 'true' && tail) {
+          qwenResponsePreview += tail;
+          const cut = qwenResponsePreview.lastIndexOf('\n', 10000);
+          qwenResponsePreview = qwenResponsePreview.slice(0, cut > 0 ? cut : 10000);
+        }
         if (streamDebugEntryId) {
           completeEntry(streamDebugEntryId);
         }
         if (config.get('SAVE_REQUEST_LOGS') === 'true' && makeRequestQwenLogFile) {
+          logQwenResponse(
+            makeRequestQwenLogFile,
+            qwenResponseStatus,
+            qwenResponseStatusText,
+            qwenResponseHeaders,
+            qwenResponsePreview,
+          );
           logQwenSSE(makeRequestQwenLogFile, sseEventCount, 0, []);
         }
         try {

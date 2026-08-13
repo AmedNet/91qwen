@@ -1,6 +1,7 @@
 import type { ParsedToolCall } from '../types/openai.ts';
 import { logStore } from './logStore.ts';
 import type { QwenPayload } from './qwen.ts';
+import { sanitizeLogHeaders, sanitizeLogSsePreview, sanitizeLogText, sanitizeLogValue } from '../utils/logSanitizer.ts';
 
 let qwenLogDir: string | undefined;
 let qwenWriteCount = 0;
@@ -68,8 +69,7 @@ export function logQwenRequest(payload: QwenPayload, url: string): string {
   const fileName = `req_${timestamp}_${Date.now()}.json`;
   const requestId = fileName.replace(/\.json$/, '');
 
-  const sanitizedPayload = JSON.parse(JSON.stringify(payload));
-  const sensitiveHeaders = ['cookie', 'authorization', 'x-request-id'];
+  const sanitizedPayload = sanitizeLogValue(payload);
   writeJsonFile(dir, fileName, {
     requestId,
     timestamp: new Date().toISOString(),
@@ -108,8 +108,10 @@ export function logQwenResponse(
     timestamp: new Date().toISOString(),
     status,
     statusText,
-    headers,
-    responsePreview: responsePreview.substring(0, 50000),
+    headers: sanitizeLogHeaders(headers),
+    responsePreview: responsePreview.includes('\ndata: ') || responsePreview.startsWith('data: ')
+      ? sanitizeLogSsePreview(responsePreview)
+      : sanitizeLogText(responsePreview, 50000),
   });
 }
 
@@ -125,6 +127,6 @@ export function logQwenSSE(logFile: string | undefined, sseEvents: number, toolC
     timestamp: new Date().toISOString(),
     sseEvents,
     toolCallEvents,
-    toolCalls,
+    toolCalls: sanitizeLogValue(toolCalls, 2000),
   });
 }

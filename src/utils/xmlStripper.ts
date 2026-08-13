@@ -1,4 +1,13 @@
-import { ALL_TOOL_KEYWORDS, LLM_META_TAGS, PRESERVED_HTML_TAGS, TOOL_RESULT_KEYWORDS } from './tagNames.ts';
+import {
+  ALL_TOOL_KEYWORDS,
+  FUNCTION_CALLS_TAGS,
+  LLM_META_CLOSE_TAGS,
+  LLM_META_TAGS,
+  LLM_STRUCTURE_TAGS,
+  PRESERVED_HTML_TAGS,
+  TOOL_CALL_KEYWORDS,
+  TOOL_RESULT_KEYWORDS,
+} from './tagNames.ts';
 
 /**
  * Tool echo patterns — strip lines where the model echoes tool results
@@ -11,20 +20,45 @@ const TOOL_ECHO_PATTERNS: RegExp[] = [
 
 export function stripToolCallArtifacts(text: string): string {
   if (!text) return '';
-  // Strip XML tool_result blocks (complete pairs)
-  const blockOpenRe = new RegExp(`<${TOOL_RESULT_KEYWORDS[0]}[^>]*>[\\s\\S]*?<\\/${TOOL_RESULT_KEYWORDS[0]}>`, 'g');
+  const resultNames = TOOL_RESULT_KEYWORDS.join('|');
+  // Malformed parameter-only blocks (missing `<function=...>`) must still be
+  // stripped together with their parameter values.
+  const toolMarkupRe = new RegExp(
+    TOOL_CALL_KEYWORDS.map((kw) => `<${kw}=[^\\s>][^>]*>[\\s\\S]*?(?:<\\/${kw}>|$)`).join('|'),
+    'g',
+  );
+  text = text.replace(toolMarkupRe, '');
+  text = text.replace(/<\/(?:function|parameter)>/g, '');
+  const newToolNames = [...FUNCTION_CALLS_TAGS, 'parameter'].join('|');
+  text = text.replace(new RegExp(`<(?:${newToolNames})\\b[^>]*>[\\s\\S]*?<\\/(?:${newToolNames})>`, 'g'), '');
+  text = text.replace(new RegExp(`<(?:${newToolNames})\\b[^>]*>[\\s\\S]*$`, 'g'), '');
+  text = text.replace(new RegExp(`<\\/(?:${newToolNames})>`, 'g'), '');
+  // Tagless tool result echoes: `tool_result tool_name="..." success="true">`
+  // or an orphan `tool_name="..." success="true">` opening, followed by stdout content.
+  // NOTE: `tool_name` prefix is REQUIRED to avoid false positives on arbitrary
+  // text containing `="..." success="...">` (e.g. user discussing HTML attributes).
+  const resultEchoRe = new RegExp(
+    `(?:^|\\n)\\s*(?:tool_(?:result|call|use)\\s+tool_name\\s*=\\s*(?:"[^"]*"|[^\\s>]+)[^>]*>|tool_name="[^"]*"\\s+success="[^"]*"[^>]*>)[\\s\\S]*?(?:<\\/(?:${resultNames})>|$)`,
+    'g',
+  );
+  text = text.replace(resultEchoRe, '');
+  text = text.replace(/<(?:command|stdout|stderr)[^>]*>[\s\S]*?<\/(?:command|stdout|stderr)>/g, '');
+  text = text.replace(/<(?:command|stdout|stderr)[^>]*>[\s\S]*$/g, '');
+  text = text.replace(/<\/(?:command|stdout|stderr)>/g, '');
+  // Strip legacy Qwen tool-result blocks (complete pairs).
+  const blockOpenRe = new RegExp(`<(?:${resultNames})[^>]*>[\\s\\S]*?<\\/(?:${resultNames})>`, 'g');
   text = text.replace(blockOpenRe, '');
-  // Strip orphaned <tool_result without matching close
-  const orphanOpenRe = new RegExp(`<${TOOL_RESULT_KEYWORDS[0]}(?:\\s[^>]*)?>`);
+  // Strip orphaned result-tag opens without a matching close.
+  const orphanOpenRe = new RegExp(`<(?:${resultNames})(?:\\s[^>]*)?>`);
   const unmatchedOpenIdx = text.search(orphanOpenRe);
   if (unmatchedOpenIdx !== -1) {
     text = text.substring(0, unmatchedOpenIdx);
   }
-  // Strip residual </tool_result> without matching open
-  const orphanCloseRe = new RegExp(`<\\/${TOOL_RESULT_KEYWORDS[0]}\\s*>`, 'g');
+  // Strip residual closing result tags without a matching open.
+  const orphanCloseRe = new RegExp(`<\\/(?:${resultNames})\\s*>`, 'g');
   text = text.replace(orphanCloseRe, '');
-  // Strip any </...tool_result> where prefix between </ and tool_result may be garbled
-  const garbledCloseRe = new RegExp(`<\\/(?:\\w+)?${TOOL_RESULT_KEYWORDS[0]}\\s*>`, 'g');
+  // Strip garbled close tags like </prefix_tool_result>.
+  const garbledCloseRe = new RegExp(`<\\/(?:\\w+)?(?:${resultNames})\\s*>`, 'g');
   text = text.replace(garbledCloseRe, '');
   // Strip <environment_details> blocks (model-generated context artifacts)
   const envDetailsRe = /<environment_details>[\s\S]*?<\/environment_details>/g;
@@ -36,7 +70,7 @@ export function stripToolCallArtifacts(text: string): string {
   text = text.replace(streamBoundaryRe, '');
   // Strip any remaining closing tool tags (with > requirement to avoid
   // matching </toolbox, </toolkit etc.)
-  const toolCloseRe = new RegExp(`<\\/(?:${TOOL_RESULT_KEYWORDS.join('|')})>`, 'g');
+  const toolCloseRe = new RegExp(`<\\/(?:${resultNames})>`, 'g');
   text = text.replace(toolCloseRe, '');
   // Strip JSON tool result echo blocks (handles both single-line and pretty-printed multi-line):
   //   [{"type":"function","tool":"name","result":{"success":true,"stdout":"...","stderr":"","command":"name"}}]
@@ -45,7 +79,22 @@ export function stripToolCallArtifacts(text: string): string {
   // generic <tag>...</tag> whose name is not in PRESERVED_HTML_TAGS. Covers
   // the leak where Qwen's output_schema='phase' boundaries are misaligned
   // and the model emits its internal scaffolding into the answer stream.
+  // Strip orphaned conversation-structure closers (</assist>, </invoke>)
+  // that the model echoes back into the answer stream.
+  const STRUCTURE_CLOSE_RE = new RegExp(
+    `<\\/(?:${LLM_STRUCTURE_TAGS.join('|')})>`,
+    'gi',
+  );
+  text = text.replace(STRUCTURE_CLOSE_RE, '');
   text = stripUnknownLlmMetaTags(text);
+  // Strip orphaned LLM metadata closers such as `</plan>` or `</purpose>`.
+  // These are harmless when part of a complete pair, but leak as plain text
+  // when a meta-tag block is split across stream chunks.
+  const META_CLOSE_RE = new RegExp(
+    `</(?:${LLM_META_CLOSE_TAGS.join('|')})>`,
+    'gi',
+  );
+  text = text.replace(META_CLOSE_RE, '');
   text = stripToolEcho(text);
   text = text.replace(/\n{3,}/g, '\n\n');
   return text;
