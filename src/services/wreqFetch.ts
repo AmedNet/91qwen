@@ -111,6 +111,9 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
 
   logSessionCreate('wreqFetch.request', { method, url: url.split('?')[0], stream });
 
+  // Generate a request id and tell worker to track it, so we can abort on signal.
+  const reqId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
   const makeReq = async (): Promise<Response> => {
     return fetch(`${baseUrl}/`, {
       method: 'POST',
@@ -124,10 +127,32 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
         impersonate,
         timeout,
         debugLogDir: options.debugLogDir,
+        id: reqId,
       }),
       signal: options.signal,
     });
   };
+
+  // When Bun-side signal aborts, also tell worker to abort its in-flight wreq-js fetch.
+  // wreq-js's HTTP connection won't actually close until the worker is told.
+  let abortWorkerOnSignal: (() => void) | undefined;
+  if (options.signal) {
+    const sig = options.signal;
+    if (sig.aborted) {
+      // already aborted
+    } else {
+      const onAbort = () => {
+        // Fire-and-forget POST /abort to the worker sidecar
+        fetch(`${baseUrl}/abort`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id: reqId }),
+        }).catch(() => { /* worker may have already moved on */ });
+      };
+      sig.addEventListener('abort', onAbort, { once: true });
+      abortWorkerOnSignal = () => sig.removeEventListener('abort', onAbort);
+    }
+  }
 
   let response: Response;
   try {
@@ -142,6 +167,8 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
       body: JSON.stringify({ method, url, headers, body: body || undefined, stream, impersonate, timeout }),
       signal: options.signal,
     });
+  } finally {
+    abortWorkerOnSignal?.();
   }
 
   const upstreamStatus = parseInt(response.headers.get('X-Upstream-Status') || '0', 10);

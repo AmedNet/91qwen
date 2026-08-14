@@ -23,6 +23,17 @@ const QWEN_DIR = projectPath('.qwen');
 
 const OLD_ACCOUNTS_FILE = projectPath('qwen_profile', 'accounts.json');
 
+/** Test isolation: redirect saveAccountsToFile to a temp file so test data can't clobber the real
+ *  .qwen/accounts.json. Tests should call setAccountsFileForTesting() in beforeEach and
+ *  unsetAccountsFileForTesting() in afterEach. */
+let _testAccountsFile: string | null = null;
+export function setAccountsFileForTesting(path: string): void {
+  _testAccountsFile = path;
+}
+export function unsetAccountsFileForTesting(): void {
+  _testAccountsFile = null;
+}
+
 function getProfileDirForEmail(email: string): string {
   const safe = email
     .toLowerCase()
@@ -197,7 +208,8 @@ export function rebuildEmailIndex(): void {
 }
 
 export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
-  const dir = path.dirname(ACCOUNTS_FILE);
+  const targetFile = _testAccountsFile ?? ACCOUNTS_FILE;
+  const dir = path.dirname(targetFile);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
@@ -211,7 +223,7 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
       ...(a.state ? { state: { token: a.state.token, refreshToken: a.state.refreshToken, expiresAt: a.state.expiresAt } } : {}),
       ...(a.profileCookies ? { profileCookies: a.profileCookies } : {}),
     }));
-  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  writeFileSync(targetFile, JSON.stringify(data, null, 2), 'utf-8');
 }
 export function loadAccountsFromFile(): Array<{
   email: string;

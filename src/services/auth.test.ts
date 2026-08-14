@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 
-import { accounts } from './accountManager.ts';
+import { accounts, setAccountsFileForTesting, unsetAccountsFileForTesting } from './accountManager.ts';
 import {
   decrementInFlight,
   getAccountByEmail,
@@ -11,6 +14,17 @@ import {
   rebuildEmailIndex,
   saveCookies,
 } from './auth.ts';
+
+let testAccountsDir: string;
+beforeEach(() => {
+  // Redirect saveAccountsToFile() to a temp file so test data can't clobber the real .qwen/accounts.json
+  testAccountsDir = mkdtempSync(join(tmpdir(), 'qwen-gate-test-'));
+  setAccountsFileForTesting(join(testAccountsDir, 'accounts.json'));
+});
+afterEach(() => {
+  unsetAccountsFileForTesting();
+  rmSync(testAccountsDir, { recursive: true, force: true });
+});
 
 describe('account inFlight and totalRequests tracking', () => {
   test('incrementInFlight increments and decrementInFlight decrements', () => {

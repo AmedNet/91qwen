@@ -22,9 +22,17 @@ export interface RetryConfig {
   attemptTimeoutMs?: number;
   /** Circuit breaker instance to use (optional). If provided, open circuit = immediate rejection. */
   circuitBreaker?: CircuitBreaker;
+  /**
+   * Called whenever an attempt is discarded (failure or abort). The discarded attempt's
+   * result (whatever `fn` returned) is passed in, so the caller can clean up attempt-scoped
+   * resources — typically cancelling an upstream Response.body so the upstream chat_id is
+   * released before the next attempt reuses it. Without this, an aborted SSE stream keeps
+   * the chat_id locked and the next attempt hits "The chat is in progress!".
+   */
+  onAttemptDiscarded?: (result: unknown, error: unknown) => void;
 }
 
-function getDefaultRetryConfig(): Required<RetryConfig> {
+function getDefaultRetryConfig(): Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & { onAttemptDiscarded?: (result: unknown, error: unknown) => void } {
   return {
     maxRetries: 3,
     baseDelayMs: 500,
@@ -36,7 +44,7 @@ function getDefaultRetryConfig(): Required<RetryConfig> {
   };
 }
 
-const DEFAULT_CONFIG: Required<RetryConfig> = getDefaultRetryConfig();
+const DEFAULT_CONFIG: Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & { onAttemptDiscarded?: (result: unknown, error: unknown) => void } = getDefaultRetryConfig();
 
 export class NonRetryableError extends Error {
   constructor(message: string) {
@@ -263,16 +271,41 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  abortController?: AbortController,
+): Promise<T> {
   if (timeoutMs <= 0) return promise;
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new AttemptTimeoutError(timeoutMs)), timeoutMs);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Prefer caller-provided AbortController (it has .abort() reliably); fall back to
+      // duck-typing the signal in case caller passes one. In some runtimes AbortSignal
+      // exposes an .abort() (e.g. Bun), in others it doesn't — the controller path always
+      // works because we create it ourselves in withRetry.
+      if (abortController && !abortController.signal.aborted) {
+        try { abortController.abort(new Error(`Attempt timed out after ${timeoutMs}ms`)); } catch { /* ignore */ }
+      } else if (signal && !signal.aborted) {
+        try {
+          (signal as unknown as { abort?: (reason?: unknown) => void }).abort?.(new Error(`Attempt timed out after ${timeoutMs}ms`));
+        } catch { /* ignore */ }
+      }
+      reject(new AttemptTimeoutError(timeoutMs));
+    }, timeoutMs);
     promise.then(
       (val) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         resolve(val);
       },
       (err) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         reject(err);
       },
@@ -283,7 +316,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 /**
  * Load retry config from environment variables with defaults.
  */
-export function getRetryConfigFromEnv(): Required<RetryConfig> {
+export function getRetryConfigFromEnv(): Required<Omit<RetryConfig, 'onAttemptDiscarded'>> {
   const envConfig: RetryConfig = {};
 
   envConfig.maxRetries = Math.max(0, config.getInt('RETRY_MAX_ATTEMPTS', DEFAULT_CONFIG.maxRetries));
@@ -294,8 +327,11 @@ export function getRetryConfigFromEnv(): Required<RetryConfig> {
   return { ...DEFAULT_CONFIG, ...envConfig };
 }
 
-export async function withRetry<T>(fn: () => Promise<T>, config?: RetryConfig): Promise<T> {
-  const cfg: Required<RetryConfig> = {
+export async function withRetry<T>(
+  fn: (attemptSignal: AbortSignal) => Promise<T>,
+  config?: RetryConfig,
+): Promise<T> {
+  const cfg: Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & { onAttemptDiscarded?: (result: unknown, error: unknown) => void } = {
     ...DEFAULT_CONFIG,
     ...getRetryConfigFromEnv(),
     ...config,
@@ -309,11 +345,28 @@ export async function withRetry<T>(fn: () => Promise<T>, config?: RetryConfig): 
   let delay = cfg.baseDelayMs;
 
   for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    // 每个 attempt 一个独立 controller：超时主动 abort 让上游连接真正关闭，
+    // 避免下个 attempt 用同一个 chatId 时撞上"chat is in progress"
+    const attemptController = new AbortController();
+    let attemptResult: unknown;
     try {
-      const result = await withTimeout(fn(), cfg.attemptTimeoutMs);
+      attemptResult = await withTimeout(fn(attemptController.signal), cfg.attemptTimeoutMs, attemptController.signal, attemptController);
       if (cfg.circuitBreaker) await cfg.circuitBreaker.recordSuccess();
-      return result;
+      return attemptResult as T;
     } catch (error: unknown) {
+      // Attempt failed. If the attempt produced a partial result before failing
+      // (e.g. an HTTP 200 + streaming body that the timeout then aborted), let
+      // the caller clean up attempt-scoped resources — typically cancelling the
+      // upstream Response.body so the server releases the chat_id.
+      if (cfg.onAttemptDiscarded && attemptResult !== undefined) {
+        try {
+          cfg.onAttemptDiscarded(attemptResult, error);
+        } catch (cleanupErr) {
+          // cleanup failures must not mask the original error
+          console.error('[Retry] onAttemptDiscarded cleanup threw:', cleanupErr);
+        }
+      }
+      attemptResult = undefined;
       lastError = error;
 
       let httpStatus: number | undefined;

@@ -119,6 +119,23 @@ export interface QwenStreamResult {
   qwenLogFile?: string;
 }
 
+/** Compose multiple AbortSignals into one — fires when any input fires. */
+function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const valid = signals.filter((s): s is AbortSignal => !!s);
+  if (valid.length === 0) return undefined;
+  if (valid.length === 1) return valid[0];
+  const composed = new AbortController();
+  const onAbort = () => composed.abort();
+  for (const s of valid) {
+    if (s.aborted) {
+      composed.abort();
+      break;
+    }
+    s.addEventListener('abort', onAbort, { once: true });
+  }
+  return composed.signal;
+}
+
 // Cached timezone for request headers
 const cachedTimezone = 'America/Sao_Paulo';
 
@@ -404,7 +421,7 @@ export async function createQwenStream(
   let qwenResponseHeaders: Record<string, string> = {};
   let qwenResponsePreview = '';
   let sseEventCount = 0;
-  const makeRequest = async (): Promise<{ response: Response; headers: Record<string, string>; qwenLogFile?: string }> => {
+  const makeRequest = async (attemptSignal?: AbortSignal): Promise<{ response: Response; headers: Record<string, string>; qwenLogFile?: string }> => {
     const bodyStr = JSON.stringify(payload);
     if (config.get('SAVE_REQUEST_LOGS') === 'true') {
       makeRequestQwenLogFile = logQwenRequest(payload, url);
@@ -420,6 +437,12 @@ export async function createQwenStream(
       'qwen',
       `[Qwen] Fetch POST ${url.substring(0, 100)} account=${currentAccountEmail || '?'} token_len=${cookieStr.length} payload_len=${bodyStr.length}`,
     );
+
+    // Compose streamAbortController.signal (created at function entry for client cancel) with the
+    // per-attempt signal (from withRetry's attemptTimeoutMs). Either source aborts the fetch.
+    const composedSignal = attemptSignal
+      ? composeAbortSignals(streamAbortController.signal, attemptSignal)
+      : streamAbortController.signal;
 
     const response = await browserlessFetch(url, {
       method: 'POST',
@@ -447,6 +470,7 @@ export async function createQwenStream(
       accountEmail: currentAccountEmail,
       stream: true, // keep session alive for streaming via impers worker
       transport: config.getBool('FAST_TRANSPORT', true) ? 'plain' : 'wreq',
+      signal: composedSignal,
     });
     logStore.log(
       'debug',
@@ -461,20 +485,66 @@ export async function createQwenStream(
         qwenResponseHeaders[key] = value;
       });
 
-      try {
-        const clone = response.clone();
-        const text = await clone.text();
-        qwenResponsePreview = text.substring(0, 10000);
-        logQwenResponse(makeRequestQwenLogFile || '', response.status, response.statusText, qwenResponseHeaders, qwenResponsePreview);
-      } catch (err) {
-        logStore.log('warn', 'qwen', `[Qwen] Failed to read response for logging: ${(err as Error).message}`);
+      // DO NOT await the full body here — for streaming chat completions the body stays
+      // open until the upstream SSE finishes, which can take 30s+. Awaiting it inside
+      // makeRequest would (a) trip withRetry's attemptTimeoutMs and (b) prevent the
+      // attempt from returning its Response so the SSE pipe-through can start.
+      // Instead, log what we already have synchronously, then drain the body in the
+      // background and persist the preview when it completes. If the user disables
+      // SAVE_REQUEST_LOGS, no body read happens at all.
+      logQwenResponse(makeRequestQwenLogFile || '', response.status, response.statusText, qwenResponseHeaders, qwenResponsePreview);
+      const qwenLogFileForBg = makeRequestQwenLogFile;
+      const statusForBg = response.status;
+      const statusTextForBg = response.statusText;
+      const headersForBg = { ...qwenResponseHeaders };
+      if (qwenLogFileForBg) {
+        (async () => {
+          try {
+            const clone = response.clone();
+            const text = await clone.text();
+            const preview = text.substring(0, 10000);
+            logQwenResponse(qwenLogFileForBg, statusForBg, statusTextForBg, headersForBg, preview);
+          } catch (err) {
+            logStore.log('warn', 'qwen', `[Qwen] Failed background body read for logging: ${(err as Error).message}`);
+          }
+        })();
       }
     }
 
-    return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile };
+    // Wire attempt-scoped cleanup: when this attempt is aborted (timeout / client cancel /
+    // next-retry cleanup), cancel the upstream response body so the server-side chat_id is
+    // released. Otherwise an aborted SSE keeps the chat_id locked and the next attempt on
+    // the same chat_id immediately returns "The chat is in progress!".
+    let cleanedUp = false;
+    const cleanupAttempt = (reason: string) => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      const body = response.body;
+      if (body && typeof body.cancel === 'function') {
+        body.cancel().catch(() => {});
+      }
+      logStore.log(
+        'debug',
+        'qwen',
+        `[Qwen] Attempt cleaned up (${reason}) for ${currentAccountEmail || '?'} — body cancelled to release chat_id`,
+      );
+    };
+    if (attemptSignal) {
+      if (attemptSignal.aborted) cleanupAttempt('attemptSignal already aborted on response');
+      else attemptSignal.addEventListener('abort', () => cleanupAttempt('attemptSignal abort'), { once: true });
+    }
+    if (streamAbortController.signal.aborted) cleanupAttempt('streamAbortController already aborted on response');
+    else streamAbortController.signal.addEventListener('abort', () => cleanupAttempt('streamAbortController abort'), { once: true });
+
+    return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile, cleanup: cleanupAttempt } as {
+      response: Response;
+      headers: Record<string, string>;
+      qwenLogFile?: string;
+      cleanup: () => void;
+    };
   };
 
-  let result: { response: Response; headers: Record<string, string>; qwenLogFile?: string };
+  let result: { response: Response; headers: Record<string, string>; qwenLogFile?: string; cleanup?: () => void };
   const cbState = qwenCircuitBreaker.getState();
   if (cbState === 'open') {
     const stats = qwenCircuitBreaker.getStats();
@@ -482,7 +552,29 @@ export async function createQwenStream(
     throw new CircuitOpenError(retryAfterMs);
   }
   if (retriesEnabled && retryConfig.maxRetries > 0) {
-    result = await withRetry(makeRequest, { ...retryConfig, circuitBreaker: qwenCircuitBreaker });
+    // withRetry 现在为每个 attempt 创建独立 controller 并在 attemptTimeoutMs 时 abort 它。
+    // onAttemptDiscarded 钩子确保 abort 之前的 attempt 时主动 cancel 上游 response.body，
+    // 让上游释放 chat_id（否则 abort 不会关闭 SSE 流，下个 attempt 用同 chat_id
+    // 立刻返回 "The chat is in progress!"）。
+    try {
+      result = await withRetry(makeRequest, {
+        ...retryConfig,
+        circuitBreaker: qwenCircuitBreaker,
+        onAttemptDiscarded: (discardedResult) => {
+          const r = discardedResult as { cleanup?: () => void } | null;
+          if (r && typeof r.cleanup === 'function') {
+            try {
+              r.cleanup();
+            } catch (e) {
+              logStore.log('warn', 'qwen', `[Qwen] attempt cleanup threw: ${(e as Error).message}`);
+            }
+          }
+        },
+      });
+    } catch (err) {
+      streamAbortController.abort();
+      throw err;
+    }
   } else {
     result = await makeRequest();
     await qwenCircuitBreaker.recordSuccess();

@@ -27,7 +27,36 @@ const HOST = '127.0.0.1';
 const PORT = parseInt(process.env.WREQ_WORKER_PORT || '0', 10);
 const MAX_BODY_BYTES = 100 * 1024 * 1024;
 
+// Track in-flight requests so Bun-side aborts can propagate to the worker.
+// Map<requestId, AbortController>
+const inflight = new Map();
+let nextReqId = 1;
+
 const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url === '/abort') {
+    // Body: { id: <requestId> } — abort the in-flight wreq fetch
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      try {
+        const { id } = JSON.parse(body);
+        const ctrl = inflight.get(id);
+        if (ctrl) {
+          ctrl.abort();
+          inflight.delete(id);
+          res.writeHead(200);
+          res.end('{"ok":true}');
+        } else {
+          res.writeHead(404);
+          res.end('{"ok":false,"error":"not found"}');
+        }
+      } catch {
+        res.writeHead(400);
+        res.end('{"error":"bad json"}');
+      }
+    });
+    return;
+  }
   if (req.method !== 'POST') {
     res.writeHead(405);
     res.end();
@@ -62,6 +91,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Use the caller's request id (Bun-side tracks it for /abort calls). Fallback to internal counter.
+    const reqId = String(spec.id ?? nextReqId++);
+    // Create an external AbortController so Bun-side aborts can propagate to wreq-js.
+    const externalAbort = new AbortController();
+    inflight.set(reqId, externalAbort);
+    res.on('close', () => inflight.delete(reqId));
+
     try {
       const session = await wreq.createSession({
         browser: impersonate,
@@ -69,12 +105,14 @@ const server = http.createServer(async (req, res) => {
       });
 
       try {
+        // Race the worker-internal timeout against the external AbortController.
+        // When Bun-side aborts, externalAbort.signal fires → wreq-js cancels the request.
         const opts = {
           method,
           headers,
           body: reqBody,
           disableDefaultHeaders: true,
-          signal: AbortSignal.timeout(timeout * 1000),
+          signal: AbortSignal.any([AbortSignal.timeout(timeout * 1000), externalAbort.signal]),
         };
 
         const wreqResp = await session.fetch(url, opts);
@@ -164,6 +202,7 @@ const server = http.createServer(async (req, res) => {
           res.end(bodyBuf);
         }
       } finally {
+        inflight.delete(reqId);
         try {
           await session.close();
         } catch {}
