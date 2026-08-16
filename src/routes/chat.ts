@@ -217,7 +217,13 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       if (chatHistoryContent) parts.push(`<chat_history>\n${chatHistoryContent}\n</chat_history>`);
       const combinedContent = parts.join('\n\n');
       try {
+        const tUploadStart = Date.now();
         const file = await uploadLargeTextAsFile(accountEmail, combinedContent, 'context.txt');
+        logStore.log(
+          'debug',
+          'qwen-timing',
+          `context.txt upload ${Date.now() - tUploadStart}ms size=${combinedContent.length}B (acct=${accountEmail.split('@')[0]})`,
+        );
         processedMessages[0] = { ...processedMessages[0], files: [file] };
       } catch (err: any) {
         logStore.log('debug', 'chat', '[Chat] Failed to upload context file: ' + (err.message || err));

@@ -24,20 +24,29 @@ function maybeCleanup(dir: string): void {
   try {
     const { readdirSync, unlinkSync, statSync } = require('node:fs');
     const { join } = require('node:path');
-    const files = readdirSync(dir);
-    if (files.length < 500) return;
-
-    const entries = files
-      .map((f: string) => ({ name: f, path: join(dir, f), mtime: statSync(join(dir, f)).mtimeMs }))
+    const MAX_QWEN_LOG_BYTES = 200 * 1024 * 1024; // 200MB total cap
+    const MAX_QWEN_LOG_FILES = 400;
+    const entries = readdirSync(dir)
+      .map((f: string) => {
+        const p = join(dir, f);
+        const st = statSync(p);
+        return { path: p, mtime: st.mtimeMs, size: st.size };
+      })
       .sort((a: { mtime: number }, b: { mtime: number }) => a.mtime - b.mtime);
-
-    const toRemove = entries.slice(0, entries.length - 400);
-    for (const entry of toRemove) {
+    let totalBytes = entries.reduce((s: number, e: { size: number }) => s + e.size, 0);
+    // Count-based capping alone is not enough: each req_*.json embeds the full
+    // upstream payload (~50KB+) and resp files carry a 50KB preview, with 4
+    // files per request — so 400 files can still reach hundreds of MB, and the
+    // early-return on count meant cleanup never ran while files stayed < 500.
+    let i = 0;
+    while (i < entries.length && (totalBytes > MAX_QWEN_LOG_BYTES || entries.length - i > MAX_QWEN_LOG_FILES)) {
       try {
-        unlinkSync(entry.path);
+        unlinkSync(entries[i].path);
       } catch {
         /* ignore */
       }
+      totalBytes -= entries[i].size;
+      i++;
     }
   } catch {
     /* cleanup is best-effort */

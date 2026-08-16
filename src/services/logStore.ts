@@ -5,7 +5,7 @@
  *
  * System-level logging has been extracted to SystemLogger (systemLogger.ts).
  */
-import { mkdirSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { join } from 'path';
 import { config } from './configService.ts';
@@ -381,14 +381,32 @@ export class RequestLogStore extends SystemLogger {
       };
       const fileName = `${dateStr}_${timeStr}.json`;
       const filePath = join(this.requestLogDir, fileName);
-      // Periodic cleanup instead of readdirSync+sort on every request
+      // Periodic cleanup instead of readdirSync+sort on every request.
+      // Count-based capping alone is not enough: each request log embeds the
+      // client's full request body (fullBody can be 0.5-1MB for long Codex
+      // sessions), so 999 files × ~1MB ≈ 1-2GB. Cap by total bytes too.
       this.requestFileCount++;
       if (this.requestFileCount % 50 === 0) {
         try {
-          const files = readdirSync(this.requestLogDir).sort();
-          if (files.length >= 1000) {
-            const toRemove = files.slice(0, files.length - 999);
-            for (const f of toRemove) unlinkSync(join(this.requestLogDir, f));
+          const MAX_REQUEST_LOG_BYTES = 200 * 1024 * 1024; // 200MB total cap
+          const MAX_REQUEST_LOG_FILES = 999;
+          // File names are timestamp-prefixed — lexicographic sort is chronological.
+          const entries = readdirSync(this.requestLogDir)
+            .map((f) => {
+              const p = join(this.requestLogDir!, f);
+              return { path: p, size: statSync(p).size };
+            })
+            .sort((a, b) => (a.path < b.path ? -1 : 1));
+          let totalBytes = entries.reduce((s, e) => s + e.size, 0);
+          let i = 0;
+          while (i < entries.length && (totalBytes > MAX_REQUEST_LOG_BYTES || entries.length - i > MAX_REQUEST_LOG_FILES)) {
+            try {
+              unlinkSync(entries[i].path);
+            } catch {
+              /* ignore */
+            }
+            totalBytes -= entries[i].size;
+            i++;
           }
         } catch {
           /* cleanup is best-effort */

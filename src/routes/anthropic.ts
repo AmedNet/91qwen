@@ -421,7 +421,14 @@ async function setupAnthropicSession(
       if (toolResultsContent) parts.push(`<tool-results>\n${toolResultsContent}\n</tool-results>`);
       if (chatHistoryContent) parts.push(`<chat_history>\n${chatHistoryContent}\n</chat_history>`);
       try {
-        const file = await uploadLargeTextAsFile(accountEmail, parts.join('\n\n'), 'context.txt');
+        const combinedContent = parts.join('\n\n');
+        const tUploadStart = Date.now();
+        const file = await uploadLargeTextAsFile(accountEmail, combinedContent, 'context.txt');
+        logStore.log(
+          'debug',
+          'qwen-timing',
+          `context.txt upload ${Date.now() - tUploadStart}ms size=${combinedContent.length}B (acct=${accountEmail.split('@')[0]})`,
+        );
         processedMessages[0] = { ...processedMessages[0], files: [file] };
       } catch (err: any) {
         logStore.log('debug', 'chat', '[Anthropic] Failed to upload context file: ' + (err.message || err));

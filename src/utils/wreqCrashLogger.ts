@@ -7,7 +7,7 @@
  * Each line is one event — easy to grep/jq.
  */
 
-import { appendFileSync, mkdirSync, writeFileSync } from 'fs';
+import { appendFileSync, mkdirSync, renameSync } from 'fs';
 import { resolve } from 'path';
 
 const LOG_DIR = resolve(process.cwd(), 'logs');
@@ -45,12 +45,15 @@ const MAX_FILE_BYTES = 10 * 1024 * 1024;
 function write(event: Record<string, unknown>): void {
   if (!inited) init();
   try {
-    // Basic rotation check
+    // Basic rotation check. Rotate = move current file to -old (overwriting
+    // any previous backup); the next append recreates LOG_FILE. Previously
+    // this wrote an EMPTY file to -old and never truncated LOG_FILE, so the
+    // log grew unbounded past the 10MB cap.
     try {
       const { statSync } = require('fs');
       const st = statSync(LOG_FILE);
       if (st.size > MAX_FILE_BYTES) {
-        writeFileSync(LOG_FILE.replace('.log', '-old.log'), '');
+        renameSync(LOG_FILE, LOG_FILE.replace('.log', '-old.log'));
       }
     } catch {
       /* first write or stat failed */
