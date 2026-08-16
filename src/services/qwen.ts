@@ -430,6 +430,9 @@ export async function createQwenStream(
       `[Qwen] Fetch POST ${url.substring(0, 100)} account=${currentAccountEmail || '?'} token_len=${cookieStr.length} payload_len=${bodyStr.length}`,
     );
 
+    // ── TTFB instrumentation ─────────────────────────────────────
+    const tFetchStart = Date.now();
+
     // Compose streamAbortController.signal (created at function entry for client cancel) with the
     // per-attempt signal (from withRetry's attemptTimeoutMs). Either source aborts the fetch.
     const composedSignal = attemptSignal
@@ -468,6 +471,11 @@ export async function createQwenStream(
       'debug',
       'qwen',
       `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'}`,
+    );
+    logStore.log(
+      'debug',
+      'qwen-timing',
+      `TTFB=${Date.now() - tFetchStart}ms (acct=${currentAccountEmail?.split('@')[0] || '?'}, payload=${bodyStr.length}B)`,
     );
 
     if (config.get('SAVE_REQUEST_LOGS') === 'true') {
@@ -589,11 +597,64 @@ export async function createQwenStream(
   const streamDebugEntryId = lastDebugEntryId;
   const textDecoder = new TextDecoder();
   const wreqClose = (result.response as any)._wreqClose as (() => void) | undefined;
+
+  // ── SSE timing instrumentation ────────────────────────────────
+  // Diagnostic: log first-byte latency, gaps between SSE events, and
+  // classify each event (real content vs keep_alive vs empty think delta).
+  // These logs surface where the slowness actually lives — gateway vs
+  // upstream — when a request stalls for minutes.
+  const sseStartMs = Date.now();
+  let sseBuffer = '';
+  let lastEventMs = sseStartMs;
+  let firstContentMs = 0;
+  let firstKeepAliveMs = 0;
+  let lastGapWarnMs = 0;
+  let sseEvents = { total: 0, keepAlive: 0, think: 0, content: 0, other: 0 };
+
+  const classifySseEvent = (data: string): 'keepAlive' | 'think' | 'content' | 'other' => {
+    if (!data) return 'other';
+    if (data.includes('"action": "keep_alive"')) return 'keepAlive';
+    if (data.includes('"phase": "think"') || data.includes('"phase":"think"')) return 'think';
+    if (data.includes('"phase": "finished"') || data.includes('"phase":"finished"') || data.includes('"finish_reason"')) return 'content';
+    if (data.includes('"response.created"') || data.includes('"usage"')) return 'other';
+    return 'other';
+  };
+
   const wrappedStream = result.response.body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
         if (streamDebugEntryId) {
           recordStreamChunk(streamDebugEntryId, textDecoder.decode(chunk, { stream: true }));
+        }
+        // SSE event-boundary timing. Each `data: ...\n\n` block is one event.
+        sseBuffer += textDecoder.decode(chunk, { stream: true });
+        let nlIdx: number;
+        while ((nlIdx = sseBuffer.indexOf('\n\n')) !== -1) {
+          const block = sseBuffer.slice(0, nlIdx);
+          sseBuffer = sseBuffer.slice(nlIdx + 2);
+          const dataLine = block.split('\n').find((l) => l.startsWith('data: '));
+          if (!dataLine) continue;
+          const data = dataLine.slice(6);
+          const kind = classifySseEvent(data);
+          sseEvents[kind]++;
+          sseEvents.total++;
+          const now = Date.now();
+          const gap = now - lastEventMs;
+          if (kind === 'keepAlive') {
+            if (firstKeepAliveMs === 0) firstKeepAliveMs = now - sseStartMs;
+          }
+          if (kind === 'content' && firstContentMs === 0) {
+            firstContentMs = now - sseStartMs;
+            logStore.log('debug', 'qwen-timing', `first real content after ${firstContentMs}ms (acct=${currentAccountEmail?.split('@')[0] || '?'})`);
+          }
+          // Warn on gaps > 5s — the upstream is stalling
+          if (gap > 5000 && sseEvents.total > 1) {
+            if (now - lastGapWarnMs > 30000) {
+              logStore.log('warn', 'qwen-timing', `SSE gap ${gap}ms (kind=${kind}, event#${sseEvents.total}, acct=${currentAccountEmail?.split('@')[0] || '?'}, elapsed=${now - sseStartMs}ms)`);
+              lastGapWarnMs = now;
+            }
+          }
+          lastEventMs = now;
         }
         if (config.get('SAVE_REQUEST_LOGS') === 'true') {
           sseEventCount++;
@@ -604,6 +665,12 @@ export async function createQwenStream(
         if (streamDebugEntryId) {
           completeEntry(streamDebugEntryId);
         }
+        const totalMs = Date.now() - sseStartMs;
+        logStore.log(
+          'debug',
+          'qwen-timing',
+          `stream done total=${totalMs}ms firstKeepAlive=${firstKeepAliveMs}ms firstContent=${firstContentMs}ms events=${JSON.stringify(sseEvents)} (acct=${currentAccountEmail?.split('@')[0] || '?'})`,
+        );
         if (config.get('SAVE_REQUEST_LOGS') === 'true' && makeRequestQwenLogFile) {
           logQwenSSE(makeRequestQwenLogFile, sseEventCount, 0, []);
         }

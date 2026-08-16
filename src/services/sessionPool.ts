@@ -159,10 +159,21 @@ export class SessionPool {
     if (p.slots.length === 0) return null;
     const now = Date.now();
     const ttl = this.poolIdleTtl();
-    const fresh = p.slots.filter((s) => now - s.createdAt < ttl);
-    const slot = fresh.shift() || null;
-    if (!slot) return null;
+    const fresh: PoolSlot[] = [];
+    for (const slot of p.slots) {
+      if (now - slot.createdAt < ttl) {
+        fresh.push(slot);
+      } else {
+        // Stale slot — delete upstream chat so the account's chat history
+        // doesn't accumulate. Without this, topUp fills up to N empty chats
+        // per account and never reclaims them, which over hours tanks the
+        // account's upstream processing latency to 200s+.
+        void this.deleteSession(slot.chatId, undefined, slot.accountEmail).catch(() => {});
+      }
+    }
     p.slots = fresh;
+    const slot = fresh.shift();
+    if (!slot) return null;
     // Refill asynchronously so the next acquire also hits the pool
     this.topUp(email).catch(() => {});
     return slot.chatId;
