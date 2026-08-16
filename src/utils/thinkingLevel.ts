@@ -63,10 +63,9 @@ export function resolveThinkingLevel(opts: {
   }
 
   const effort = (opts.reasoningEffort || '').toLowerCase();
-  if (effort === 'off' || effort === 'none') return 'off';
+  if (effort === 'off' || effort === 'none' || effort === 'low' || effort === 'minimal') return 'off';
   if (effort === 'full' || effort === 'deep' || effort === 'high') return 'full';
-  if (effort === 'summary') return 'summary';
-  if (effort === 'low' || effort === 'medium') return 'summary';
+  if (effort === 'medium' || effort === 'summary') return 'summary';
 
   return 'summary';
 }

@@ -789,40 +789,25 @@ test('Chat Completions: JSON CAPTCHA body is throttled, not returned as empty 20
   }
 });
 
-test('CAPTCHA solver: mock "solved" clears throttle and retries on the same account', async () => {
+test('CAPTCHA: returns APIError to client immediately (no interactive solver)', async () => {
+  // Behavior contract: when Qwen returns a CAPTCHA challenge, we DO NOT
+  // pop a visible browser window and we DO NOT cycle through accounts
+  // (each would just hit the same WAF). Instead we surface a 5xx error
+  // so the downstream client can apply its own retry / backoff.
   const originalFetch = globalThis.fetch;
-  const originalCaptchaSolver = process.env.CAPTCHA_SOLVER;
-  const originalMockResult = process.env.CAPTCHA_SOLVER_MOCK_RESULT;
-  process.env.CAPTCHA_SOLVER = 'true';
-  process.env.CAPTCHA_SOLVER_MOCK_RESULT = 'true';
 
   let callCount = 0;
   (globalThis as any).fetch = async (input: any) => {
     const url = typeof input === 'string' ? input : input.url;
     if (url.includes('/api/v2/chat/completions')) {
       callCount++;
-      if (callCount === 1) {
-        // First attempt: CAPTCHA. Solver mock resolves it.
-        return new Response(
-          JSON.stringify({
-            ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::mock'],
-            data: {},
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-      // Second attempt (same account, retried after solve): normal stream.
-      const stream = new ReadableStream({
-        start(c) {
-          c.enqueue(
-            new TextEncoder().encode(
-              'data: {"choices": [{"delta": {"phase": "answer", "content": "captcha solved"}}]}\n\ndata: [DONE]\n\n',
-            ),
-          );
-          c.close();
-        },
-      });
-      return new Response(stream, { status: 200 });
+      return new Response(
+        JSON.stringify({
+          ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::mock'],
+          data: {},
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
     }
     return originalFetch(input);
   };
@@ -840,13 +825,9 @@ test('CAPTCHA solver: mock "solved" clears throttle and retries on the same acco
     });
 
     const res = await app.fetch(req);
-    assert.strictEqual(res.status, 200, 'Solved CAPTCHA should yield a successful response');
-    const body = await res.json();
-    assert.match(body.content?.[0]?.text || '', /captcha solved/);
-    assert.ok(callCount >= 2, `Expected at least 2 upstream calls (CAPTCHA + retry), got ${callCount}`);
+    assert.ok(res.status >= 500, `Expected 5xx error to client, got ${res.status}`);
+    assert.equal(callCount, 1, `Expected exactly 1 upstream call (no retry cycling), got ${callCount}`);
   } finally {
-    process.env.CAPTCHA_SOLVER = originalCaptchaSolver;
-    process.env.CAPTCHA_SOLVER_MOCK_RESULT = originalMockResult;
     globalThis.fetch = originalFetch;
   }
 });

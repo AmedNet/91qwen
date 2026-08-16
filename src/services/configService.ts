@@ -37,6 +37,8 @@ export interface ConfigSchema {
   LOCAL_MCP_MAX_CHARS: string;
   CAPTCHA_SOLVER: string;
   CAPTCHA_SOLVE_TIMEOUT_MS: string;
+  SESSION_ACTIVE_TIMEOUT_MS: string;
+  SESSION_SWEEPER_INTERVAL_MS: string;
 }
 
 export const DEFAULT_CONFIG: ConfigSchema = {
@@ -73,6 +75,8 @@ export const DEFAULT_CONFIG: ConfigSchema = {
   LOCAL_MCP_MAX_CHARS: '70000',
   CAPTCHA_SOLVER: 'true',
   CAPTCHA_SOLVE_TIMEOUT_MS: '120000',
+  SESSION_ACTIVE_TIMEOUT_MS: '1800000',
+  SESSION_SWEEPER_INTERVAL_MS: '300000',
 };
 
 const CONFIG_KEYS = new Set<string>(Object.keys(DEFAULT_CONFIG));

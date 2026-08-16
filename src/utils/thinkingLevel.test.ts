@@ -29,6 +29,12 @@ describe('resolveThinkingLevel', () => {
     expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'high' })).toBe('full');
     expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'medium' })).toBe('summary');
     expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'off' })).toBe('off');
+    // low (and minimal) → off per "low and below → no thinking" contract
+    expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'low' })).toBe('off');
+    expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'minimal' })).toBe('off');
+    expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'none' })).toBe('off');
+    // deep is an alias for full
+    expect(resolveThinkingLevel({ mode: 'auto', model: 'qwen3.7-max', reasoningEffort: 'deep' })).toBe('full');
   });
 
   test('default stays summary (matches qwen-gate always-on thinking)', () => {

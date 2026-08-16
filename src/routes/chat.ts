@@ -4,7 +4,7 @@ import { pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
-import { CaptchaSolvedError, RetryableQwenStreamError } from '../services/qwen.ts';
+import { CaptchaRequiredError, CaptchaSolvedError, RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -294,17 +294,18 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         retrySameAccount = resolvedEmail;
         continue;
       }
-      // 暂时注释掉 FAIL_SYS_USER_VALIDATE 判断，避免误判
-      // if (
-      //   (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
-      //   (err.message || '').includes('CAPTCHA') ||
-      //   err instanceof RetryableQwenStreamError
-      // ) {
-      //   lastFailedEmail = resolvedEmail;
-      //   lastError = err;
-      //   if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
-      //   continue;
-      // }
+      // CaptchaRequiredError means the interactive solver was bypassed —
+      // surface it to the downstream client so it can apply its own retry
+      // policy. Do NOT cycle through accounts; each one is just as likely
+      // to hit the same WAF challenge.
+      if (err instanceof CaptchaRequiredError) {
+        logStore.log(
+          'warn',
+          'chat',
+          `[Chat] CAPTCHA challenge on ${resolvedEmail || '?'} — surfacing to client: ${err.message}`,
+        );
+        throw new Error(`Qwen CAPTCHA required — please retry shortly. ${err.message}`);
+      }
 
       // 对于 "ChatInProgress" 错误，直接返回给客户端，不再重试
       if (err.upstreamCode === 'ChatInProgress') {

@@ -47,10 +47,12 @@ async function refreshPool() {
   var wait = data.waiting || 0;
   var avail = data.available || 0;
   var total = data.total || 0;
+  var stuck = data.stuck || 0;
   setText('poolActive', inUse);
   setText('poolWaiting', wait);
   setText('poolAvailable', avail);
   setText('poolTotal', total);
+  setText('poolStuck', stuck);
   setText('kpiActiveSessions', inUse);
   setText('kpiActiveSessionsSub', 'of ' + total + ' sessions');
   setText('kpiQueue', wait);
@@ -59,6 +61,9 @@ async function refreshPool() {
   var bar = document.getElementById('poolBarFill');
   bar.style.width = pct + '%';
   bar.style.background = pct > 80 ? 'var(--danger)' : pct > 50 ? 'var(--warning)' : 'var(--accent)';
+  // Highlight stuck count when sweeper finds orphans
+  var stuckEl = document.getElementById('poolStuck');
+  if (stuckEl) stuckEl.style.color = stuck > 0 ? 'var(--danger)' : '';
 }
 /* ── Model Health ── */
 async function refreshModelHealth() {

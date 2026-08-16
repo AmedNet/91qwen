@@ -5,7 +5,7 @@ import { pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
-import { CaptchaSolvedError, RetryableQwenStreamError } from '../services/qwen.ts';
+import { CaptchaRequiredError, CaptchaSolvedError, RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -481,6 +481,15 @@ async function setupAnthropicSession(
         lastError = undefined;
         retrySameAccount = resolvedEmail;
         continue;
+      }
+      // CaptchaRequiredError: solver was bypassed — surface to the client.
+      if (err instanceof CaptchaRequiredError) {
+        logStore.log(
+          'warn',
+          'chat',
+          `[Anthropic] CAPTCHA challenge on ${resolvedEmail || '?'} — surfacing to client: ${err.message}`,
+        );
+        throw new Error(`Qwen CAPTCHA required — please retry shortly. ${err.message}`);
       }
       // 暂时注释掉 FAIL_SYS_USER_VALIDATE 判断，避免误判
       // if (

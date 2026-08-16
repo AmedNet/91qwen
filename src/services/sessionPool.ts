@@ -37,11 +37,20 @@ export class SessionPool {
   private releaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Per-account pools of pre-created EMPTY chats, so acquire doesn't wait on chats/new. */
   private pools = new Map<string, AccountPool>();
+  /** Timestamp (ms) when each active chatId was acquired — used by the stuck sweeper. */
+  private acquiredAt = new Map<string, number>();
+  /** Tracks cached headers per chatId so sweeper can call deleteSession after release. */
+  private cachedByChat = new Map<string, { headers?: { cookie: string; userAgent: string }; email?: string }>();
+  /** Background sweeper handle; null until initialize() starts it. */
+  private sweeperInterval: ReturnType<typeof setInterval> | null = null;
 
   async initialize(): Promise<void> {
     if (process.env.TEST_MOCK_PLAYWRIGHT) {
       return;
     }
+    // Start stuck-session sweeper unconditionally — it's the belt-and-suspenders
+    // backstop that fires even when the chat pool is disabled.
+    this.startSweeper();
     const target = this.poolTarget();
     if (target <= 0) return;
     for (const email of getAllAccountEmails()) {
@@ -49,6 +58,56 @@ export class SessionPool {
         /* retried on next acquire */
       });
     }
+  }
+
+  private activeTimeoutMs(): number {
+    return Math.max(60_000, config.getInt('SESSION_ACTIVE_TIMEOUT_MS', 1_800_000));
+  }
+
+  private sweeperIntervalMs(): number {
+    return Math.max(10_000, config.getInt('SESSION_SWEEPER_INTERVAL_MS', 300_000));
+  }
+
+  /** Start the stuck-session sweeper interval. Idempotent — clears any existing handle first. */
+  private startSweeper(): void {
+    if (this.sweeperInterval) {
+      clearInterval(this.sweeperInterval);
+      this.sweeperInterval = null;
+    }
+    const interval = this.sweeperIntervalMs();
+    this.sweeperInterval = setInterval(() => {
+      try {
+        const { swept } = this.sweepStuckSessions();
+        if (swept.length > 0) {
+          logStore.log('warn', 'pool', `Sweeper released ${swept.length} stuck session(s): ${swept.map((c) => c.substring(0, 8)).join(', ')}`);
+        }
+      } catch (err: any) {
+        logStore.log('debug', 'pool', `Sweeper error: ${err.message}`);
+      }
+    }, interval);
+    if (typeof this.sweeperInterval.unref === 'function') this.sweeperInterval.unref();
+  }
+
+  /**
+   * Release sessions older than `activeTimeoutMs`. Returns the released chatIds so
+   * callers / logs can attribute what was swept. Safe to call concurrently with
+   * normal acquire/release — releases through the same idempotent path.
+   */
+  sweepStuckSessions(): { swept: string[] } {
+    const now = Date.now();
+    const threshold = this.activeTimeoutMs();
+    const swept: string[] = [];
+    for (const chatId of this.activeSessions) {
+      const acquiredAt = this.acquiredAt.get(chatId) ?? 0;
+      if (now - acquiredAt > threshold) {
+        const meta = this.cachedByChat.get(chatId);
+        swept.push(chatId);
+        // Reuse release() — it is idempotent and will schedule DELETE upstream
+        // (and clear our bookkeeping), so we don't duplicate cleanup logic.
+        void this.release(chatId, null, meta?.headers, meta?.email, false);
+      }
+    }
+    return { swept };
   }
 
   private poolTarget(): number {
@@ -147,6 +206,11 @@ export class SessionPool {
             };
             this.activeSessions.add(pooledChatId);
             this.activeCount++;
+            this.acquiredAt.set(pooledChatId, Date.now());
+            this.cachedByChat.set(pooledChatId, {
+              headers: { cookie: headers.cookie, userAgent: headers.userAgent },
+              email: entry.accountEmail,
+            });
             logStore.log('info', 'pool', 'Session reused (pool)' + (entry.accountEmail ? ': ' + entry.accountEmail.split('@')[0] : ''));
             return entry;
           }
@@ -176,6 +240,11 @@ export class SessionPool {
         };
         this.activeSessions.add(chatId);
         this.activeCount++;
+        this.acquiredAt.set(chatId, Date.now());
+        this.cachedByChat.set(chatId, {
+          headers: { cookie: headers.cookie, userAgent: headers.userAgent },
+          email: entry.accountEmail,
+        });
         // Refill the pool in the background for the next request
         if (resolvedEmail) this.topUp(resolvedEmail).catch(() => {});
         logStore.log('info', 'pool', 'Session acquired' + (entry.accountEmail ? ': ' + entry.accountEmail.split('@')[0] : ''));
@@ -220,6 +289,8 @@ export class SessionPool {
     }
 
     this.activeSessions.delete(chatId);
+    this.acquiredAt.delete(chatId);
+    this.cachedByChat.delete(chatId);
     if (this.activeCount > 0) this.activeCount--;
     const existingTimer = this.releaseTimers.get(chatId);
     if (existingTimer) clearTimeout(existingTimer);
@@ -274,12 +345,35 @@ export class SessionPool {
     }
   }
 
-  getStats(): { total: number; available: number; inUse: number; waiting: number } {
+  getStats(): {
+    total: number;
+    available: number;
+    inUse: number;
+    waiting: number;
+    stuck: number;
+    oldestSessionMs: number;
+    activeTimeoutMs: number;
+    sweeperEnabled: boolean;
+  } {
+    const now = Date.now();
+    const threshold = this.activeTimeoutMs();
+    let oldest = 0;
+    let stuck = 0;
+    for (const chatId of this.activeSessions) {
+      const acquiredAt = this.acquiredAt.get(chatId) ?? 0;
+      const age = now - acquiredAt;
+      if (age > oldest) oldest = age;
+      if (age > threshold) stuck++;
+    }
     return {
       total: this.activeSessions.size,
       available: this.activeSessions.size - this.activeCount,
       inUse: this.activeCount,
       waiting: 0,
+      stuck,
+      oldestSessionMs: oldest,
+      activeTimeoutMs: threshold,
+      sweeperEnabled: this.sweeperInterval !== null,
     };
   }
 

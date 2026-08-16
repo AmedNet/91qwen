@@ -45,6 +45,7 @@ ${sidebarHtml('overview')}
                 <div class="pool-stat"><div class="pool-stat-value" id="poolWaiting">—</div><div class="pool-stat-label">Waiting</div></div>
                 <div class="pool-stat"><div class="pool-stat-value" id="poolAvailable">—</div><div class="pool-stat-label">Available</div></div>
                 <div class="pool-stat"><div class="pool-stat-value" id="poolTotal">—</div><div class="pool-stat-label">Total</div></div>
+                <div class="pool-stat"><div class="pool-stat-value" id="poolStuck">—</div><div class="pool-stat-label">Stuck</div></div>
               </div>
               <div class="pool-bar"><div class="pool-bar-fill" id="poolBarFill" style="width:0%"></div></div>
             </div>

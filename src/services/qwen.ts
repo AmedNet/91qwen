@@ -3,7 +3,6 @@ import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
 import { decrementInFlight, getTokenWithAccount, pickAccount, setAccountDisabled, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
-import { solveCaptchaOnProfile } from './captchaSolver.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
 import { completeEntry, errorEntry, recordStreamChunk } from './networkDebug.ts';
@@ -63,6 +62,20 @@ export class CaptchaSolvedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'CaptchaSolvedError';
+  }
+}
+
+/**
+ * Thrown when Qwen returns a CAPTCHA challenge. The caller MUST surface this
+ * to the downstream client as a 5xx error so the client (Codex CLI etc.) can
+ * apply its own retry / backoff policy. We deliberately do NOT pop a visible
+ * browser window here — that adds a 2-minute synchronous wait per failed
+ * request and balloons latency. Instead we throttle the account and bail.
+ */
+export class CaptchaRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CaptchaRequiredError';
   }
 }
 
@@ -345,46 +358,25 @@ export async function createQwenStream(
           throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, status);
         }
 
-        // Qwen anti-bot CAPTCHA — try interactive solver first, else throttle+switch
+        // Qwen anti-bot CAPTCHA — never pop a visible browser here. The
+        // interactive solver used to add a 2-minute synchronous wait per
+        // failed request, which destroys latency. Instead, throttle the
+        // account, log loudly, and surface the failure to the downstream
+        // client so it can apply its own retry policy.
         if (errorJson?.ret?.[0] === 'FAIL_SYS_USER_VALIDATE') {
           const details = errorJson.ret[1] || 'CAPTCHA required';
           logStore.log('warn', 'qwen', `CAPTCHA detected for ${currentAccountEmail || 'unknown'}: ${details}`);
-
-          const captchaSolverEnabled = config.get('CAPTCHA_SOLVER') === 'true';
-          if (captchaSolverEnabled && currentAccountEmail) {
-            const solveTimeoutMs = Number(config.get('CAPTCHA_SOLVE_TIMEOUT_MS') || 120000);
-            const solved = await solveCaptchaOnProfile(currentAccountEmail, { timeoutMs: solveTimeoutMs });
-            if (solved) {
-              logStore.log(
-                'info',
-                'qwen',
-                `[Qwen] CAPTCHA solved interactively for ${currentAccountEmail} — retrying with fresh token`,
-              );
-              errorEntry(debugEntryId, 'CAPTCHA solved via interactive solver');
-              // saveCookies() already cleared the throttle — retry on the same account
-              throw new CaptchaSolvedError('Qwen CAPTCHA solved — retrying on same account');
-            }
-            logStore.log(
-              'warn',
-              'qwen',
-              `[Qwen] Interactive CAPTCHA solve failed for ${currentAccountEmail} — throttling and switching`,
-            );
-          }
 
           if (currentAccountEmail) {
             throttleAccount(currentAccountEmail, 5 * 60 * 1000);
             logStore.log(
               'debug',
               'qwen',
-              `[Qwen] BOT DETECTION: ${currentAccountEmail} hit FAIL_SYS_USER_VALIDATE — throttled 5min, switching account`,
+              `[Qwen] BOT DETECTION: ${currentAccountEmail} hit FAIL_SYS_USER_VALIDATE — throttled 5min, surfacing to client`,
             );
-            const nextAccount = await pickAccount(currentAccountEmail);
-            if (nextAccount) {
-              currentAccountEmail = nextAccount.email;
-              decrementInFlight(nextAccount.email);
-            }
           }
-          throw new RetryableQwenStreamError(`Qwen CAPTCHA — switched accounts. ${details}`, 3000);
+          errorEntry(debugEntryId, `CAPTCHA required: ${details}`);
+          throw new CaptchaRequiredError(`Qwen CAPTCHA — ${details}`);
         }
 
         if (
