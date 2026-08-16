@@ -66,7 +66,7 @@ interface AnthropicMessage {
   content: string | AnthropicContentBlock[];
 }
 
-function anthropicMessagesToOpenAI(messages: AnthropicMessage[], system?: string): any[] {
+export function anthropicMessagesToOpenAI(messages: AnthropicMessage[], system?: string): any[] {
   const out: any[] = [];
   if (system) {
     out.push({ role: 'system', content: system });
@@ -91,7 +91,15 @@ function anthropicMessagesToOpenAI(messages: AnthropicMessage[], system?: string
             }
           } else if (block.type === 'tool_result') {
             hasToolResult = true;
-            const tc = typeof block.content === 'string' ? block.content : '';
+            let tc = '';
+            if (typeof block.content === 'string') {
+              tc = block.content;
+            } else if (Array.isArray(block.content)) {
+              // Anthropic tool_result content is usually an array of content
+              // blocks ([{ type: 'text', text: ... }]). It used to be dropped
+              // to '' here, so Qwen never saw the tool's output.
+              tc = block.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
+            }
             out.push({ role: 'tool', tool_call_id: block.tool_use_id, content: tc });
           } else {
             console.warn(`[Anthropic] Unknown content block: ${block.type}`);

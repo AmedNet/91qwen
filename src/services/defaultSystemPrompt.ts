@@ -41,15 +41,15 @@ Messages may include attached files. These are referenced inline and also appear
 
 ### How to Use \`context.txt\`
 
-**Tool results never appear in the conversation text.** They are written **only** in the \`<tool-results>\` section of \`context.txt\`. If you don't read that file, you cannot see what your tools returned.
+**Tool results appear inline** in the conversation text: each tool call is immediately followed by its \`<tool_result>\` block. Very large outputs may be truncated inline; the complete output of every tool call is archived in the \`<tool-results>\` section of \`context.txt\`.
 
 **Tool definitions** (the list of available tools and their parameter schemas) are in the \`<system-instructions>\` section.
 
 **Rules:**
-1. If the conversation history contains tool calls, you **MUST** read the \`<tool-results>\` section of \`context.txt\` before producing your response.
-2. The **latest entries** at the end correspond to the most recent tool calls. Always start from the bottom.
-3. Do not guess or assume what a tool returned — read the file.
-4. If there are multiple tool calls, all their results are appended sequentially in the order they were called.
+1. Use the inline \`<tool_result>\` block right after each tool call as the primary source for what the tool returned.
+2. If an inline result is truncated or missing, consult the \`<tool-results>\` section of \`context.txt\`. The **latest entries** at the end correspond to the most recent tool calls — start from the bottom.
+3. Do not guess or assume what a tool returned — read the inline result or the archive.
+4. If there are multiple tool calls, their results appear sequentially in the order they were called.
 5. If the \`<chat_history>\` section exists, it contains older conversation turns that preceded the inline context. Read it if you need the full conversation history.
 
 When a file is attached, treat it as authoritative context for that turn.

@@ -9,7 +9,7 @@ import type { ModelSpec } from '../types/openai.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 import { resolveToolName } from '../utils/toolNameMap.ts';
 import { pendingCorrections } from './chatHelpersCore.ts';
-import { compressToolResult } from './compressToolResult.ts';
+import { compressToolResult, truncateToolResult } from './compressToolResult.ts';
 
 /** Escape special XML characters in a string (for safe attribute & element content). */
 function escXml(s: string): string {
@@ -66,9 +66,9 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const segments: string[] = [];
   const systemParts: string[] = [];
   const toolResultObjects: any[] = [];
-
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
+  const workingMessages = messages;
+  for (let i = 0; i < workingMessages.length; i++) {
+    const msg = workingMessages[i];
 
     let contentStr = '';
     if (Array.isArray(msg.content)) {
@@ -77,6 +77,19 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       contentStr = JSON.stringify(msg.content);
     } else {
       contentStr = msg.content || '';
+    }
+
+    // Strip the literal strings some OpenAI clients serialize when an
+    // assistant turn produced no textual content (e.g. the turn only emitted
+    // a tool_call). Variants observed: "null", "undefined", "None" (Python
+    // str(None)). Pushing them through surfaces as <assist>null</assist> in
+    // the prompt and the upstream model hangs for minutes trying to
+    // reconcile empty turns with the following tool results.
+    if (typeof msg.role === 'string' && msg.role !== 'user' && msg.role !== 'system') {
+      const trimmed = (contentStr || '').trim();
+      if (trimmed === 'null' || trimmed === 'undefined' || trimmed === 'None') {
+        contentStr = '';
+      }
     }
 
     if (msg.role === 'system') {
@@ -146,16 +159,30 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         }
       }
 
+      // Drop empty assistant turns — content=null/"" AND no tool_calls means the
+      // turn contributed nothing to the conversation. Some OpenAI clients
+      // serialize these (often paired with tool result messages that follow)
+      // and Qwen's upstream hangs for minutes trying to reconcile them.
+      if (!assistantContent.trim()) {
+        continue;
+      }
+
       segments.push(`<assist>\n${assistantContent}\n</assist>`);
     } else if (msg.role === 'tool' || msg.role === 'function') {
       let toolName = msg.name;
-      if (!toolName && msg.tool_call_id) {
+      let toolCallArgs: string | undefined;
+      let callFound = false;
+      if (msg.tool_call_id) {
         for (let j = i - 1; j >= 0; j--) {
-          const prevMsg = messages[j];
+          const prevMsg = workingMessages[j];
           if (prevMsg.role === 'assistant' && prevMsg.tool_calls) {
             const call = prevMsg.tool_calls.find((tc: any) => tc.id === msg.tool_call_id);
             if (call) {
-              toolName = call.function?.name;
+              toolName = toolName || call.function?.name;
+              toolCallArgs = typeof call.function?.arguments === 'string'
+                ? call.function.arguments
+                : JSON.stringify(call.function?.arguments || {});
+              callFound = true;
               break;
             }
           }
@@ -166,6 +193,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       toolResultObjects.push({
         type: 'function',
         tool: toolName || 'unknown',
+        args: toolCallArgs,
         result: {
           success: true,
           stdout: truncated,
@@ -173,6 +201,28 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
           command: toolName || '',
         },
       });
+
+      // Orphan result: the client sent a tool result without the assistant
+      // tool_call that issued it (observed in production: the prompt shows
+      // tool results but zero assistant calls). Without a visible call the
+      // model can't tell what it just invoked and re-calls the same tool in
+      // a loop. Synthesize the call so the prompt shows a complete
+      // call -> result pair.
+      if (!callFound && msg.tool_call_id) {
+        const FKW = TOOL_CALL_KEYWORDS[0];
+        segments.push(`<assist>\n<${FKW}=${toolName || 'unknown'}>\n</${FKW}>\n</assist>`);
+      }
+
+      // Inline the result right after its call. Results used to live ONLY in
+      // the uploaded context.txt attachment, so the model saw "I called a
+      // tool" but never the outcome in the conversation flow — another loop
+      // trigger. The inline copy is truncated for echo control; the full
+      // (compressed) result still ships in toolResultsContent, which the
+      // route handlers archive in context.txt.
+      const inlineResult = truncateToolResult(contentStr || '');
+      segments.push(
+        `<tool_result tool="${escXml(toolName || 'unknown')}" success="true">\n<stdout>${escXml(inlineResult)}</stdout>\n</tool_result>`,
+      );
     }
   }
 
@@ -271,9 +321,10 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const formatToolResult = (r: {
     type: string;
     tool: string;
+    args?: string;
     result: { success: boolean; stdout?: string; stderr?: string; command?: string };
   }) =>
-    `<tool_result tool="${r.tool}" success="${r.result.success}">\n<command>${escXml(r.result.command || '')}</command>\n<stdout>${escXml(r.result.stdout || '')}</stdout>\n<stderr>${escXml(r.result.stderr || '')}</stderr>\n</tool_result>`;
+    `<tool_result tool="${r.tool}" success="${r.result.success}">${r.args ? `\n<arguments>${escXml(r.args)}</arguments>` : ''}\n<command>${escXml(r.result.command || '')}</command>\n<stdout>${escXml(r.result.stdout || '')}</stdout>\n<stderr>${escXml(r.result.stderr || '')}</stderr>\n</tool_result>`;
   const toolResultsContent = toolResultObjects.length > 0 ? toolResultObjects.map(formatToolResult).join('\n\n') : undefined;
   const qwenMessages: QwenMessage[] = [
     {
