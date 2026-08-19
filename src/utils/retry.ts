@@ -23,11 +23,13 @@ export interface RetryConfig {
   /** Circuit breaker instance to use (optional). If provided, open circuit = immediate rejection. */
   circuitBreaker?: CircuitBreaker;
   /**
-   * Called whenever an attempt is discarded (failure or abort). The discarded attempt's
-   * result (whatever `fn` returned) is passed in, so the caller can clean up attempt-scoped
-   * resources — typically cancelling an upstream Response.body so the upstream chat_id is
-   * released before the next attempt reuses it. Without this, an aborted SSE stream keeps
-   * the chat_id locked and the next attempt hits "The chat is in progress!".
+   * Called whenever an attempt is discarded (failure, timeout, or abort). The discarded
+   * attempt's result is passed in — note it is `undefined` when the attempt never
+   * completed (the timeout/abort case), so handlers must tolerate that. Callers use it
+   * to clean up attempt-scoped resources — typically cancelling an upstream Response.body
+   * so the upstream chat_id is released before the next attempt reuses it. Without this,
+   * an aborted SSE stream keeps the chat_id locked and the next attempt hits
+   * "The chat is in progress!".
    */
   onAttemptDiscarded?: (result: unknown, error: unknown) => void;
 }
@@ -124,7 +126,15 @@ export class CircuitBreaker {
     };
   }
 
-  /** Check if the circuit allows a request to pass. Throws CircuitOpenError if open. */
+  /**
+   * Check if the circuit allows a request to pass. Throws CircuitOpenError if open.
+   *
+   * Note: this path (via tryTransitionToHalfOpen) mutates state outside the
+   * recordSuccess/recordFailure mutex. That is safe because it executes fully
+   * synchronously — in a single-threaded event loop no interleaving can occur
+   * within one call. The mutex exists only to serialize the async record*()
+   * promise chains against each other.
+   */
   allowRequest(): void {
     this.tryTransitionToHalfOpen();
     if (this.state === 'open') {
@@ -214,19 +224,24 @@ export function isRetryable(error: unknown, httpStatus?: number): boolean {
   // Explicit non-retryable
   if (error instanceof NonRetryableError) return false;
 
-  // Network errors (fetch throws TypeError/DOMException for network issues)
+  // An AbortError means an EXTERNAL abort (client disconnect / caller
+  // cancelled the request). Our own per-attempt timeout rejects with
+  // AttemptTimeoutError instead — so an AbortError reaching this point means
+  // the requester is already gone and retrying upstream is wasted work.
+  if (error instanceof Error && error.name === 'AbortError') return false;
+
+  // Network errors (fetch throws TypeError/DOMException for network issues).
+  // NOTE: 'aborted' is deliberately NOT a keyword — abort messages are
+  // handled by the AbortError check above and must not be retried.
   if (error instanceof TypeError || error instanceof DOMException) {
     const msg = String(error.message).toLowerCase();
-    const networkKeywords = ['network', 'fetch', 'aborted', 'timeout', 'connection', 'econnrefused', 'enotfound', 'econnreset', 'socket'];
+    const networkKeywords = ['network', 'fetch', 'timeout', 'connection', 'econnrefused', 'enotfound', 'econnreset', 'socket'];
     return networkKeywords.some((kw) => msg.includes(kw));
   }
 
   // Timeout
   if (error instanceof AttemptTimeoutError) return true;
   if (error instanceof Error && error.name === 'TimeoutError') return true;
-
-  // Abort
-  if (error instanceof Error && error.name === 'AbortError') return true;
 
   // HTTP status check
   if (httpStatus !== undefined) {
@@ -354,11 +369,14 @@ export async function withRetry<T>(
       if (cfg.circuitBreaker) await cfg.circuitBreaker.recordSuccess();
       return attemptResult as T;
     } catch (error: unknown) {
-      // Attempt failed. If the attempt produced a partial result before failing
-      // (e.g. an HTTP 200 + streaming body that the timeout then aborted), let
-      // the caller clean up attempt-scoped resources — typically cancelling the
-      // upstream Response.body so the server releases the chat_id.
-      if (cfg.onAttemptDiscarded && attemptResult !== undefined) {
+      // Attempt failed — always notify the discard hook. The previous
+      // `attemptResult !== undefined` guard made this hook unreachable in the
+      // exact scenario it exists for: on timeout/abort the await above never
+      // assigns attemptResult, so the cleanup callback never fired and the
+      // aborted SSE kept the upstream chat_id locked. The hook now fires on
+      // every discarded attempt (result is undefined when fn never completed);
+      // handlers must tolerate an undefined result.
+      if (cfg.onAttemptDiscarded) {
         try {
           cfg.onAttemptDiscarded(attemptResult, error);
         } catch (cleanupErr) {
@@ -369,17 +387,25 @@ export async function withRetry<T>(
       attemptResult = undefined;
       lastError = error;
 
+      // Extract a structured HTTP status only from typed error fields
+      // (.status / .statusCode / .upstreamStatus). The previous regex scan of
+      // error.message matched ANY three-digit number — e.g. "payload exceeds
+      // 500 bytes" was misread as HTTP 500 and triggered bogus retries.
       let httpStatus: number | undefined;
       if (error && typeof error === 'object') {
         const errObj = error as Record<string, unknown>;
-        httpStatus = errObj.status as number | undefined;
-        if (!httpStatus && error instanceof Error) {
-          const match = error.message.match(/\b([45]\d{2})\b/);
-          if (match) httpStatus = parseInt(match[1], 10);
+        const candidate = errObj.status ?? errObj.statusCode ?? errObj.upstreamStatus;
+        if (typeof candidate === 'number' && candidate >= 100 && candidate <= 599) {
+          httpStatus = candidate;
         }
       }
 
-      const retryable = isRetryable(error, httpStatus);
+      let retryable = isRetryable(error, httpStatus);
+      // Honor the configured non-retryable status list (previously declared
+      // with a default value but never read — dead config).
+      if (retryable && httpStatus !== undefined && cfg.nonRetryableStatuses.includes(httpStatus)) {
+        retryable = false;
+      }
 
       if (cfg.circuitBreaker && retryable) {
         await cfg.circuitBreaker.recordFailure();

@@ -38,8 +38,10 @@ export class SystemLogger {
       message,
       metadata,
     };
-    this.systemEntries.unshift(entry);
-    if (this.systemEntries.length > MAX_SYSTEM_ENTRIES) this.systemEntries.pop();
+    // P-6: append (O(1)) instead of unshift. Stored oldest-first; readers
+    // reverse on the way out.
+    this.systemEntries.push(entry);
+    if (this.systemEntries.length > MAX_SYSTEM_ENTRIES) this.systemEntries.shift();
     for (const listener of this.systemListeners) {
       try {
         listener(entry);
@@ -77,7 +79,8 @@ export class SystemLogger {
     if (filter?.since) {
       result = result.filter((e) => e.timestamp >= filter.since!);
     }
-    return result.slice(0, filter?.limit ?? 100);
+    // Newest-first for callers, limit applied to the newest (P-6).
+    return result.slice(-Math.min(filter?.limit ?? 100, result.length)).reverse();
   }
   subscribeSystem(listener: (entry: SystemLogEntry) => void): () => void {
     this.systemListeners.add(listener);

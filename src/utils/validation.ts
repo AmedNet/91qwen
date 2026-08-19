@@ -67,6 +67,19 @@ export const openAIRequestSchema = z.object({
       include_usage: z.boolean().optional(),
     })
     .optional(),
+  // NOTE: zod strips undeclared fields by default. These must be declared here
+  // or the chat route (which consumes the validated body) silently loses the
+  // client's thinking intent — types/openai.ts declares both fields.
+  thinking: z
+    .object({
+      type: z.string().optional(),
+      enabled: z.boolean().optional(),
+      budget_tokens: z.number().optional(),
+      budgetTokens: z.number().optional(),
+    })
+    .passthrough()
+    .optional(),
+  reasoning_effort: z.string().optional(),
 });
 
 export type ValidatedOpenAIRequest = z.infer<typeof openAIRequestSchema>;

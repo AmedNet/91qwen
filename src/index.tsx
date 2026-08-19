@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { existsSync, unlinkSync, writeFileSync } from 'fs';
 import { Hono } from 'hono';
 import { bearerAuth } from 'hono/bearer-auth';
+import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
 
 import { rateLimitMiddleware, startAutoCleanup, stopAutoCleanup } from './middleware/rateLimit.ts';
@@ -134,6 +135,15 @@ const PING_RESPONSE = new Response('OK', {
 app.get('/ping', () => PING_RESPONSE);
 
 // API Key protection for OpenAI-compatible routes
+// The Anthropic endpoint additionally accepts the `x-api-key` header, which is
+// the standard auth scheme Claude Code uses (it never sends Authorization).
+app.use('/v1/messages', async (c, next) => {
+  const apiKey = config.get('API_KEY');
+  if (!apiKey) return await next();
+  const xApiKey = c.req.header('x-api-key');
+  if (xApiKey && safeCompare(xApiKey, apiKey)) return await next();
+  return bearerAuth({ token: apiKey })(c, next);
+});
 app.use('/v1/*', async (c, next) => {
   const apiKey = config.get('API_KEY');
   if (!apiKey) return await next();
@@ -142,6 +152,13 @@ app.use('/v1/*', async (c, next) => {
 
 registerDashboardRoutes(app);
 
+// S-8: /debug/network exposes raw request/response data (may include auth
+// material) — it must never be reachable unauthenticated.
+app.use('/debug/network*', async (c, next) => {
+  const apiKey = config.get('API_KEY');
+  if (!apiKey) return await next();
+  return bearerAuth({ token: apiKey })(c, next);
+});
 app.route('/debug/network', debugNetworkApp);
 
 // Account CRUD API — protected by bearer auth
@@ -164,15 +181,16 @@ if (config.get('API_KEY')) {
 }
 app.route('/api/config', configRouter);
 
-// 10MB request body limit on all chat endpoints
+// 10MB request body limit on all chat endpoints.
+// S-17: use hono/body-limit instead of a content-length header check — the
+// header check is bypassed by chunked transfer-encoding, whereas bodyLimit
+// meters the actual stream bytes.
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
-app.use('/v1/chat/completions', async (c, next) => {
-  const contentLength = Number(c.req.header('content-length') || 0);
-  if (contentLength > MAX_BODY_BYTES) {
-    return c.json({ error: { message: 'Request body too large' } }, 413);
-  }
-  await next();
+const bodyTooLarge = bodyLimit({
+  maxSize: MAX_BODY_BYTES,
+  onError: (c) => c.json({ error: { message: 'Request body too large' } }, 413),
 });
+app.use('/v1/chat/completions', bodyTooLarge);
 
 app.post(
   '/v1/chat/completions',
@@ -184,14 +202,8 @@ app.post(
   chatCompletions,
 );
 
-// 10MB request body limit on anthropic endpoint
-app.use('/v1/messages', async (c, next) => {
-  const contentLength = Number(c.req.header('content-length') || 0);
-  if (contentLength > MAX_BODY_BYTES) {
-    return c.json({ error: { message: 'Request body too large' } }, 413);
-  }
-  await next();
-});
+// 10MB request body limit on anthropic endpoint (chunked-safe, see S-17)
+app.use('/v1/messages', bodyTooLarge);
 
 app.post(
   '/v1/messages',

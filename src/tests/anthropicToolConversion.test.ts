@@ -135,7 +135,9 @@ describe('xmlToolCallToParsed', () => {
     const { xmlToolCallToParsed } = await import('../tools/xmlToolParser.ts');
 
     const result = xmlToolCallToParsed({ name: 'Read', parameters: { file_path: '"/tmp/test.txt"', timeout: '5000' } }, 0);
-    expect(result.arguments).toEqual({ file_path: '/tmp/test.txt', timeout: 5000 });
+    // Quoted strings are JSON-unwrapped; bare scalars stay strings so a
+    // numeric-looking path/id never silently changes type.
+    expect(result.arguments).toEqual({ file_path: '/tmp/test.txt', timeout: '5000' });
   });
 
   test('strips ★- prefix from tool name', async () => {

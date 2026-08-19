@@ -119,13 +119,14 @@ export function createNetworkEntry(options: NetworkDebugOptions): NetworkDebugEn
     errors: [],
   };
 
-  // Add to front of array (newest first)
-  entries.unshift(entry);
+  // P-6: append (O(1)) instead of unshift. Stored oldest-first; readers
+  // reverse on the way out.
+  entries.push(entry);
   entryIndex.set(entry.id, entry);
 
   // Maintain FIFO - remove oldest if over limit
   if (entries.length > MAX_ENTRIES) {
-    const removed = entries.pop()!;
+    const removed = entries.shift()!;
     entryIndex.delete(removed.id);
   }
 
@@ -215,7 +216,8 @@ export function errorEntry(entryId: string, error: string): void {
 }
 
 export function getRecentNetworkEntries(count: number = 50): NetworkDebugEntry[] {
-  return entries.slice(0, Math.min(count, entries.length));
+  // Newest-first for callers — entries are stored oldest-first (P-6).
+  return entries.slice(-Math.min(count, entries.length)).reverse();
 }
 
 export function getNetworkEntry(id: string): NetworkDebugEntry | undefined {

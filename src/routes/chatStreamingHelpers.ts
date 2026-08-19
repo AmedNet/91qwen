@@ -132,7 +132,9 @@ export interface StreamProcessingCtx {
   sseEventCount?: number;
 }
 
-export type ProcessStreamResult = 'continue' | 'break_stream';
+export type ProcessStreamResult =
+  | { result: 'continue'; contentDeltaEmitted: boolean }
+  | { result: 'break_stream'; contentDeltaEmitted: boolean };
 
 /**
  * Shared content filter pipeline standardizing the order:
@@ -197,7 +199,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
         retryAfterMs: 2000,
       }),
     );
-    return 'break_stream';
+    return { result: 'break_stream', contentDeltaEmitted: false };
   }
   const deltaStatus = data.choices?.[0]?.delta?.status;
   if (deltaStatus === 'error') {
@@ -216,7 +218,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
         retryAfterMs: 2000,
       }),
     );
-    return 'break_stream';
+    return { result: 'break_stream', contentDeltaEmitted: false };
   }
   let streamFinished = false;
   if (deltaStatus === 'finished') {
@@ -276,8 +278,8 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   const { vStr, foundStr, isThinkingChunk } = deltaResult;
   state.currentThoughtIndex = deltaResult.currentThoughtIndex;
 
-  if (!foundStr || vStr === '') return 'continue';
-  if (vStr === 'FINISHED') return 'continue';
+  if (!foundStr || vStr === '') return { result: 'continue', contentDeltaEmitted: false };
+  if (vStr === 'FINISHED') return { result: 'continue', contentDeltaEmitted: false };
 
   if (isThinkingChunk) {
     if (state.reasoningBuffer.length < 20000) state.reasoningBuffer += vStr;
@@ -290,11 +292,11 @@ export async function processStreamData(data: any, state: StreamProcessingState,
         await writeReasoningEvent(streamWriter, completionId, model, cleaned);
       }
     }
-    return 'continue';
+    return { result: 'continue', contentDeltaEmitted: false };
   }
 
   if (SELF_CLOSING_TAG_PATTERN.test(vStr)) {
-    return 'continue';
+    return { result: 'continue', contentDeltaEmitted: false };
   }
 
   logStore.addRawChunk(logId, vStr);
@@ -334,7 +336,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
 
   if (rawText.includes('<') && !rawText.includes('>') && rawText.length < MAX_BUFFER_CHARS) {
     state.pendingChunk = rawText;
-    return 'continue';
+    return { result: 'continue', contentDeltaEmitted: false };
   }
 
   // At this point the text won't be delayed. Accumulate and process.
@@ -344,7 +346,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // Performance: skip all downstream work when there's no new raw content.
   // This avoids the expensive parseXmlToolCalls (100KB buffer) and
   // filterContentPipeline on thinking-only or empty chunks.
-  if (!rawText) return 'continue';
+  if (!rawText) return { result: 'continue', contentDeltaEmitted: false };
 
   // Track tool call depth to suppress content leaks from chunk-boundary fragments
   // When inside a tool call block (depth > 0), don't accumulate into
@@ -436,6 +438,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     }
   }
 
+  let emittedContentThisChunk = false;
   if (cleanedText && state.toolCallDepth === 0) {
     // Text-only content (no tool calls): write content delta to SSE + logStore
     const contentDelta = getSnapshotDelta(cleanedText, state.lastFilteredSnapshot);
@@ -453,9 +456,11 @@ export async function processStreamData(data: any, state: StreamProcessingState,
         state.lastVStrRaw,
         logStore,
       );
+      // Track whether real content was emitted (not just tool calls/thinking/keep-alive)
+      emittedContentThisChunk = true;
     }
   }
 
-  if (streamFinished) return 'break_stream';
-  return 'continue';
+  if (streamFinished) return { result: 'break_stream', contentDeltaEmitted: false };
+  return { result: 'continue', contentDeltaEmitted: emittedContentThisChunk };
 }

@@ -11,7 +11,10 @@ export interface ParsedXmlToolCall {
 // (called 50-200 times per streaming request).
 const FKW = TOOL_CALL_KEYWORDS[0]; // 'function' — the block-level keyword
 const PKW = TOOL_CALL_KEYWORDS[1]; // 'parameter' — the parameter keyword
-const FUNCTION_BLOCK_RE = new RegExp(`<${FKW}=[^\\s>]+[\\s\\S]*?>[\\s\\S]*?(?:<\\/${FKW}>|$)`, 'g');
+// Opening tag: `<keyword=NAME...>` — the header run uses [^>]* so it cannot
+// span past the first `>` (the previous `[^\s>]+[\s\S]*?>` stacked two heavy
+// quantifiers that could backtrack badly on adversarial input).
+const FUNCTION_BLOCK_RE = new RegExp(`<${FKW}=[^\\s>]+[^>]*>[\\s\\S]*?(?:<\\/${FKW}>|$)`, 'g');
 const PARAM_RE = new RegExp(`<${PKW}=([^\\s>]+)>([\\s\\S]*?)<\\/${PKW}>`, 'g');
 const FUNC_NAME_RE = new RegExp(`^<${FKW}=([^\\s>]+)>`);
 
@@ -23,7 +26,6 @@ function functionNameFromTag(tag: string): string | null {
 
 export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[]; cleanedText: string } {
   const toolCalls: ParsedXmlToolCall[] = [];
-  const unique = new Set<string>();
   let cleanedText = text;
 
   // Fast path: skip the expensive regex exec loop when there's no tool call content
@@ -39,9 +41,11 @@ export function parseXmlToolCalls(text: string): { toolCalls: ParsedXmlToolCall[
   let match: RegExpExecArray | null;
 
   while ((match = re.exec(text)) !== null) {
-    if (unique.has(match[0])) continue;
-    unique.add(match[0]);
-
+    // No byte-level dedup here. Identical repeated blocks are meaningful:
+    // detectParallelToolLoop (tools/guard.ts) needs to SEE ≥3 copies of the
+    // same call to flag a parallel tool-call loop, and legitimately repeated
+    // parallel calls must not be silently merged into one. Streaming-level
+    // dedup of cumulative re-parses is the callers' job (snapshot deltas).
     const name = functionNameFromTag(match[0]);
     if (!name) continue;
 
@@ -105,11 +109,21 @@ export function xmlToolCallToParsed(
 ): { id: string; name: string; arguments: Record<string, unknown> } {
   const args: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(block.parameters)) {
-    try {
-      args[key] = JSON.parse(value);
-    } catch {
-      args[key] = value;
+    // Only attempt JSON parsing for object/array literals and quoted strings.
+    // Bare scalars ("123", "true") must stay strings — a numeric-looking file
+    // path or id would otherwise silently change type (JSON.parse("123") → 123).
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+        try {
+          args[key] = JSON.parse(trimmed);
+          continue;
+        } catch {
+          /* fall through — keep the raw string */
+        }
+      }
     }
+    args[key] = value;
   }
   const rawName = block.name;
   const name = rawName.startsWith('★-') ? rawName.slice(2) : rawName;

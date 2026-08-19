@@ -108,6 +108,8 @@ const DEFAULT_MAX_ENTRIES = 50000;
 const SAVE_DEBOUNCE_MS = 5000;
 
 class MonitorStore {
+  /** Overshoot allowed before a batched trim (see record()). */
+  private static readonly TRIM_BATCH = 1000;
   private entries: MonitorEntry[] = [];
   private storePath: string;
   private maxEntries: number;
@@ -141,11 +143,15 @@ class MonitorStore {
       mode: params.stream ? 'streaming' : 'non-streaming',
     };
 
-    this.entries.unshift(entry);
+    // P-6: append (O(1)) instead of unshift (O(n) per insert). Entries are
+    // stored oldest-first; readers reverse on the way out.
+    this.entries.push(entry);
 
-    // Trim to max
-    if (this.entries.length > this.maxEntries) {
-      this.entries = this.entries.slice(0, this.maxEntries);
+    // Amortized-O(1) trim: only splice in batches once we overshoot the cap
+    // by TRIM_BATCH, so a steady-state store at capacity doesn't memmove the
+    // whole 50k-entry array on every request.
+    if (this.entries.length > this.maxEntries + MonitorStore.TRIM_BATCH) {
+      this.entries.splice(0, this.entries.length - this.maxEntries);
     }
 
     this.dirty = true;
@@ -292,7 +298,8 @@ class MonitorStore {
    */
   getRecentEntries(hours = 24): MonitorEntry[] {
     const cutoff = Date.now() - hours * 60 * 60 * 1000;
-    return this.entries.filter((e) => new Date(e.timestamp).getTime() >= cutoff);
+    // Newest-first for callers — entries are stored oldest-first (P-6).
+    return this.entries.filter((e) => new Date(e.timestamp).getTime() >= cutoff).reverse();
   }
 
   /** Count of entries currently stored. */
@@ -324,7 +331,18 @@ class MonitorStore {
       const raw = readFileSync(this.storePath, 'utf-8');
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        this.entries = parsed.slice(0, this.maxEntries);
+        // P-6: in-memory format is now oldest-first. Files written by older
+        // versions are newest-first — detect and reverse them, then keep the
+        // newest maxEntries (the tail of the oldest-first array).
+        if (
+          parsed.length > 1 &&
+          typeof parsed[0]?.timestamp === 'string' &&
+          typeof parsed[parsed.length - 1]?.timestamp === 'string' &&
+          parsed[0].timestamp > parsed[parsed.length - 1].timestamp
+        ) {
+          parsed.reverse();
+        }
+        this.entries = parsed.slice(-this.maxEntries);
       }
     } catch {
       this.entries = [];

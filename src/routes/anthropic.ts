@@ -18,6 +18,7 @@ import {
   acquireSessionWithCorrections,
   buildQwenMessages,
   createQwenStreamWithRetry,
+  detectCumulativeChunk,
   extractDeltaContent,
   getModelSpecs,
   handleImageModelFallback,
@@ -688,6 +689,7 @@ async function handleAnthropicStream(
       let localToolCallsAccum: any[] = [];
       let hasEmittedContent = false;
       let textBlockIndex = 0;
+      let streamInterrupted = false;
 
       const STREAM_IDLE_TIMEOUT = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60_000));
 
@@ -707,6 +709,20 @@ async function handleAnthropicStream(
         } catch (streamErr: any) {
           const errMsg = streamErr.message || 'Stream read error';
           logStore.log('warn', 'chat', `[Anthropic] ${errMsg} (logId=${logId})`);
+          streamInterrupted = true;
+          // Release upstream resources: abort the Qwen request and cancel the
+          // reader. Previously the idle-timeout/read-error path leaked both,
+          // leaving the upstream fetch running until it died naturally (M-3).
+          try {
+            qwenAbortController?.abort();
+          } catch {
+            /* non-blocking */
+          }
+          try {
+            streamReader?.cancel().catch(() => {});
+          } catch {
+            /* non-blocking */
+          }
           if (!streamReleased && streamWriter) {
             try {
               await streamWriter.write(
@@ -776,6 +792,11 @@ async function handleAnthropicStream(
           if (!deltaResult.foundStr || !deltaResult.vStr) continue;
 
           currentThoughtIndex = deltaResult.currentThoughtIndex;
+
+          // FINISHED sentinel: Qwen marks completion with a literal 'FINISHED'
+          // answer delta — never surface it as content (the OpenAI chat route
+          // filters it; this path previously leaked it to Claude Code) (M-1).
+          if (deltaResult.vStr === 'FINISHED') continue;
 
           // Handle thinking chunks — emit Anthropic thinking blocks
           if (deltaResult.isThinkingChunk) {
@@ -867,10 +888,18 @@ async function handleAnthropicStream(
             emittedTextBlock = true;
           }
 
+          // Qwen sometimes resends cumulative content — emit only the new delta
+          // so the client doesn't receive duplicated text and the XML tool-call
+          // parser doesn't see repeated blocks (M-2; the OpenAI path already
+          // dedups via detectCumulativeChunk).
+          const cumDetection = detectCumulativeChunk(deltaResult.vStr, lastFullContent);
+          const effectiveVStr = cumDetection.cumulative ? cumDetection.delta : deltaResult.vStr;
+          if (!effectiveVStr) continue;
+
           // Strip XML tool call artifacts from emitted text (Claude Code may
           // fall back to parsing tool calls from text content, and XML artifacts
           // can produce spurious tool calls or confuse the client).
-          const cleanedText = cleanTextOfXmlArtifacts(deltaResult.vStr).cleanedText || '';
+          const cleanedText = cleanTextOfXmlArtifacts(effectiveVStr).cleanedText || '';
 
           // Emit cleaned text delta to Claude Code
           await streamWriter.write(
@@ -882,11 +911,30 @@ async function handleAnthropicStream(
           );
 
           // Accumulate RAW text (with XML) for XML fallback tool call parsing
-          lastFullContent += deltaResult.vStr;
+          lastFullContent += effectiveVStr;
           logStore.addProcessedOutput(logId, cleanedText);
-          logStore.addRawChunk(logId, deltaResult.vStr);
+          logStore.addRawChunk(logId, effectiveVStr);
           hasEmittedContent = true;
         }
+      }
+
+      // Interrupted stream (idle timeout / read error): the error event and
+      // [DONE] were already written inside the loop. Do NOT emit success
+      // termination events — clients must not treat truncated content as a
+      // complete response (M-4).
+      if (streamInterrupted) {
+        logStore.addError(logId, 'Anthropic stream interrupted before completion');
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = {
+            finishReason: 'error',
+            toolCallCount: 0,
+            contentPreview: (lastFullContent || reasoningBuffer).substring(0, 500),
+          };
+        });
+        streamReleased = true;
+        logStore.finalizeRequest(logId, { finishReason: 'error' });
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        return;
       }
 
       // Stream ended — emit close events

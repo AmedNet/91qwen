@@ -135,6 +135,15 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           buffer: loopResult.buffer,
           enableContentFiltering,
           includeUsage: !!body.stream_options?.include_usage,
+          // "Empty" only when nothing visible reached the client: no content
+          // deltas, no accumulated raw text, no tool-call events and no
+          // reasoning. A pure tool-call response must NOT be treated as empty
+          // (finish_reason would flip from 'tool_calls' to 'stop').
+          isEmptyResponse:
+            !loopResult.contentEmitted &&
+            streamState.lastFullContent === '' &&
+            streamCtx.emittedToolCallCount === 0 &&
+            streamState.reasoningBuffer === '',
         },
         {
           reader,

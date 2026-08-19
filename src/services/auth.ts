@@ -263,16 +263,41 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
     const { BROWSER_DEFAULT_ARGS } = await import('./playwright.ts');
     const { launchPersistentContext } = await import('cloakbrowser');
     const PROFILE_LAUNCH_TIMEOUT_MS = 30_000;
-    context = await Promise.race([
-      launchPersistentContext({
-        userDataDir: profileDir,
-        headless: true,
-        args: [...BROWSER_DEFAULT_ARGS],
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Profile launch timed out after 30s')), PROFILE_LAUNCH_TIMEOUT_MS),
-      ),
-    ]);
+    // Promise.race does NOT cancel the loser: if the timeout fired while the
+    // launch was still pending, the browser would resolve later with no
+    // reference to it — an orphaned Chromium process per timed-out account.
+    // Keep the launch promise and close any late-arriving context.
+    const launchPromise = launchPersistentContext({
+      userDataDir: profileDir,
+      headless: true,
+      args: [...BROWSER_DEFAULT_ARGS],
+    });
+    let launchTimedOut = false;
+    let launchTimer: ReturnType<typeof setTimeout> | undefined;
+    launchPromise
+      .then((lateCtx: any) => {
+        if (launchTimedOut) {
+          lateCtx.close().catch(() => {
+            /* non-blocking */
+          });
+        }
+      })
+      .catch(() => {
+        /* handled by the race below */
+      });
+    try {
+      context = await Promise.race([
+        launchPromise,
+        new Promise<never>((_, reject) => {
+          launchTimer = setTimeout(() => {
+            launchTimedOut = true;
+            reject(new Error('Profile launch timed out after 30s'));
+          }, PROFILE_LAUNCH_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (launchTimer) clearTimeout(launchTimer);
+    }
 
     try {
       let cookies = await context.cookies();

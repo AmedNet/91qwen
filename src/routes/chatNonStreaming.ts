@@ -1,4 +1,5 @@
 import { Context } from 'hono';
+import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { detectParallelToolLoop } from '../tools/guard.ts';
@@ -391,18 +392,58 @@ export async function handleNonStreamingRequest(ctx: NonStreamingContext): Promi
   let nonStreamReleased = false;
   let logFinalized = false;
 
+  // Same idle protection as the streaming path (streamLoop.ts): race each
+  // read against STREAM_IDLE_TIMEOUT_MS. Without it, a silent upstream stall
+  // after the first byte would hang this request — and its session-pool
+  // slot / account quota — forever.
+  const idleTimeoutMs = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60_000));
+
   try {
-    while (true) {
-      const { done, value } = await state.reader.read();
-      if (done) break;
+    try {
+      while (true) {
+        let idleTimer: ReturnType<typeof setTimeout> | undefined;
+        let readResult: Awaited<ReturnType<typeof state.reader.read>>;
+        try {
+          readResult = await Promise.race([
+            state.reader.read(),
+            new Promise<never>((_, reject) => {
+              idleTimer = setTimeout(
+                () => reject(new Error(`Upstream stream idle timeout — no data for ${idleTimeoutMs / 1000}s`)),
+                idleTimeoutMs,
+              );
+            }),
+          ]);
+        } finally {
+          if (idleTimer) clearTimeout(idleTimer);
+        }
+        if (readResult.done) break;
 
-      state.buffer += state.decoder.decode(value, { stream: true });
-      const lines = state.buffer.split('\n');
-      state.buffer = lines.pop() || '';
+        state.buffer += state.decoder.decode(readResult.value, { stream: true });
+        const lines = state.buffer.split('\n');
+        state.buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        parseQwenResponse(line, state, ctx);
+        for (const line of lines) {
+          parseQwenResponse(line, state, ctx);
+        }
       }
+    } catch (readErr) {
+      // Idle timeout or read failure: surface a retryable upstream error
+      // instead of hanging. The outer finally still cancels the reader,
+      // releases the session and finalizes the log entry.
+      const msg = readErr instanceof Error ? readErr.message : String(readErr);
+      logStore.addError(ctx.logId, msg);
+      return ctx.c.json(
+        {
+          error: {
+            message: msg,
+            type: 'server_error',
+            code: 'stream_idle_timeout',
+            retryable: true,
+            retry_after_ms: 3000,
+          },
+        },
+        504,
+      );
     }
 
     nonStreamReleased = true;

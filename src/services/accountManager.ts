@@ -170,9 +170,17 @@ export function encrypt(plaintext: string): string {
 }
 
 export function decrypt(encryptedText: string): string {
-  const parts = encryptedText.split(':');
-  if (parts.length !== 3) return encryptedText;
-  const [ivHex, authTagHex, encrypted] = parts;
+  // Encrypted format: iv(16B→32 hex) : authTag(16B→32 hex) : ciphertext(hex).
+  // Anything that does not match this pattern is a LEGACY PLAINTEXT password
+  // from pre-encryption accounts.json — return it as-is so old files keep
+  // loading (it gets re-encrypted on the next saveAccountsToFile). The old
+  // `parts.length !== 3` check was unsafe: a plaintext password containing
+  // two colons (e.g. "a:b:c") would be misrouted into decryption and come
+  // back as '' — silently destroying the account's password.
+  if (!/^[0-9a-f]{32}:[0-9a-f]{32}:[0-9a-f]+$/i.test(encryptedText)) {
+    return encryptedText;
+  }
+  const [ivHex, authTagHex, encrypted] = encryptedText.split(':');
   try {
     const key = deriveKey(getEncryptionKey());
     const iv = Buffer.from(ivHex, 'hex');
@@ -217,7 +225,11 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
     .filter((a) => a.password)
     .map((a) => ({
       email: a.email,
-      password: a.password,
+      // Encrypt at persistence time (AES-256-GCM). The in-memory entry keeps
+      // the plaintext password — it is still needed for interactive re-login.
+      // Legacy plaintext files migrate transparently: decryptPassword() passes
+      // non-encrypted values through, and they get re-encrypted on next save.
+      password: encryptPassword(a.password),
       ...(a.throttledUntil > Date.now() ? { throttledUntil: a.throttledUntil } : {}),
       ...(a.disabled !== undefined ? { disabled: a.disabled } : {}),
       ...(a.state ? { state: { token: a.state.token, refreshToken: a.state.refreshToken, expiresAt: a.state.expiresAt } } : {}),
@@ -505,8 +517,13 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
     );
     picked.lastUsed = Date.now();
     picked.inFlight++;
-    // Safety valve: reset if counter drifts unreasonably high
-    if (picked.inFlight > 20) picked.inFlight = 0;
+    // Safety valve: a counter this high indicates an inFlight leak somewhere
+    // (unreleased slots). Log loudly instead of silently resetting, which
+    // used to mask the leak; clamp to 1 (this request's own slot).
+    if (picked.inFlight > 20) {
+      logStore.log('warn', 'auth', `[Account] inFlight drift for ${picked.email} (${picked.inFlight}) — possible slot leak, clamping to 1`);
+      picked.inFlight = 1;
+    }
     return picked;
   } catch (err: any) {
     logStore.log('error', 'auth', 'pickAccount error:', err);
@@ -544,8 +561,15 @@ export function throttleAccount(email: string, durationMs?: number): void {
   const cooldown = durationMs || config.getInt('RATE_LIMIT_COOLDOWN_MS', 120000);
   acct.throttledUntil = Date.now() + cooldown;
   const unlockTime = new Date(acct.throttledUntil).toISOString();
-  const hours = Math.ceil(cooldown / 3600000);
-  logStore.log('warn', 'auth', `Throttled ${email} — unlocks at ${unlockTime} (${hours}h)`);
+  // Human-readable duration — the old `Math.ceil(cooldown / 3600000)` printed
+  // "(1h)" even for 30-second cooldowns, which misled debugging.
+  const durationLabel =
+    cooldown >= 3600000
+      ? `${Math.ceil(cooldown / 3600000)}h`
+      : cooldown >= 60000
+        ? `${Math.ceil(cooldown / 60000)}m`
+        : `${Math.ceil(cooldown / 1000)}s`;
+  logStore.log('warn', 'auth', `Throttled ${email} — unlocks at ${unlockTime} (${durationLabel})`);
   // Persist so restart respects the cooldown
   saveAccountsToFile(accounts);
 }

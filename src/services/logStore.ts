@@ -175,11 +175,13 @@ export class RequestLogStore extends SystemLogger {
       },
       errors: [],
     };
-    this.entries.unshift(entry);
+    // P-6: append (O(1)) instead of unshift (O(n) per insert). Entries are
+    // stored oldest-first; readers (getRecent/getAll) reverse on the way out.
+    this.entries.push(entry);
     this.entryMap.set(entry.id, entry);
     const maxEntries = this.maxEntries;
     if (this.entries.length > maxEntries) {
-      const removed = this.entries.pop();
+      const removed = this.entries.shift();
       if (removed) this.entryMap.delete(removed.id);
     }
     return entry;
@@ -228,10 +230,12 @@ export class RequestLogStore extends SystemLogger {
     });
   }
   getRecent(count = 20): LogEntry[] {
-    return this.entries.slice(0, count);
+    // Newest-first for callers (SSE replay, /log/json) — see P-6.
+    return this.entries.slice(-count).reverse();
   }
   getAll(): LogEntry[] {
-    return this.entries;
+    // Newest-first copy; callers never mutate the internal array.
+    return this.entries.slice().reverse();
   }
   setNetworkTiming(id: string, timing: LogEntry['networkTiming']): void {
     this.updateEntry(id, (entry) => {

@@ -1,11 +1,11 @@
 import crypto from 'node:crypto';
 import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
-import { decrementInFlight, getTokenWithAccount, pickAccount, setAccountDisabled, throttleAccount } from './auth.ts';
+import { getTokenWithAccount, pickAccount, setAccountDisabled, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
-import { completeEntry, errorEntry, recordStreamChunk } from './networkDebug.ts';
+import { completeEntry, createNetworkEntry, errorEntry, recordResponse, recordStreamChunk } from './networkDebug.ts';
 import { logQwenRequest, logQwenResponse, logQwenSSE } from './qwenLogger.ts';
 
 export { configureAccount, deleteAllChats, fetchQwenModels } from './qwenModels.ts';
@@ -162,68 +162,10 @@ export function createFetchTimeout(): { controller: AbortController; cleanup: ()
   return { controller, cleanup: () => {} };
 }
 
-function buildRequestHeaders(reqHeaders: Record<string, string>, cId?: string): Record<string, string> {
-  const bxUmidtoken =
-    reqHeaders['bx-umidtoken'] ||
-    crypto
-      .createHash('sha256')
-      .update(reqHeaders['cookie'] || `anon-${Date.now()}`)
-      .digest('hex')
-      .slice(0, 64);
-  const bxUa =
-    reqHeaders['bx-ua'] ||
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
-  return {
-    accept: 'application/json, text/plain, */*',
-    'accept-language': 'pt-BR,pt;q=0.9,en;q=0.5',
-    'content-type': 'application/json',
-    source: 'web',
-    cookie: reqHeaders['cookie'],
-    origin: QWEN_API_BASE,
-    referer: cId ? `https://chat.qwen.ai/c/${cId}` : 'https://chat.qwen.ai/',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    // Client hints — critical for WAF bypass. Real Chrome sends these automatically,
-    // but Node.js fetch() doesn't. Adding them manually tells the WAF this is a
-    // real browser request.
-    'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not?A_Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    timezone: cachedTimezone,
-    'user-agent':
-      reqHeaders['user-agent'] ||
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
-    'x-accel-buffering': 'no',
-    'x-request-id': crypto.randomUUID(),
-    'bx-ua': bxUa,
-    'bx-umidtoken': bxUmidtoken,
-    'bx-v': reqHeaders['bx-v'] || QWEN_BX_V,
-  };
-}
-
-const lastRequestTime = new Map<string, number>();
-async function applyRequestJitter(accountEmail?: string): Promise<void> {
-  if (!accountEmail) return;
-  const now = Date.now();
-  const last = lastRequestTime.get(accountEmail) || 0;
-  const elapsed = now - last;
-
-  // Minimum gap between requests from the same account (1-3 seconds)
-  const minGap = 1000 + Math.random() * 2000;
-  if (elapsed < minGap) {
-    const wait = minGap - elapsed + Math.random() * 500;
-    await new Promise((r) => setTimeout(r, wait));
-  }
-
-  // Occasional longer pause (10% chance of 2-5s delay — simulates user reading/thinking)
-  if (Math.random() < 0.1) {
-    const pause = 2000 + Math.random() * 3000;
-    await new Promise((r) => setTimeout(r, pause));
-  }
-
-  lastRequestTime.set(accountEmail, Date.now());
-}
+// NOTE: buildRequestHeaders() and applyRequestJitter() were removed — they
+// were dead code (never called; makeRequest builds its own headers inline).
+// If inter-request jitter is ever needed again, wire it into createQwenStream
+// explicitly rather than leaving an unwired helper.
 
 const qwenCircuitBreaker = new CircuitBreaker('qwen-api', {
   // In CDP mode, first requests per context can take longer (baxia warmup).
@@ -344,8 +286,12 @@ export async function createQwenStream(
             const nextAccount = await pickAccount(currentAccountEmail);
             if (nextAccount) {
               currentAccountEmail = nextAccount.email;
-              decrementInFlight(nextAccount.email);
-            } else if (!nextAccount) {
+              // Do NOT decrementInFlight here: pickAccount already incremented
+              // the slot for the new account. Releasing it immediately would let
+              // concurrent requests pick the same account and trigger upstream
+              // "chat is in progress". The slot is released by the normal
+              // request-end release path.
+            } else {
               throw new QwenUpstreamError(`All accounts rate-limited. ${details}.${wait}`, code, 429);
             }
           }
@@ -391,7 +337,11 @@ export async function createQwenStream(
         if (
           parseOrRetryError instanceof RetryableQwenStreamError ||
           parseOrRetryError instanceof QwenUpstreamError ||
-          parseOrRetryError instanceof CaptchaSolvedError
+          parseOrRetryError instanceof CaptchaSolvedError ||
+          // Must be rethrown: callers rely on `instanceof CaptchaRequiredError`
+          // to surface CAPTCHA failures to the downstream client. Swallowing it
+          // here would downgrade it to a generic UpstreamStatusError below.
+          parseOrRetryError instanceof CaptchaRequiredError
         ) {
           throw parseOrRetryError;
         }
@@ -422,13 +372,30 @@ export async function createQwenStream(
     // Browserless path: impers worker for TLS/HTTP2 impersonation, cookie from account manager
     const tokenInfo = currentAccountEmail ? await getTokenWithAccount(currentAccountEmail) : null;
     const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-    const tokenPreview = cookieStr ? cookieStr.substring(0, 20) + '...' : 'none';
 
     logStore.log(
       'debug',
       'qwen',
       `[Qwen] Fetch POST ${url.substring(0, 100)} account=${currentAccountEmail || '?'} token_len=${cookieStr.length} payload_len=${bodyStr.length}`,
     );
+
+    // ── Network debug instrumentation ────────────────────────────
+    // Previously lastDebugEntryId was never assigned, so recordStreamChunk /
+    // completeEntry below were silent no-ops and the dashboard Network page
+    // showed no Qwen upstream traffic. Create one entry per attempt.
+    try {
+      const debugEntry = createNetworkEntry({
+        url,
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: cookieStr },
+        body: payload,
+        category: 'chat',
+        accountEmail: currentAccountEmail,
+      });
+      lastDebugEntryId = debugEntry.id;
+    } catch {
+      /* debug instrumentation is best-effort */
+    }
 
     // ── TTFB instrumentation ─────────────────────────────────────
     const tFetchStart = Date.now();
@@ -467,6 +434,7 @@ export async function createQwenStream(
       transport: config.getBool('FAST_TRANSPORT', true) ? 'plain' : 'wreq',
       signal: composedSignal,
     });
+    if (lastDebugEntryId) recordResponse(lastDebugEntryId, response);
     logStore.log(
       'debug',
       'qwen',
@@ -522,6 +490,18 @@ export async function createQwenStream(
       const body = response.body;
       if (body && typeof body.cancel === 'function') {
         body.cancel().catch(() => {});
+      }
+      // Also close the transport session directly: when the body is cancelled
+      // the downstream pipeThrough cancel hook may not fire (e.g. consumer
+      // never attached). _wreqClose implementations are idempotent no-ops or
+      // safe to call twice with the wrappedStream cancel path.
+      const wc = (response as any)._wreqClose;
+      if (typeof wc === 'function') {
+        try {
+          wc();
+        } catch {
+          /* best-effort */
+        }
       }
       logStore.log(
         'debug',
@@ -597,6 +577,19 @@ export async function createQwenStream(
   const streamDebugEntryId = lastDebugEntryId;
   const textDecoder = new TextDecoder();
   const wreqClose = (result.response as any)._wreqClose as (() => void) | undefined;
+  // Idempotent close guard: flush() only runs when the stream is fully
+  // consumed; on downstream cancel/abort we close via the transformer's
+  // cancel() hook, and attempt-cleanup may also fire — never double-close.
+  let wreqClosed = false;
+  const closeWreqOnce = () => {
+    if (wreqClosed) return;
+    wreqClosed = true;
+    try {
+      wreqClose?.();
+    } catch (closeErr) {
+      logCrash('qwen.stream.close', closeErr, { accountEmail: currentAccountEmail });
+    }
+  };
 
   // ── SSE timing instrumentation ────────────────────────────────
   // Diagnostic: log first-byte latency, gaps between SSE events, and
@@ -622,12 +615,16 @@ export async function createQwenStream(
 
   const wrappedStream = result.response.body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
+      transform(chunk: Uint8Array, controller: TransformStreamDefaultController<Uint8Array>) {
+        // Decode ONCE per chunk: TextDecoder in { stream: true } mode is
+        // stateful — decoding the same bytes twice would corrupt multi-byte
+        // characters split across chunk boundaries.
+        const decoded = textDecoder.decode(chunk, { stream: true });
         if (streamDebugEntryId) {
-          recordStreamChunk(streamDebugEntryId, textDecoder.decode(chunk, { stream: true }));
+          recordStreamChunk(streamDebugEntryId, decoded);
         }
         // SSE event-boundary timing. Each `data: ...\n\n` block is one event.
-        sseBuffer += textDecoder.decode(chunk, { stream: true });
+        sseBuffer += decoded;
         let nlIdx: number;
         while ((nlIdx = sseBuffer.indexOf('\n\n')) !== -1) {
           const block = sseBuffer.slice(0, nlIdx);
@@ -675,13 +672,27 @@ export async function createQwenStream(
           logQwenSSE(makeRequestQwenLogFile, sseEventCount, 0, []);
         }
         try {
-          wreqClose?.();
+          closeWreqOnce();
           logSessionClose('qwen.stream.flush');
         } catch (closeErr) {
           logCrash('qwen.stream.flush', closeErr, { accountEmail: currentAccountEmail });
         }
       },
-    }),
+      cancel() {
+        // Downstream consumer cancelled/aborted — flush() does NOT run in
+        // this case, so close the transport session here to avoid leaking
+        // wreq sessions (previously wreqClose was only called from flush()).
+        try {
+          closeWreqOnce();
+          logSessionClose('qwen.stream.cancel');
+        } catch (closeErr) {
+          logCrash('qwen.stream.cancel', closeErr, { accountEmail: currentAccountEmail });
+        }
+      },
+      // The WHATWG streams spec permits an optional cancel() on transformers,
+      // but the bundled TS `Transformer` type omits it — cast the object so
+      // the cancel hook still registers at runtime (Bun supports it).
+    } as unknown as Transformer<Uint8Array, Uint8Array>),
   );
   return {
     stream: wrappedStream,

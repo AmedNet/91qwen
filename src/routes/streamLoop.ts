@@ -1,3 +1,6 @@
+import { writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls } from '../tools/xmlToolParser.ts';
@@ -6,13 +9,11 @@ import { filterContentPipeline, processStreamData, type StreamProcessingCtx, typ
 import { checkFinalAmplification, scheduleCleanup } from './cleanupHelpers.ts';
 import { buildChunkEvent, buildErrorEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent } from './writeHelpers.ts';
 
-/** Shared TextDecoder — stateless, safe to reuse across streams */
-export const sharedDecoder = new TextDecoder();
-
 export interface StreamLoopResult {
   buffer: string;
   nextParentId: string | null;
   error?: string;
+  contentEmitted: boolean;
 }
 
 export async function runStreamLoop(
@@ -25,6 +26,12 @@ export async function runStreamLoop(
 ): Promise<StreamLoopResult> {
   let streamDone = false;
   let nextParentId = streamState.nextParentId;
+  let contentEmitted = false;
+  // TextDecoder in { stream: true } mode is STATEFUL: it buffers partial
+  // multi-byte sequences between decode() calls. A module-level shared decoder
+  // would leak half-decoded characters across concurrent streams (garbled CJK
+  // output). Create one decoder per stream instead.
+  const decoder = new TextDecoder();
 
   while (true) {
     if (streamDone) break;
@@ -56,13 +63,13 @@ export async function runStreamLoop(
     } catch (timeoutErr) {
       if (idleTimer) clearTimeout(idleTimer);
       if (!idleTimedOut) await reader.cancel();
-      return { buffer: bufferRef.text, nextParentId, error: (timeoutErr as Error).message };
+      return { buffer: bufferRef.text, nextParentId, error: (timeoutErr as Error).message, contentEmitted };
     }
     if (idleTimer) clearTimeout(idleTimer);
     if (readResult.done) break;
     if (readResult.value) ampState.rawInputBytes += readResult.value.length;
 
-    const rawDecoded = sharedDecoder.decode(readResult.value, { stream: true });
+    const rawDecoded = decoder.decode(readResult.value, { stream: true });
     bufferRef.text += rawDecoded;
     const lines = bufferRef.text.split('\n');
     bufferRef.text = lines.pop() || '';
@@ -81,9 +88,13 @@ export async function runStreamLoop(
         const chunk = JSON.parse(dataStr);
 
         const result = await processStreamData(chunk, streamState, streamCtx);
-        if (result === 'break_stream') {
+        if (result.result === 'break_stream') {
           streamDone = true;
           break;
+        }
+        // Track whether any real content (not just thinking/keep-alive) was emitted
+        if (result.contentDeltaEmitted) {
+          contentEmitted = true;
         }
       } catch (e) {
         console.error('[Chat] Streaming: parse error on chunk, ignoring partial:', (e as Error)?.message, 'raw:', dataStr.slice(0, 200));
@@ -92,7 +103,7 @@ export async function runStreamLoop(
     nextParentId = streamState.nextParentId;
   }
 
-  return { buffer: bufferRef.text, nextParentId };
+  return { buffer: bufferRef.text, nextParentId, contentEmitted };
 }
 
 export async function handlePostStreamCompletion(
@@ -108,6 +119,7 @@ export async function handlePostStreamCompletion(
     buffer: string;
     enableContentFiltering: boolean;
     includeUsage: boolean;
+    isEmptyResponse?: boolean;
   },
   cleanup: {
     reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -137,7 +149,8 @@ export async function handlePostStreamCompletion(
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
       try {
-        require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
+        // os.tmpdir() — '/tmp' does not exist on Windows
+        writeFileSync(join(tmpdir(), 'qwen-error-buffer.json'), buffer.slice(0, 10000));
       } catch (e) {}
       const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
       await writeEvent(
@@ -155,6 +168,35 @@ export async function handlePostStreamCompletion(
       logStore.updateEntry(logId, (entry) => {
         entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
         entry.finalResponse.finishReason = 'upstream_error';
+      });
+      logStore.finalizeRequest(logId);
+      return;
+    }
+
+    // ── Empty-response detection ──────────────────────────────────
+    // Upstream returned a valid SSE stream (HTTP 200, no error payload) but
+    // produced zero content events. This is an intentional silence, not an
+    // error. Signal it with "efficiency_score: 0.0" so downstream clients
+    // (Claude Code etc.) do NOT re-issue the same request.
+    if (args.isEmptyResponse) {
+      logStore.log('debug', 'stream', `[Chat] Empty response detected for ${logId} — signaling with efficiency_score: 0.0`);
+      await writeEvent(
+        streamWriter,
+        buildChunkEvent(completionId, model, [makeChoice({ content: '', efficiency_score: 0.0 })]),
+      );
+      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'stop')]));
+      await streamWriter.write('data: [DONE]\n\n');
+      // Per operator decision empty responses are counted as ERRORS in
+      // monitoring so they don't inflate success rates: addError makes
+      // finalizeRequest record success=false, and the distinct finishReason
+      // keeps them identifiable on the dashboard. The client-facing protocol
+      // stays "stop" + efficiency_score 0.0 so downstream clients do not retry.
+      logStore.addError(logId, 'Empty response: upstream stream finished without emitting any content');
+      logStore.updateEntry(logId, (entry) => {
+        entry.finalResponse = entry.finalResponse || { finishReason: 'empty_response', toolCallCount: 0, contentPreview: '' };
+        entry.finalResponse.finishReason = 'empty_response';
+        entry.finalResponse.contentPreview = '(empty response)';
+        entry.remainingText = '';
       });
       logStore.finalizeRequest(logId);
       return;
