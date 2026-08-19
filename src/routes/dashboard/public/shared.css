@@ -103,7 +103,8 @@ html {
 }
 
 @keyframes pulse-glow {
-  0%, 100% {
+  0%,
+  100% {
     box-shadow: 0 0 20px rgba(94, 157, 92, 0.3);
   }
   50% {

@@ -305,11 +305,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       // policy. Do NOT cycle through accounts; each one is just as likely
       // to hit the same WAF challenge.
       if (err instanceof CaptchaRequiredError) {
-        logStore.log(
-          'warn',
-          'chat',
-          `[Chat] CAPTCHA challenge on ${resolvedEmail || '?'} — surfacing to client: ${err.message}`,
-        );
+        logStore.log('warn', 'chat', `[Chat] CAPTCHA challenge on ${resolvedEmail || '?'} — surfacing to client: ${err.message}`);
         throw new Error(`Qwen CAPTCHA required — please retry shortly. ${err.message}`);
       }
 
@@ -321,10 +317,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         throw err;
       }
 
-      if (
-        (err.message || '').includes('CAPTCHA') ||
-        err instanceof RetryableQwenStreamError
-      ) {
+      if ((err.message || '').includes('CAPTCHA') || err instanceof RetryableQwenStreamError) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
         if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);

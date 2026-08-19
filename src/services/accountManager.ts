@@ -502,10 +502,7 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
     for (let i = 1; i < candidates.length; i++) {
       const a = candidates[i];
       const b = candidates[bestIdx];
-      if (
-        a.totalRequests < b.totalRequests ||
-        (a.totalRequests === b.totalRequests && (a.lastUsed || 0) < (b.lastUsed || 0))
-      ) {
+      if (a.totalRequests < b.totalRequests || (a.totalRequests === b.totalRequests && (a.lastUsed || 0) < (b.lastUsed || 0))) {
         bestIdx = i;
       }
     }

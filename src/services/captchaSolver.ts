@@ -13,7 +13,7 @@
 
 import { launchPersistentContext } from 'cloakbrowser';
 import type { Cookie } from 'playwright';
-import { getProfileDir, BROWSER_DEFAULT_ARGS } from './browserProfiles.ts';
+import { BROWSER_DEFAULT_ARGS, getProfileDir } from './browserProfiles.ts';
 import { logStore } from './logStore.ts';
 
 export interface SolveCaptchaOptions {

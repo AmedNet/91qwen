@@ -500,11 +500,7 @@ async function setupAnthropicSession(
       }
       // CaptchaRequiredError: solver was bypassed — surface to the client.
       if (err instanceof CaptchaRequiredError) {
-        logStore.log(
-          'warn',
-          'chat',
-          `[Anthropic] CAPTCHA challenge on ${resolvedEmail || '?'} — surfacing to client: ${err.message}`,
-        );
+        logStore.log('warn', 'chat', `[Anthropic] CAPTCHA challenge on ${resolvedEmail || '?'} — surfacing to client: ${err.message}`);
         throw new Error(`Qwen CAPTCHA required — please retry shortly. ${err.message}`);
       }
       // 暂时注释掉 FAIL_SYS_USER_VALIDATE 判断，避免误判
@@ -526,10 +522,7 @@ async function setupAnthropicSession(
         throw err;
       }
 
-      if (
-        (err.message || '').includes('CAPTCHA') ||
-        err instanceof RetryableQwenStreamError
-      ) {
+      if ((err.message || '').includes('CAPTCHA') || err instanceof RetryableQwenStreamError) {
         logStore.log('warn', 'chat', `[Anthropic]   -> CAPTCHA/validation, throttling + trying next`);
         lastFailedEmail = resolvedEmail;
         lastError = err;

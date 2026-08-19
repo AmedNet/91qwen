@@ -45,9 +45,7 @@ describe('buildQwenMessages tool visibility', () => {
       {
         role: 'assistant',
         content: null,
-        tool_calls: [
-          { id: 'call_xyz', type: 'function', function: { name: 'Read', arguments: '{"file_path":"/tmp/a.ts"}' } },
-        ],
+        tool_calls: [{ id: 'call_xyz', type: 'function', function: { name: 'Read', arguments: '{"file_path":"/tmp/a.ts"}' } }],
       },
       { role: 'tool', tool_call_id: 'call_xyz', content: 'export const x = 1;' },
     ];

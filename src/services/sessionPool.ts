@@ -79,7 +79,11 @@ export class SessionPool {
       try {
         const { swept } = this.sweepStuckSessions();
         if (swept.length > 0) {
-          logStore.log('warn', 'pool', `Sweeper released ${swept.length} stuck session(s): ${swept.map((c) => c.substring(0, 8)).join(', ')}`);
+          logStore.log(
+            'warn',
+            'pool',
+            `Sweeper released ${swept.length} stuck session(s): ${swept.map((c) => c.substring(0, 8)).join(', ')}`,
+          );
         }
       } catch (err: any) {
         logStore.log('debug', 'pool', `Sweeper error: ${err.message}`);

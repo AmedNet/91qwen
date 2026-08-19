@@ -363,7 +363,9 @@ export async function createQwenStream(
   let qwenResponseHeaders: Record<string, string> = {};
   let qwenResponsePreview = '';
   let sseEventCount = 0;
-  const makeRequest = async (attemptSignal?: AbortSignal): Promise<{ response: Response; headers: Record<string, string>; qwenLogFile?: string }> => {
+  const makeRequest = async (
+    attemptSignal?: AbortSignal,
+  ): Promise<{ response: Response; headers: Record<string, string>; qwenLogFile?: string }> => {
     const bodyStr = JSON.stringify(payload);
     if (config.get('SAVE_REQUEST_LOGS') === 'true') {
       makeRequestQwenLogFile = logQwenRequest(payload, url);
@@ -402,9 +404,7 @@ export async function createQwenStream(
 
     // Compose streamAbortController.signal (created at function entry for client cancel) with the
     // per-attempt signal (from withRetry's attemptTimeoutMs). Either source aborts the fetch.
-    const composedSignal = attemptSignal
-      ? composeAbortSignals(streamAbortController.signal, attemptSignal)
-      : streamAbortController.signal;
+    const composedSignal = attemptSignal ? composeAbortSignals(streamAbortController.signal, attemptSignal) : streamAbortController.signal;
 
     const response = await browserlessFetch(url, {
       method: 'POST',
@@ -642,12 +642,20 @@ export async function createQwenStream(
           }
           if (kind === 'content' && firstContentMs === 0) {
             firstContentMs = now - sseStartMs;
-            logStore.log('debug', 'qwen-timing', `first real content after ${firstContentMs}ms (acct=${currentAccountEmail?.split('@')[0] || '?'})`);
+            logStore.log(
+              'debug',
+              'qwen-timing',
+              `first real content after ${firstContentMs}ms (acct=${currentAccountEmail?.split('@')[0] || '?'})`,
+            );
           }
           // Warn on gaps > 5s — the upstream is stalling
           if (gap > 5000 && sseEvents.total > 1) {
             if (now - lastGapWarnMs > 30000) {
-              logStore.log('warn', 'qwen-timing', `SSE gap ${gap}ms (kind=${kind}, event#${sseEvents.total}, acct=${currentAccountEmail?.split('@')[0] || '?'}, elapsed=${now - sseStartMs}ms)`);
+              logStore.log(
+                'warn',
+                'qwen-timing',
+                `SSE gap ${gap}ms (kind=${kind}, event#${sseEvents.total}, acct=${currentAccountEmail?.split('@')[0] || '?'}, elapsed=${now - sseStartMs}ms)`,
+              );
               lastGapWarnMs = now;
             }
           }

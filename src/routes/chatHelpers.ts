@@ -179,9 +179,8 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
             const call = prevMsg.tool_calls.find((tc: any) => tc.id === msg.tool_call_id);
             if (call) {
               toolName = toolName || call.function?.name;
-              toolCallArgs = typeof call.function?.arguments === 'string'
-                ? call.function.arguments
-                : JSON.stringify(call.function?.arguments || {});
+              toolCallArgs =
+                typeof call.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function?.arguments || {});
               callFound = true;
               break;
             }

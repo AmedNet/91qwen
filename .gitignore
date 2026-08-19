@@ -94,3 +94,6 @@ token-usage-output.txt
 .auth/
 .cortexkit/
 test-*.ts
+
+# Test output
+test_out.txt

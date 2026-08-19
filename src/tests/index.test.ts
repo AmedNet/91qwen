@@ -831,4 +831,3 @@ test('CAPTCHA: returns APIError to client immediately (no interactive solver)', 
     globalThis.fetch = originalFetch;
   }
 });
-

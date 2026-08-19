@@ -34,7 +34,9 @@ export interface RetryConfig {
   onAttemptDiscarded?: (result: unknown, error: unknown) => void;
 }
 
-function getDefaultRetryConfig(): Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & { onAttemptDiscarded?: (result: unknown, error: unknown) => void } {
+function getDefaultRetryConfig(): Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & {
+  onAttemptDiscarded?: (result: unknown, error: unknown) => void;
+} {
   return {
     maxRetries: 3,
     baseDelayMs: 500,
@@ -46,7 +48,9 @@ function getDefaultRetryConfig(): Required<Omit<RetryConfig, 'onAttemptDiscarded
   };
 }
 
-const DEFAULT_CONFIG: Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & { onAttemptDiscarded?: (result: unknown, error: unknown) => void } = getDefaultRetryConfig();
+const DEFAULT_CONFIG: Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & {
+  onAttemptDiscarded?: (result: unknown, error: unknown) => void;
+} = getDefaultRetryConfig();
 
 export class NonRetryableError extends Error {
   constructor(message: string) {
@@ -286,12 +290,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  signal?: AbortSignal,
-  abortController?: AbortController,
-): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal, abortController?: AbortController): Promise<T> {
   if (timeoutMs <= 0) return promise;
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -303,11 +302,17 @@ function withTimeout<T>(
       // exposes an .abort() (e.g. Bun), in others it doesn't — the controller path always
       // works because we create it ourselves in withRetry.
       if (abortController && !abortController.signal.aborted) {
-        try { abortController.abort(new Error(`Attempt timed out after ${timeoutMs}ms`)); } catch { /* ignore */ }
+        try {
+          abortController.abort(new Error(`Attempt timed out after ${timeoutMs}ms`));
+        } catch {
+          /* ignore */
+        }
       } else if (signal && !signal.aborted) {
         try {
           (signal as unknown as { abort?: (reason?: unknown) => void }).abort?.(new Error(`Attempt timed out after ${timeoutMs}ms`));
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
       reject(new AttemptTimeoutError(timeoutMs));
     }, timeoutMs);
@@ -342,10 +347,7 @@ export function getRetryConfigFromEnv(): Required<Omit<RetryConfig, 'onAttemptDi
   return { ...DEFAULT_CONFIG, ...envConfig };
 }
 
-export async function withRetry<T>(
-  fn: (attemptSignal: AbortSignal) => Promise<T>,
-  config?: RetryConfig,
-): Promise<T> {
+export async function withRetry<T>(fn: (attemptSignal: AbortSignal) => Promise<T>, config?: RetryConfig): Promise<T> {
   const cfg: Required<Omit<RetryConfig, 'onAttemptDiscarded'>> & { onAttemptDiscarded?: (result: unknown, error: unknown) => void } = {
     ...DEFAULT_CONFIG,
     ...getRetryConfigFromEnv(),

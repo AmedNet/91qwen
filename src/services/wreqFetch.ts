@@ -147,7 +147,9 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ id: reqId }),
-        }).catch(() => { /* worker may have already moved on */ });
+        }).catch(() => {
+          /* worker may have already moved on */
+        });
       };
       sig.addEventListener('abort', onAbort, { once: true });
       abortWorkerOnSignal = () => sig.removeEventListener('abort', onAbort);

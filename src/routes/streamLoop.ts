@@ -180,10 +180,7 @@ export async function handlePostStreamCompletion(
     // (Claude Code etc.) do NOT re-issue the same request.
     if (args.isEmptyResponse) {
       logStore.log('debug', 'stream', `[Chat] Empty response detected for ${logId} — signaling with efficiency_score: 0.0`);
-      await writeEvent(
-        streamWriter,
-        buildChunkEvent(completionId, model, [makeChoice({ content: '', efficiency_score: 0.0 })]),
-      );
+      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: '', efficiency_score: 0.0 })]));
       await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'stop')]));
       await streamWriter.write('data: [DONE]\n\n');
       // Per operator decision empty responses are counted as ERRORS in
