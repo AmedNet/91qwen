@@ -190,7 +190,7 @@ accountsRouter.get('/:email/password', async (c) => {
     if (!account) return c.json({ error: { message: `Account ${email} not found` } }, 404);
     if (!account.password) return c.json({ error: { message: 'No password stored' } }, 400);
     return c.json({ email: account.email, password: account.password });
-  } catch (err: any) {
+  } catch  {
     return c.json({ error: { message: 'Failed' } }, 500);
   }
 });

@@ -60,8 +60,25 @@ export interface BuildQwenMessagesResult {
 // ── Business logic ───────────────────────────────────────────────
 
 export function buildQwenMessages(messages: any[], body: any, availableTokens: number, _toolCalling: boolean): BuildQwenMessagesResult {
+  console.error('[PROBE-SRC] buildQwenMessages called; model=' + body.model + ' tools=' + (body.tools?.length || 0));
   const timestamp = Math.floor(Date.now() / 1000);
   const model = (body.model || '').replace('-no-thinking', '');
+
+  // ── Proxy mode (Plan F) ──────────────────────────────────────────
+  // no-thinking models with tool definitions trigger a Qwen upstream refusal
+  // when the request carries accumulated XML tool history (the protocol
+  // expects structured function_calls on history turns). Rather than fight
+  // the upstream, we synthesize the prior tool turns into natural-language
+  // summaries for the upstream — the model still has tools available this
+  // turn (via system prompt), and XML tool_call generation still works for
+  // the CURRENT response, but historical tool turns become plain prose so
+  // upstream sees a clean user/assistant text log.
+  const isProxyMode =
+    !!body.tools &&
+    Array.isArray(body.tools) &&
+    body.tools.length > 0 &&
+    (body.thinkingLevel === 'off' || (body.model || '').includes('-no-thinking'));
+  console.error('[PROBE-SRC] isProxyMode=' + isProxyMode + ' thinkingLevel=' + body.thinkingLevel);
 
   const segments: string[] = [];
   const systemParts: string[] = [];
@@ -134,28 +151,53 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
     } else if (msg.role === 'assistant') {
       let assistantContent = contentStr || '';
       const reasoning = msg.reasoning_content;
-      if (reasoning) assistantContent = `<thinking>\n${reasoning}\n</thinking>\n\n${assistantContent}`;
+      if (reasoning) assistantContent = `<thinking>\n${reasoning}</thinking>\n\n${assistantContent}`;
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-        for (const tc of msg.tool_calls) {
-          let parsedArgs: any = {};
-          const args = tc.function?.arguments;
-          if (typeof args === 'string') {
-            try {
-              parsedArgs = JSON.parse(args);
-            } catch {
-              parsedArgs = {};
+        if (isProxyMode) {
+          // ── Proxy: render tool calls as prose ──────────────────────
+          // The model "called" tools in prior turns; summarize each as
+          // natural language so upstream sees no XML tool history.
+          const proseParts: string[] = [];
+          if (assistantContent.trim()) proseParts.push(assistantContent.trim());
+          for (const tc of msg.tool_calls) {
+            let parsedArgs: any = {};
+            const args = tc.function?.arguments;
+            if (typeof args === 'string') {
+              try {
+                parsedArgs = JSON.parse(args);
+              } catch {
+                parsedArgs = {};
+              }
+            } else if (args && typeof args === 'object') {
+              parsedArgs = args;
             }
-          } else if (args && typeof args === 'object') {
-            parsedArgs = args;
+            const argsStr = Object.keys(parsedArgs).length === 0 ? 'no arguments' : JSON.stringify(parsedArgs);
+            proseParts.push(`[I called the \`${tc.function?.name}\` tool with: ${argsStr}]`);
           }
-          const FKW = TOOL_CALL_KEYWORDS[0];
-          const PKW = TOOL_CALL_KEYWORDS[1];
-          const xmlParams = Object.entries(parsedArgs)
-            .map(([k, v]) => `<${PKW}=${k}>${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}</${PKW}>`)
-            .join('\n');
-          const xmlPayload = `<${FKW}=${tc.function?.name}>\n${xmlParams}\n</${FKW}>`;
-          assistantContent = assistantContent ? assistantContent + '\n' + xmlPayload : xmlPayload;
+          assistantContent = proseParts.join('\n');
+        } else {
+          // ── Default: serialize as XML for upstream ────────────────
+          for (const tc of msg.tool_calls) {
+            let parsedArgs: any = {};
+            const args = tc.function?.arguments;
+            if (typeof args === 'string') {
+              try {
+                parsedArgs = JSON.parse(args);
+              } catch {
+                parsedArgs = {};
+              }
+            } else if (args && typeof args === 'object') {
+              parsedArgs = args;
+            }
+            const FKW = TOOL_CALL_KEYWORDS[0];
+            const PKW = TOOL_CALL_KEYWORDS[1];
+            const xmlParams = Object.entries(parsedArgs)
+              .map(([k, v]) => `<${PKW}=${k}>${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}</${PKW}>`)
+              .join('\n');
+            const xmlPayload = `<${FKW}=${tc.function?.name}>\n${xmlParams}\n</${FKW}>`;
+            assistantContent = assistantContent ? assistantContent + '\n' + xmlPayload : xmlPayload;
+          }
         }
       }
 
@@ -200,6 +242,17 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
           command: toolName || '',
         },
       });
+
+      if (isProxyMode) {
+        // ── Proxy: tool result as prose user message ────────────────
+        // Drop the orphan-call synthesis (no XML turn exists upstream).
+        // Inline the result as a plain user message so the model sees
+        // the outcome without any tool-call markers.
+        const inlineResult = truncateToolResult(contentStr || '');
+        const prose = `[Tool \`${escXml(toolName || 'unknown')}\` returned]:\n${inlineResult}`;
+        segments.push(`<user>\n${prose}\n</user>`);
+        continue;
+      }
 
       // Orphan result: the client sent a tool result without the assistant
       // tool_call that issued it (observed in production: the prompt shows
@@ -248,7 +301,18 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const MAX_TOOL_DESC_LENGTH = 300;
 
-  if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+  // ── Proxy mode: skip local_mcp and toolDescriptions ──────────────
+  // In proxy mode the model never sees tool definitions, so it never
+  // attempts XML tool-call generation (the source of guard-validation
+  // failures and upstream protocol mismatches). Tool-calling semantics are
+  // handled entirely by qwen-gate locally: client sends OpenAI-format
+  // tool_calls/tool results, qwen-gate synthesizes them into prose for
+  // the upstream conversation. Skip the entire localMcp construction and
+  // the system-prompt toolDescriptions injection — the upstream sees no
+  // tool markers at all.
+  if (isProxyMode) {
+    featureConfig.local_mcp = undefined;
+  } else if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const localMcp: Record<string, any> = {};
     localMcp['★'] = {};
     const toolNames: string[] = [];
@@ -390,7 +454,27 @@ export async function acquireSessionWithCorrections(
     pendingCorrections.get(session.chatId) ||
     (accountEmail ? pendingCorrections.get(accountEmail) : undefined) ||
     pendingCorrections.get('__echo_retry__');
-  if (prevCorrections && prevCorrections.length > 0) {
+
+  // ── Tool-call rejection → hard reset ─────────────────────────────
+  // A correction carrying a tool-call validation failure ("Tool call missing
+  // or has invalid name field") means the upstream session already has a
+  // corrupted tool-call turn baked into its chat history. Feeding that
+  // correction back into the SAME chat_id makes the model retry the bad turn
+  // in-place, which compounds into the "Tool X does not exists" cascade on
+  // multi-turn conversations. Instead: discard the correction, drop the
+  // poisoned chat_id, and acquire a fresh session so the next turn replays
+  // onto clean history.
+  if (prevCorrections && prevCorrections.some((c: string) => /Tool call missing or has invalid|missing "arguments" field/i.test(c))) {
+    pendingCorrections.delete(session.chatId);
+    if (accountEmail) pendingCorrections.delete(accountEmail);
+    pendingCorrections.delete('__echo_retry__');
+    await sessionPool.deleteSession(session.chatId, session.cachedHeaders, session.accountEmail || accountEmail);
+    const fresh = await sessionPool.acquire(accountEmail);
+    session.chatId = fresh.chatId;
+    session.parentId = fresh.parentId;
+    session.cachedHeaders = fresh.cachedHeaders;
+    session.accountEmail = fresh.accountEmail || session.accountEmail;
+  } else if (prevCorrections && prevCorrections.length > 0) {
     pendingCorrections.delete(session.chatId);
     if (accountEmail) pendingCorrections.delete(accountEmail);
     pendingCorrections.delete('__echo_retry__');

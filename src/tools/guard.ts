@@ -7,15 +7,55 @@ export interface GuardResult {
   ok: boolean;
 }
 
+/**
+ * Tool-call objects circulating through the stream pipeline appear in two
+ * shapes:
+ *   - ParsedToolCall (flat):       { id, name, arguments }
+ *   - MessageToolCall (OpenAI):    { id, type:'function', function:{ name, arguments:string } }
+ *
+ * `toolCallsOut` (the buffer emitted to OpenAI clients) uses the nested
+ * shape, and `chatNonStreaming.ts` passes it through guard before pushing —
+ * so guard must accept BOTH shapes to avoid the false "missing name /
+ * arguments" rejection that broke every non-streaming tool-call request.
+ *
+ * Normalize here, before field-level checks, so all downstream checks
+ * (validation, parallel-loop detection, spam guard) see a uniform view.
+ */
+type RawTC = Record<string, unknown> & {
+  name?: unknown;
+  arguments?: unknown;
+  function?: { name?: unknown; arguments?: unknown };
+};
+
+function normalizeToolCall(tc: RawTC): { name: unknown; arguments: unknown } {
+  const fn = tc.function;
+  const name = tc.name ?? fn?.name;
+  let args = tc.arguments;
+  if (args === undefined && fn?.arguments !== undefined) {
+    // OpenAI nested form serializes arguments as a JSON string.
+    if (typeof fn.arguments === 'string') {
+      try {
+        args = JSON.parse(fn.arguments);
+      } catch {
+        args = fn.arguments; // keep the raw string; the object-type check below will surface it
+      }
+    } else {
+      args = fn.arguments;
+    }
+  }
+  return { name, arguments: args };
+}
+
 function validateSingleTC(tc: ParsedToolCall): string[] {
   const errors: string[] = [];
-  if (!tc.name || typeof tc.name !== 'string' || tc.name.trim() === '') {
+  const { name, arguments: args } = normalizeToolCall(tc as unknown as RawTC);
+  if (!name || typeof name !== 'string' || name.trim() === '') {
     errors.push('Tool call missing or has invalid "name" field.');
   }
-  if (tc.arguments === undefined || tc.arguments === null) {
-    errors.push(`Tool call "${tc.name}" missing "arguments" field.`);
-  } else if (typeof tc.arguments !== 'object') {
-    errors.push(`Tool call "${tc.name}" has non-object arguments.`);
+  if (args === undefined || args === null) {
+    errors.push(`Tool call "${name as string}" missing "arguments" field.`);
+  } else if (typeof args !== 'object') {
+    errors.push(`Tool call "${name as string}" has non-object arguments.`);
   }
   return errors;
 }
@@ -29,6 +69,17 @@ export function validateSingleToolCall(tc: ParsedToolCall): GuardResult {
     correctionPrompt,
     ok: errors.length === 0,
   };
+}
+
+/**
+ * Read `name` / `arguments` from a tool-call object regardless of whether it
+ * uses the flat (`{name, arguments}`) or OpenAI-nested
+ * (`{function:{name, arguments:string}}`) shape. Arguments from the nested
+ * form are JSON-parsed back to an object so callers see a uniform type.
+ */
+export function readToolCall(tc: any): { name: string; arguments: unknown } {
+  const { name, arguments: args } = normalizeToolCall(tc);
+  return { name: typeof name === 'string' ? name : '', arguments: args };
 }
 
 function buildCorrectionPrompt(errors: string[]): string {

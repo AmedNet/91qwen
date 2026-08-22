@@ -151,7 +151,7 @@ export async function handlePostStreamCompletion(
       try {
         // os.tmpdir() — '/tmp' does not exist on Windows
         writeFileSync(join(tmpdir(), 'qwen-error-buffer.json'), buffer.slice(0, 10000));
-      } catch (e) {}
+      } catch  {}
       const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
       await writeEvent(
         streamWriter,
@@ -171,6 +171,43 @@ export async function handlePostStreamCompletion(
       });
       logStore.finalizeRequest(logId);
       return;
+    }
+
+    // ── Silent tool-call rejection detection ──────────────────────────
+    // Some Qwen upstream flows silently swallow tool-call failures: the
+    // stream returns HTTP 200 with no error payload, but the accumulated
+    // content contains a "Fix: Tool call missing or has invalid 'name'
+    // field" or "does not exists" diagnostic that means the upstream model
+    // tried to emit a tool call the protocol could not parse. Surfacing this
+    // as a real SSE error prevents downstream runtimes (Claude Code etc.)
+    // from accumulating "wanted-to-call-tool-but-got-nothing" history that
+    // would explode into "Tool X does not exists" on subsequent turns.
+    {
+      const accumulated = [streamState.lastFullContent || '', streamState.reasoningBuffer || ''].join('\n');
+      const silentToolRejection = /Fix:\s*Tool call missing or has invalid|does not exists|Tool call "undefined" missing/i;
+      const match = accumulated.match(silentToolRejection);
+      if (match) {
+        const diagnostic = match[0];
+        logStore.addError(logId, `Silent upstream tool-call rejection: ${diagnostic}`);
+        await writeEvent(
+          streamWriter,
+          buildErrorEvent(completionId, model, {
+            message: `Upstream silently rejected tool call: ${diagnostic}`,
+            type: 'server_error',
+            code: 'silent_tool_rejection',
+            retryable: true,
+            retryAfterMs: 2000,
+          }),
+        );
+        await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'error')]));
+        await streamWriter.write('data: [DONE]\n\n');
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+          entry.finalResponse.finishReason = 'silent_tool_rejection';
+        });
+        logStore.finalizeRequest(logId);
+        return;
+      }
     }
 
     // ── Empty-response detection ──────────────────────────────────

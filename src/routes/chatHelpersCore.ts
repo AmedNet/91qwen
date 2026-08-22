@@ -1,5 +1,5 @@
 import { logStore } from '../services/logStore.ts';
-import { validateSingleToolCall } from '../tools/guard.ts';
+import { readToolCall, validateSingleToolCall } from '../tools/guard.ts';
 import { TOOL_CALL_KEYWORDS, TOOL_RESULT_KEYWORDS } from '../utils/tagNames.ts';
 import { QWEN_THINK_TAG_PATTERN as THINK_TAG_PATTERN } from '../utils/thinkTagStripper.ts';
 
@@ -340,9 +340,13 @@ export function processToolCallsThroughGuard(toolCalls: any[], toolCallsOut: any
       correctionPrompts.push(guard.correctionPrompt);
       continue;
     }
-    const spamCheck = toolSpamGuard.check(tc.name, tc.arguments);
+    // Read name/arguments from either flat or OpenAI-nested shape — `toolCallsOut`
+    // stores the nested form (since the OpenAI client expects it), so guard
+    // sees that shape on subsequent calls inside the same pipeline.
+    const { name, arguments: tcArgs } = readToolCall(tc);
+    const spamCheck = toolSpamGuard.check(name, tcArgs);
     if (!spamCheck.ok) {
-      logStore.log('debug', 'chat', `  [🛑 TOOL SPAM${label ? ' ' + label : ''}] ${tc.name}: repeated call blocked`);
+      logStore.log('debug', 'chat', `  [🛑 TOOL SPAM${label ? ' ' + label + ' ' : ''}] ${name}: repeated call blocked`);
       correctionPrompts.push(spamCheck.correctionPrompt);
       continue;
     }
@@ -360,11 +364,11 @@ export function processToolCallsThroughGuard(toolCalls: any[], toolCallsOut: any
     toolCallsOut.push({
       id: tc.id,
       type: 'function',
-      function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+      function: { name, arguments: JSON.stringify(tcArgs) },
     });
     if (logParsed) {
       logStore.updateEntry(logId, (entry: any) => {
-        entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.arguments) });
+        entry.parsedToolCalls.push({ name, args: JSON.stringify(tcArgs) });
       });
     }
   }

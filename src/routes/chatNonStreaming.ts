@@ -322,6 +322,37 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
     entry.remainingText = state.lastFullContent;
   });
 
+  // ── Silent tool-call rejection detection ──────────────────────────
+  // When guard.ts validation fails (Tool call missing or has invalid 'name'
+  // field, etc.) the rejection diagnostic is queued in state.correctionPrompts
+  // for the NEXT turn. That next-turn injection is exactly what produces the
+  // "Tool X does not exists" cascade in the OpenAI client: model sees a
+  // correction, gives up, returns empty content, client receives an empty
+  // stop — and now both "I tried to call X" and "there was no X" are baked
+  // into the same chat session for subsequent turns.
+  //
+  // Surface the rejection as a real HTTP 502 server_error instead of letting
+  // it ride silently into pendingCorrections. Clear the queued corrections
+  // so the next request to this chat_id starts clean.
+  if (state.correctionPrompts.length > 0) {
+    const diagnostic = state.correctionPrompts[0];
+    logStore.addError(logId, `Silent upstream tool-call rejection: ${diagnostic}`);
+    pendingCorrections.delete(session.chatId);
+    logStore.finalizeRequest(logId);
+    return c.json(
+      {
+        error: {
+          message: `Upstream silently rejected tool call: ${diagnostic}`,
+          type: 'server_error',
+          code: 'silent_tool_rejection',
+          retryable: true,
+          retry_after_ms: 2000,
+        },
+      },
+      502,
+    );
+  }
+
   for (const prompt of state.correctionPrompts) {
     logStore.addError(logId, prompt);
   }
