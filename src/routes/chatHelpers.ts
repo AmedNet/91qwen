@@ -64,21 +64,38 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const timestamp = Math.floor(Date.now() / 1000);
   const model = (body.model || '').replace('-no-thinking', '');
 
-  // ── Proxy mode (Plan F) ──────────────────────────────────────────
-  // no-thinking models with tool definitions trigger a Qwen upstream refusal
-  // when the request carries accumulated XML tool history (the protocol
-  // expects structured function_calls on history turns). Rather than fight
-  // the upstream, we synthesize the prior tool turns into natural-language
-  // summaries for the upstream — the model still has tools available this
-  // turn (via system prompt), and XML tool_call generation still works for
-  // the CURRENT response, but historical tool turns become plain prose so
-  // upstream sees a clean user/assistant text log.
-  const isProxyMode =
-    !!body.tools &&
-    Array.isArray(body.tools) &&
-    body.tools.length > 0 &&
-    (body.thinkingLevel === 'off' || (body.model || '').includes('-no-thinking'));
-  console.error('[PROBE-SRC] isProxyMode=' + isProxyMode + ' thinkingLevel=' + body.thinkingLevel);
+  // All tool-calling paths serialize history as XML tool calls and ship
+  // feature_config.local_mcp to upstream, regardless of thinking level. The
+  // Qwen web protocol delivers the current turn's tool calls via the
+  // `phase=local_tool` SSE phase (handled by extractLocalMcpToolCalls), so
+  // we never need a "synthesize prose to dodge upstream" detour — even on
+  // no-thinking models.
+
+  // Tools the CURRENT request registered with upstream via local_mcp.
+  // Historical assistant tool_calls outside this set would re-trigger
+  // upstream "unknown tool" errors (Qwen re-executes them server-side),
+  // surfacing as poisoned tool_result history that later turns see as
+  // "the tool is unavailable". Drop those to prose so the model retains
+  // a natural-language record of what happened without the upstream
+  // trying to re-run a name it no longer has.
+  //
+  // Gate: only downgrade when the request ACTUALLY registered tools.
+  // An empty/missing body.tools means the request is tool-free (e.g. a
+  // chat-only smoke test). With registeredToolNames === ∅ every
+  // historical tool_call would look "unregistered" and the legacy XML
+  // serialization would silently regress into prose — that breaks any
+  // non-tool test that still relies on historical XML turns being
+  // forwarded verbatim. Skip the downgrade in that case; without a
+  // local_mcp budget, upstream also has no tool to re-execute, so
+  // history is safe to forward.
+  const hasRegisteredTools = !!(body.tools && Array.isArray(body.tools) && body.tools.length > 0);
+  const registeredToolNames = new Set<string>();
+  if (hasRegisteredTools) {
+    for (const t of body.tools as any[]) {
+      const fn = t?.function;
+      if (fn?.name) registeredToolNames.add(fn.name);
+    }
+  }
 
   const segments: string[] = [];
   const systemParts: string[] = [];
@@ -154,13 +171,19 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       if (reasoning) assistantContent = `<thinking>\n${reasoning}</thinking>\n\n${assistantContent}`;
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-        if (isProxyMode) {
-          // ── Proxy: render tool calls as prose ──────────────────────
-          // The model "called" tools in prior turns; summarize each as
-          // natural language so upstream sees no XML tool history.
-          const proseParts: string[] = [];
-          if (assistantContent.trim()) proseParts.push(assistantContent.trim());
-          for (const tc of msg.tool_calls) {
+        // Serialize historical tool calls as XML blocks; Qwen upstream sees
+        // <function=NAME><parameter=KEY>VALUE</parameter>...</function> on
+        // assistant turns and treats them as part of the conversation log.
+        // Tool names absent from the current request's registeredTools set
+        // are downgraded to prose — Qwen re-executes these server-side and
+        // would return "unknown tool" results, polluting later turns.
+        for (const tc of msg.tool_calls) {
+          const tcName = tc.function?.name;
+          // Skip the downgrade when the request registered no tools: see
+          // `hasRegisteredTools` rationale above. Without registration
+          // there's no local_mcp budget for upstream to re-execute, so
+          // forwarding the historical XML tool_call is safe.
+          if (tcName && hasRegisteredTools && !registeredToolNames.has(tcName)) {
             let parsedArgs: any = {};
             const args = tc.function?.arguments;
             if (typeof args === 'string') {
@@ -172,32 +195,30 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
             } else if (args && typeof args === 'object') {
               parsedArgs = args;
             }
-            const argsStr = Object.keys(parsedArgs).length === 0 ? 'no arguments' : JSON.stringify(parsedArgs);
-            proseParts.push(`[I called the \`${tc.function?.name}\` tool with: ${argsStr}]`);
+            const argsStr =
+              Object.keys(parsedArgs).length === 0 ? 'no arguments' : JSON.stringify(parsedArgs);
+            const prose = `[Previously called the \`${tcName}\` tool with: ${argsStr}]`;
+            assistantContent = assistantContent ? assistantContent + '\n' + prose : prose;
+            continue;
           }
-          assistantContent = proseParts.join('\n');
-        } else {
-          // ── Default: serialize as XML for upstream ────────────────
-          for (const tc of msg.tool_calls) {
-            let parsedArgs: any = {};
-            const args = tc.function?.arguments;
-            if (typeof args === 'string') {
-              try {
-                parsedArgs = JSON.parse(args);
-              } catch {
-                parsedArgs = {};
-              }
-            } else if (args && typeof args === 'object') {
-              parsedArgs = args;
+          let parsedArgs: any = {};
+          const args = tc.function?.arguments;
+          if (typeof args === 'string') {
+            try {
+              parsedArgs = JSON.parse(args);
+            } catch {
+              parsedArgs = {};
             }
-            const FKW = TOOL_CALL_KEYWORDS[0];
-            const PKW = TOOL_CALL_KEYWORDS[1];
-            const xmlParams = Object.entries(parsedArgs)
-              .map(([k, v]) => `<${PKW}=${k}>${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}</${PKW}>`)
-              .join('\n');
-            const xmlPayload = `<${FKW}=${tc.function?.name}>\n${xmlParams}\n</${FKW}>`;
-            assistantContent = assistantContent ? assistantContent + '\n' + xmlPayload : xmlPayload;
+          } else if (args && typeof args === 'object') {
+            parsedArgs = args;
           }
+          const FKW = TOOL_CALL_KEYWORDS[0];
+          const PKW = TOOL_CALL_KEYWORDS[1];
+          const xmlParams = Object.entries(parsedArgs)
+            .map(([k, v]) => `<${PKW}=${k}>${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}</${PKW}>`)
+            .join('\n');
+          const xmlPayload = `<${FKW}=${tcName}>\n${xmlParams}\n</${FKW}>`;
+          assistantContent = assistantContent ? assistantContent + '\n' + xmlPayload : xmlPayload;
         }
       }
 
@@ -243,14 +264,18 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         },
       });
 
-      if (isProxyMode) {
-        // ── Proxy: tool result as prose user message ────────────────
-        // Drop the orphan-call synthesis (no XML turn exists upstream).
-        // Inline the result as a plain user message so the model sees
-        // the outcome without any tool-call markers.
+      // If this tool result's name is not in the current request's
+      // registeredTools set, downgrade to prose so the assistant-turn
+      // counterpart (also downgraded) has a matching user-side record.
+      // Otherwise upstream re-executes the un-registered tool call and
+      // pollutes later turns with "unknown tool" results.
+      //
+      // Skip when the request registered no tools (see hasRegisteredTools
+      // rationale): the assistant turn above is also forwarded verbatim,
+      // so the result side must stay in lockstep.
+      if (toolName && hasRegisteredTools && !registeredToolNames.has(toolName)) {
         const inlineResult = truncateToolResult(contentStr || '');
-        const prose = `[Tool \`${escXml(toolName || 'unknown')}\` returned]:\n${inlineResult}`;
-        segments.push(`<user>\n${prose}\n</user>`);
+        segments.push(`<user>\n[Result for the unregistered \`${toolName}\` tool]:\n${inlineResult}\n</user>`);
         continue;
       }
 
@@ -301,18 +326,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const MAX_TOOL_DESC_LENGTH = 300;
 
-  // ── Proxy mode: skip local_mcp and toolDescriptions ──────────────
-  // In proxy mode the model never sees tool definitions, so it never
-  // attempts XML tool-call generation (the source of guard-validation
-  // failures and upstream protocol mismatches). Tool-calling semantics are
-  // handled entirely by qwen-gate locally: client sends OpenAI-format
-  // tool_calls/tool results, qwen-gate synthesizes them into prose for
-  // the upstream conversation. Skip the entire localMcp construction and
-  // the system-prompt toolDescriptions injection — the upstream sees no
-  // tool markers at all.
-  if (isProxyMode) {
-    featureConfig.local_mcp = undefined;
-  } else if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+  if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const localMcp: Record<string, any> = {};
     localMcp['★'] = {};
     const toolNames: string[] = [];

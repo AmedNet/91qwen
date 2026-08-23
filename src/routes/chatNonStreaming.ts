@@ -198,9 +198,16 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   } else if (delta.phase === 'answer') {
     processAnswerDelta(delta, state, ctx);
   } else if (delta.phase === 'local_tool') {
-    // Qwen returns tool calls in the local_tool phase via extra.local_mcp["★"].
-    // These may arrive with or without XML tool call blocks in the answer phase,
-    // so we must extract them here to avoid losing tool calls.
+    // Qwen emits two SSE events for each tool call:
+    //   1. status=typing:   { tool_name, content:"Call ★-Name" }  (no params)
+    //   2. status=finished: { extra.local_mcp: [{ tool_name, params }] }
+    // Extracting on the typing event would yield an empty-arguments tool call
+    // (the fallback in extractLocalMcpToolCalls) that the finished event
+    // then duplicates with the real params — the client receives two
+    // tool_calls for the same invocation. Gate on status=finished to mirror
+    // the streaming path (chatStreamingHelpers.ts:224), which already only
+    // extracts on finished.
+    if (delta.status !== 'finished') return;
     const localToolCalls = extractLocalMcpToolCalls(chunk);
     if (localToolCalls.length > 0) {
       const parsed = localToolCalls.map((tc) => ({
