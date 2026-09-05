@@ -112,3 +112,103 @@ describe('anthropicMessagesToOpenAI tool_result content', () => {
     expect(toolMsg.content).toBe('plain string result');
   });
 });
+
+// ── no-thinking tool-call depth limit ─────────────────────────────
+// Only active when:
+//   1. thinkingLevel === 'off' (or -no-thinking model suffix)
+//   2. The request registered at least one tool
+//   3. The history contains at least one assistant tool-call turn
+// Then: assistant turns ranked >= DEPTH_LIMIT (3) downgrade to prose,
+// and their matching tool_result blocks downgrade to prose in lockstep.
+// Thinking models: no downgrade regardless of history length.
+describe('buildQwenMessages no-thinking depth limit', () => {
+  const FN_OPEN = '<' + 'function=';
+  const NO_THINK_BODY = {
+    model: 'qwen3.7-max-no-thinking',
+    thinkingLevel: 'off' as const,
+    tools: [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: {} } } }],
+  };
+  const THINK_BODY = {
+    model: 'qwen3.7-max',
+    thinkingLevel: 'summary' as const,
+    tools: [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: {} } } }],
+  };
+
+  // Build N assistant+tool turns, each with a unique tool_call_id.
+  function buildLongHistory(n: number): any[] {
+    const msgs: any[] = [{ role: 'user', content: 'go' }];
+    for (let k = 0; k < n; k++) {
+      msgs.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: `call_${k}`, type: 'function', function: { name: 'Read', arguments: '{"file_path":"/tmp/' + k + '.ts"}' } }],
+      });
+      msgs.push({ role: 'tool', tool_call_id: `call_${k}`, content: `result ${k}` });
+    }
+    msgs.push({ role: 'user', content: 'now write a summary' });
+    return msgs;
+  }
+
+  test('no-thinking + 5 turns: oldest 2 assistant calls downgrade to prose, tool results in lockstep', () => {
+    const messages = buildLongHistory(5);
+    const { qwenMessages } = buildQwenMessages(messages, NO_THINK_BODY, 100000, true);
+    const prompt = qwenMessages[0].content as string;
+
+    // DEPTH_LIMIT=3, so ranks 0,1,2 keep XML; ranks 3,4 downgrade.
+    // Rank 0 = most recent assistant turn = the one right before the final user turn.
+    // Rank 4 = oldest turn.
+
+    // Recent (rank 0,1,2) keep XML.
+    expect(prompt).toContain(FN_OPEN + 'Read>');
+
+    // Oldest (rank 3,4) downgrade — count prose downgrades. The
+    // [Previously called the `Read` tool (earlier) ...] label is the
+    // signature; the (earlier) tag distinguishes depth-downgrade from
+    // unregistered-downgrade.
+    const earlierMatches = prompt.match(/Previously called the `Read` tool \(earlier\)/g) || [];
+    expect(earlierMatches.length).toBe(2);
+
+    // Matching tool results also downgrade. Both sides must move in
+    // lockstep — otherwise the model sees a <tool_result> referencing
+    // a call that's no longer in the prompt.
+    const resultProseMatches = prompt.match(/Result for the earlier `Read` tool/g) || [];
+    expect(resultProseMatches.length).toBe(2);
+
+    // Sanity: no (unregistered) labels — Read IS in registeredTools.
+    expect(prompt).not.toContain('unregistered');
+  });
+
+  test('thinking model: depth limit inactive, all 5 assistant calls stay XML', () => {
+    const messages = buildLongHistory(5);
+    const { qwenMessages } = buildQwenMessages(messages, THINK_BODY, 100000, true);
+    const prompt = qwenMessages[0].content as string;
+
+    // Zero prose downgrades.
+    expect(prompt).not.toContain('(earlier)');
+    expect(prompt).not.toContain('(unregistered)');
+    // All 5 calls serialize as XML.
+    const xmlCalls = prompt.match(new RegExp(FN_OPEN + 'Read>', 'g')) || [];
+    expect(xmlCalls.length).toBe(5);
+  });
+
+  test('no-thinking + exactly DEPTH_LIMIT (3) turns: none downgrade (rank < 3 keeps XML)', () => {
+    const messages = buildLongHistory(3);
+    const { qwenMessages } = buildQwenMessages(messages, NO_THINK_BODY, 100000, true);
+    const prompt = qwenMessages[0].content as string;
+    expect(prompt).not.toContain('(earlier)');
+    const xmlCalls = prompt.match(new RegExp(FN_OPEN + 'Read>', 'g')) || [];
+    expect(xmlCalls.length).toBe(3);
+  });
+
+  test('no-thinking + no registered tools: depth limit inactive (matches existing unregistered rationale)', () => {
+    // Mirror the existing rule: without body.tools there's nothing to
+    // re-execute upstream, so historical XML is safe regardless of depth.
+    const messages = buildLongHistory(5);
+    const body = { model: 'qwen3.7-max-no-thinking', thinkingLevel: 'off' as const, tools: [] };
+    const { qwenMessages } = buildQwenMessages(messages, body, 100000, true);
+    const prompt = qwenMessages[0].content as string;
+    expect(prompt).not.toContain('(earlier)');
+    const xmlCalls = prompt.match(new RegExp(FN_OPEN + 'Read>', 'g')) || [];
+    expect(xmlCalls.length).toBe(5);
+  });
+});

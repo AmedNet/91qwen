@@ -18,7 +18,7 @@ const contentPartSchema = z.object({
 });
 
 const messageSchema = z.object({
-  role: z.enum(['system', 'user', 'assistant', 'tool', 'function']),
+  role: z.enum(['system', 'user', 'assistant', 'tool', 'function', 'developer']),
   content: z
     .union([z.string(), z.array(contentPartSchema), z.null()])
     .optional()
@@ -69,7 +69,7 @@ export const openAIRequestSchema = z.object({
     .optional(),
   // NOTE: zod strips undeclared fields by default. These must be declared here
   // or the chat route (which consumes the validated body) silently loses the
-  // client's thinking intent â€” types/openai.ts declares both fields.
+  // client's thinking intent â€?types/openai.ts declares both fields.
   thinking: z
     .object({
       type: z.string().optional(),

@@ -101,6 +101,47 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const systemParts: string[] = [];
   const toolResultObjects: any[] = [];
   const workingMessages = messages;
+
+  // ── no-thinking tool-call depth limit ──────────────────────────────
+  // Hypothesis: no-thinking models can't reason about a long chain of
+  // historical XML tool calls; old calls re-trigger upstream re-execution
+  // and pollute later turns. Keep the most recent N assistant turns as
+  // XML, downgrade older ones to prose.
+  //
+  // Why only no-thinking: thinking models handle long tool chains fine
+  // (production data shows no regression). We only opt-in when the
+  // request explicitly disables thinking.
+  //
+  // Scope: the limit applies to the assistant tool_call serialization
+  // AND the matching tool result block, so both sides downgrade in
+  // lockstep (otherwise the model sees a `<tool_result>` referencing a
+  // call that's no longer in the prompt).
+  //
+  // Depth definition: an "assistant turn" is any msg with role === 'assistant'
+  // that contains at least one tool_call. Rank 0 = the most recent such turn
+  // (closest to the end of the history), rank 1 = the next older, etc.
+  // A turn with rank >= DEPTH_LIMIT downgrades both itself and its matching
+  // tool_result to prose.
+  const isNoThinking = body.thinkingLevel === 'off' || (typeof body.model === 'string' && body.model.includes('-no-thinking'));
+  const DEPTH_LIMIT = 3; // ENG.JUDGMENT: 3 = typical multi-step agent window. Tunable via this single constant.
+  const hasToolTurns = workingMessages.some((m: any) => m && m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
+  const depthLimitActive = isNoThinking && hasRegisteredTools && hasToolTurns;
+
+  // Pre-scan: assign each assistant tool_call turn a "depth rank" where
+  // 0 = most recent, 1 = next older, etc. Used by both the assistant
+  // serialization loop and the tool-result downgrade path.
+  const assistantTurnDepth = new Map<number, number>();
+  if (depthLimitActive) {
+    let rank = 0;
+    for (let k = workingMessages.length - 1; k >= 0; k--) {
+      const m = workingMessages[k];
+      if (m && m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        assistantTurnDepth.set(k, rank);
+        rank++;
+      }
+    }
+  }
+
   for (let i = 0; i < workingMessages.length; i++) {
     const msg = workingMessages[i];
 
@@ -177,13 +218,22 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
         // Tool names absent from the current request's registeredTools set
         // are downgraded to prose — Qwen re-executes these server-side and
         // would return "unknown tool" results, polluting later turns.
+        //
+        // Depth rule (no-thinking only): turns older than DEPTH_LIMIT
+        // assistant-tool-call ranks also downgrade to prose. The matching
+        // tool_result downgrade in the `tool` branch reads the same
+        // `assistantTurnDepth` map, so both sides stay in lockstep.
+        const thisTurnRank = depthLimitActive ? (assistantTurnDepth.get(i) ?? Infinity) : -1;
+        const exceedsDepthLimit = thisTurnRank >= DEPTH_LIMIT;
         for (const tc of msg.tool_calls) {
           const tcName = tc.function?.name;
+          const isUnregistered = tcName && hasRegisteredTools && !registeredToolNames.has(tcName);
+          const isRegisteredButTooOld = !isUnregistered && exceedsDepthLimit && tcName && hasRegisteredTools && registeredToolNames.has(tcName);
           // Skip the downgrade when the request registered no tools: see
           // `hasRegisteredTools` rationale above. Without registration
           // there's no local_mcp budget for upstream to re-execute, so
           // forwarding the historical XML tool_call is safe.
-          if (tcName && hasRegisteredTools && !registeredToolNames.has(tcName)) {
+          if (isUnregistered || isRegisteredButTooOld) {
             let parsedArgs: any = {};
             const args = tc.function?.arguments;
             if (typeof args === 'string') {
@@ -197,7 +247,11 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
             }
             const argsStr =
               Object.keys(parsedArgs).length === 0 ? 'no arguments' : JSON.stringify(parsedArgs);
-            const prose = `[Previously called the \`${tcName}\` tool with: ${argsStr}]`;
+            // Distinguish the two downgrade causes in the prose so the
+            // model can tell "tool gone" from "tool present but old".
+            // The tool-result block on the user side mirrors this label.
+            const label = isRegisteredButTooOld ? 'earlier' : 'unregistered';
+            const prose = `[Previously called the \`${tcName}\` tool (${label}) with: ${argsStr}]`;
             assistantContent = assistantContent ? assistantContent + '\n' + prose : prose;
             continue;
           }
@@ -273,9 +327,35 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       // Skip when the request registered no tools (see hasRegisteredTools
       // rationale): the assistant turn above is also forwarded verbatim,
       // so the result side must stay in lockstep.
-      if (toolName && hasRegisteredTools && !registeredToolNames.has(toolName)) {
+      //
+      // Depth match (no-thinking only): if the matching assistant turn is
+      // older than DEPTH_LIMIT, downgrade the result to prose too. We
+      // find the matching turn by tool_call_id and read its pre-computed
+      // rank from assistantTurnDepth.
+      let resultExceedsDepth = false;
+      let resultCallTurnIdx = -1;
+      if (depthLimitActive && toolName && hasRegisteredTools && registeredToolNames.has(toolName) && msg.tool_call_id) {
+        // Re-find the matching assistant turn (callFound above may have
+        // skipped if no tool_call_id; we need the index even when callFound).
+        for (let j = i - 1; j >= 0; j--) {
+          const prevMsg = workingMessages[j];
+          if (prevMsg.role === 'assistant' && prevMsg.tool_calls) {
+            const call = prevMsg.tool_calls.find((tc: any) => tc.id === msg.tool_call_id);
+            if (call) {
+              resultCallTurnIdx = j;
+              break;
+            }
+          }
+        }
+        if (resultCallTurnIdx !== -1) {
+          const rank = assistantTurnDepth.get(resultCallTurnIdx) ?? Infinity;
+          resultExceedsDepth = rank >= DEPTH_LIMIT;
+        }
+      }
+      if (toolName && hasRegisteredTools && (!registeredToolNames.has(toolName) || resultExceedsDepth)) {
         const inlineResult = truncateToolResult(contentStr || '');
-        segments.push(`<user>\n[Result for the unregistered \`${toolName}\` tool]:\n${inlineResult}\n</user>`);
+        const label = resultExceedsDepth ? 'earlier' : 'unregistered';
+        segments.push(`<user>\n[Result for the ${label} \`${toolName}\` tool]:\n${inlineResult}\n</user>`);
         continue;
       }
 
